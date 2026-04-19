@@ -13,6 +13,13 @@ HOST_URL       = os.environ.get("HOST_URL", "http://raspberrypi5lan:8080")
 IDLE_TIMEOUT   = int(os.environ.get("IDLE_TIMEOUT", "120"))
 MAX_WARM_STREAMS = int(os.environ.get("MAX_WARM_STREAMS", "3"))
 WARM_TTL_SECONDS = int(os.environ.get("WARM_TTL_SECONDS", str(2 * 3600)))
+# Channels to keep warm permanently. Initial seed from env var, then
+# persisted to disk so UI toggles survive restarts. LRU eviction never
+# touches these; a background loop re-spawns ffmpeg if they die. Cap
+# is auto-raised so viewing still has a free slot.
+ALWAYS_WARM = {s.strip() for s in
+               os.environ.get("ALWAYS_WARM", "").split(",") if s.strip()}
+always_warm_lock = threading.Lock()
 FAV_TAG_UUID   = os.environ.get("FAV_TAG_UUID", "ed43d130b6d7f8e56b063db6de8d2b06")
 SEGMENT_TIME   = 1                                    # shorter = faster first-load
 WINDOW_SECONDS = 2 * 3600
@@ -20,6 +27,8 @@ LIST_SIZE      = WINDOW_SECONDS // SEGMENT_TIME       # 7200 segments (2h)
 CODEC_CACHE_FILE = HLS_DIR / ".codec_cache.json"
 STATS_FILE       = HLS_DIR / ".usage_stats.json"
 EPG_ARCHIVE_FILE = HLS_DIR / ".epg_archive.jsonl"
+ALWAYS_WARM_FILE = HLS_DIR / ".always_warm.json"
+PIN_HARD_MAX = 3   # tuner-driven upper bound; minus active/scheduled DVR jobs
 EPG_SNAPSHOT_INTERVAL = 600   # 10 min
 EPG_ARCHIVE_KEEP_DAYS = 14
 
@@ -450,8 +459,9 @@ def ensure_running(slug):
             record_stop(slug, info.get("started_at", time.time()))
             channels.pop(slug, None)
         others = [(s, i["last_seen"]) for s, i in channels.items()
-                  if i["process"].poll() is None and s != slug]
-        others.sort(key=lambda x: x[1])  # oldest idle first
+                  if i["process"].poll() is None and s != slug
+                  and s not in ALWAYS_WARM]   # never evict permanent
+        others.sort(key=lambda x: x[1])
         while len(others) >= MAX_WARM_STREAMS:
             victims.append(others.pop(0)[0])
         proc = start_ffmpeg(slug)
@@ -475,13 +485,85 @@ def idle_killer_loop():
             now = time.time()
             with active_lock:
                 stale = [s for s, i in channels.items()
-                         if now - i["last_seen"] > WARM_TTL_SECONDS]
+                         if now - i["last_seen"] > WARM_TTL_SECONDS
+                         and s not in ALWAYS_WARM]
             for s in stale:
                 print(f"[{s}] warm TTL expired ({WARM_TTL_SECONDS}s)",
                       flush=True)
                 stop_channel(s)
         except Exception as e:
             print(f"idle loop: {e}", flush=True)
+
+
+def load_always_warm():
+    global MAX_WARM_STREAMS
+    if ALWAYS_WARM_FILE.exists():
+        try:
+            data = json.loads(ALWAYS_WARM_FILE.read_text())
+            with always_warm_lock:
+                ALWAYS_WARM.clear()
+                ALWAYS_WARM.update(data.get("slugs", []))
+        except Exception as e:
+            print(f"load always-warm: {e}", flush=True)
+    if ALWAYS_WARM:
+        MAX_WARM_STREAMS = max(MAX_WARM_STREAMS, len(ALWAYS_WARM) + 1)
+    print(f"always-warm: {sorted(ALWAYS_WARM) or '(none)'}  "
+          f"max_warm={MAX_WARM_STREAMS}", flush=True)
+
+
+def save_always_warm():
+    try:
+        with always_warm_lock:
+            payload = {"slugs": sorted(ALWAYS_WARM)}
+        ALWAYS_WARM_FILE.write_text(json.dumps(payload, indent=2))
+    except Exception as e:
+        print(f"save always-warm: {e}", flush=True)
+
+
+def set_always_warm(slug, on):
+    """Toggle a channel's pinned-warm state. Returns True if state
+    was changed. Pinning spawns ffmpeg; unpinning keeps the stream
+    running but re-subjects it to normal LRU eviction (TTL or
+    replaced-by-next-viewed-channel)."""
+    global MAX_WARM_STREAMS
+    changed = False
+    with always_warm_lock:
+        if on and slug not in ALWAYS_WARM:
+            ALWAYS_WARM.add(slug); changed = True
+        elif not on and slug in ALWAYS_WARM:
+            ALWAYS_WARM.discard(slug); changed = True
+    if changed:
+        MAX_WARM_STREAMS = max(
+            int(os.environ.get("MAX_WARM_STREAMS", "3")),
+            len(ALWAYS_WARM) + 1)
+        save_always_warm()
+        if on:
+            ensure_running(slug)
+    return changed
+
+
+def always_warm_loop():
+    """Background watchdog: make sure each slug in ALWAYS_WARM has a
+    live ffmpeg. Re-spawns if the process died. Nudges last_seen so
+    LRU ordering keeps these channels ahead of ad-hoc viewers."""
+    time.sleep(15)
+    while True:
+        try:
+            now = time.time()
+            for slug in list(ALWAYS_WARM):
+                with active_lock:
+                    info = channels.get(slug)
+                    alive = info and info["process"].poll() is None
+                if not alive:
+                    print(f"[{slug}] always-warm respawn", flush=True)
+                    ensure_running(slug)
+                else:
+                    with active_lock:
+                        if slug in channels:
+                            channels[slug]["last_seen"] = now
+        except Exception as e:
+            print(f"always-warm loop: {e}", flush=True)
+        time.sleep(30)
 
 
 def _cors(resp):
@@ -503,8 +585,9 @@ def index():
 
     with cmap_lock:
         items = list(channel_map.items())
-    # Sort: watch_seconds DESC, starts DESC, then name ASC
+    # Sort: pinned first, then watch_seconds DESC, starts DESC, name ASC
     items.sort(key=lambda kv: (
+        0 if kv[0] in ALWAYS_WARM else 1,
         -st_snap.get(kv[0], {}).get("watch_seconds", 0),
         -st_snap.get(kv[0], {}).get("starts", 0),
         kv[1]["name"].lower(),
@@ -524,10 +607,13 @@ def index():
                  if starts > 0 else
                  '<span class="usage muted">neu</span>')
         rows.append(
-            f'<li>'
+            f'<li data-slug="{s}">'
             f'<a class="logo" href="{watch_url}">{logo}</a>'
             f'<div class="meta">'
-            f'<a href="{watch_url}">{info["name"]}</a> {usage}<br>'
+            f'<a href="{watch_url}">{info["name"]}</a> '
+            f'<span class="warm-badge" data-slug="{s}"></span> '
+            f'<button class="pin-btn" data-slug="{s}" title="Dauer-warm">📌</button> '
+            f'{usage}<br>'
             f'<span class="ch-actions">'
             f'<a href="{watch_url}">⚡ Live</a> · '
             f'<a href="{dvr_url}">📺 Timeshift</a>'
@@ -544,13 +630,90 @@ def index():
         f'<li><a href="{url}">{label}</a><br>'
         f'<code style="font-size:0.8em;color:#888">{url}</code></li>'
         for label, url in tools)
+    extra_css = (
+        ".warm-badge{display:none;font-size:.72em;font-weight:600;"
+        "padding:1px 7px;border-radius:10px;vertical-align:2px;"
+        "margin-left:4px;color:#fff}"
+        ".warm-badge.running{display:inline-block;background:#27ae60}"
+        ".warm-badge.running.pinned{background:#2980b9}"
+        ".pin-btn{background:none;border:0;cursor:pointer;font-size:1em;"
+        "opacity:.3;padding:0 4px;vertical-align:1px;transition:opacity .15s}"
+        ".pin-btn:hover{opacity:.65}"
+        ".pin-btn.active{opacity:1;filter:drop-shadow(0 0 1px #2980b9)}"
+    )
+    js = (
+        "async function refreshWarm(){"
+        "  try{"
+        "    const r=await fetch('/api/warm-status');"
+        "    const d=await r.json();"
+        "    const W=d.window_seconds||7200;"
+        "    for(const el of document.querySelectorAll('.warm-badge')){"
+        "      const s=el.dataset.slug;"
+        "      const e=d.channels[s];"
+        "      if(!e||!e.running){el.className='warm-badge';el.textContent='';}"
+        "      else {"
+        "        const bs=e.buffer_seconds;"
+        "        const full=bs>=W-30;"
+        "        let time;"
+        "        if(full)time='2h';"
+        "        else if(bs>=3600)time=Math.floor(bs/3600)+'h'+Math.floor((bs%3600)/60)+'m';"
+        "        else if(bs>=60)time=Math.floor(bs/60)+'m';"
+        "        else time=bs+'s';"
+        "        el.textContent='● '+time;"
+        "        el.className='warm-badge running'+(e.always_warm?' pinned':'');"
+        "        el.title=(e.always_warm?'Dauer-warm':'Warm-Tuner')+"
+        "          ' · Puffer '+time+(full?' (voll)':'');"
+        "      }"
+        "    }"
+        "    const budget=(d.pin_budget||0);"
+        "    for(const b of document.querySelectorAll('.pin-btn')){"
+        "      const s=b.dataset.slug;"
+        "      const e=d.channels[s];"
+        "      const pinned=e&&e.always_warm;"
+        "      b.classList.toggle('active',!!pinned);"
+        "      if(!pinned&&budget<=0){"
+        "        b.style.display='none';"
+        "      } else {"
+        "        b.style.display='';"
+        "      }"
+        "      b.title=pinned?'Dauer-warm aktiv — klick zum Deaktivieren':"
+        "                     'Kanal dauer-warm halten (max '+(d.pin_limit||0)+' bei '+(d.pin_dvr_reserve||0)+' DVR-Jobs)';"
+        "    }"
+        "  }catch(e){}"
+        "}"
+        "function reorderPinned(){"
+        "  const ul=document.querySelector('ul.channels');if(!ul)return;"
+        "  const items=Array.from(ul.children);"
+        "  const pinned=items.filter(li=>li.querySelector('.pin-btn.active'));"
+        "  const rest=items.filter(li=>!li.querySelector('.pin-btn.active'));"
+        "  for(const li of pinned)ul.appendChild(li);"
+        "  for(const li of rest)ul.appendChild(li);"
+        "}"
+        "async function togglePin(btn){"
+        "  const slug=btn.dataset.slug;"
+        "  const on=!btn.classList.contains('active');"
+        "  btn.classList.toggle('active',on);"
+        "  try{"
+        "    await fetch('/api/always-warm/'+slug,{method:'POST',"
+        "      headers:{'content-type':'application/json'},"
+        "      body:JSON.stringify({on:on})});"
+        "    refreshWarm();reorderPinned();"
+        "  }catch(e){}"
+        "}"
+        "document.addEventListener('click',e=>{"
+        "  const b=e.target.closest('.pin-btn');"
+        "  if(b){e.preventDefault();togglePin(b);}"
+        "});"
+        "refreshWarm();setInterval(refreshWarm,5000);"
+    )
     body = (f"<html><head><meta name='viewport' "
             f"content='width=device-width,initial-scale=1'>"
             f"<meta name='color-scheme' content='light dark'>"
-            f"<style>{BASE_CSS}</style></head>"
+            f"<style>{BASE_CSS}{extra_css}</style></head>"
             f"<body><h1>HLS Gateway</h1>"
             f"<h2>Tools</h2><ul class='tools'>{tool_rows}</ul>"
             f"<h2>Kanäle</h2><ul class='channels'>{''.join(rows)}</ul>"
+            f"<script>{js}</script>"
             f"</body></html>")
     return body
 
@@ -826,11 +989,12 @@ def epg_grid():
         ts += 1800
 
     with cmap_lock:
-        # sort same as main page: usage-based
+        # sort same as main page: pinned first, then usage-based
         items = list(channel_map.items())
     with stats_lock:
         st_snap = {s: dict(v) for s, v in stats.items()}
     items.sort(key=lambda kv: (
+        0 if kv[0] in ALWAYS_WARM else 1,
         -st_snap.get(kv[0], {}).get("watch_seconds", 0),
         -st_snap.get(kv[0], {}).get("starts", 0),
         kv[1]["name"].lower()))
@@ -1111,6 +1275,15 @@ html,body{{height:100%;background:#000;color:#eee;
   top:-12px;bottom:-12px}}
 .chapter.current{{background:#ffd84d;width:6px;height:18px}}
 .chapter:active{{opacity:.6}}
+.ad-block{{position:absolute;top:50%;transform:translateY(-50%);
+  height:7px;border-radius:2px;pointer-events:none;
+  background:repeating-linear-gradient(45deg,
+  #ff8a65,#ff8a65 3px,#4d1c0f 3px,#4d1c0f 6px);
+  box-shadow:0 0 0 1px #000a;z-index:1}}
+#skipad{{background:#e74c3c;color:#fff;padding:7px 12px;border:0;
+  border-radius:16px;font-weight:600;font-size:.85em;cursor:pointer;
+  display:none;flex:0 0 auto}}
+#skipad.on{{display:inline-flex}}
 #ttlrow{{margin-top:8px;font-size:.85em;padding-left:4px;
   white-space:nowrap;overflow:hidden;text-overflow:ellipsis}}
 .chname{{font-weight:600;color:#fff;margin-right:8px}}
@@ -1154,6 +1327,7 @@ html,body{{height:100%;background:#000;color:#eee;
   <button class='iconbtn' onclick='seek(10)' aria-label='+10 s'>⏩</button>
   <button id='liveBtn' class='iconbtn' onclick='goLive()'
    aria-label='Zu Live'>⏭</button>
+  <button id='skipad' onclick='skipCurrentAd()'>Werbung ⏭</button>
   <button class='iconbtn' onclick='prevCh()' aria-label='voriger Kanal'>◀︎</button>
   <button class='iconbtn' onclick='nextCh()' aria-label='nächster Kanal'>▶︎</button>
   <span id='cur' class='time'>0:00</span>
@@ -1260,7 +1434,7 @@ function refresh(){{
     }}
   }}
 }}
-v.addEventListener('timeupdate',()=>{{refresh();updateLiveBadge();}});
+v.addEventListener('timeupdate',()=>{{refresh();updateLiveBadge();refreshSkipAdBtn();}});
 v.addEventListener('progress',()=>{{refresh();renderChapters();}});
 v.addEventListener('loadeddata',()=>{{refresh();renderChapters();}});
 v.addEventListener('canplay',()=>{{refresh();renderChapters();}});
@@ -1269,6 +1443,7 @@ v.addEventListener('loadedmetadata',()=>{{
   refresh();renderChapters();
 }});
 setInterval(()=>{{if(!v.paused)renderChapters();}},5000);
+setInterval(()=>{{if(current)loadLiveAds(current);}},300000);
 function goLive(){{
   if(onMediathek){{
     onMediathek=false;
@@ -1526,6 +1701,45 @@ function loadEvents(slug){{
      epgEvents=d.events||[];renderChapters();
    }}).catch(()=>{{}});
 }}
+let liveAds=[];
+const skipBtn=document.getElementById('skipad');
+function renderLiveAds(){{
+  document.querySelectorAll('.ad-block').forEach(el=>el.remove());
+  for(const[wStart,wStop]of liveAds){{
+    const left=posForWall(wStart);
+    const right=posForWall(wStop);
+    if(left===null&&right===null)continue;
+    const L=(left===null?0:left);
+    const R=(right===null?100:right);
+    if(R<=L)continue;
+    const el=document.createElement('div');
+    el.className='ad-block';
+    el.style.left=L+'%';el.style.width=(R-L)+'%';
+    scrub.appendChild(el);
+  }}
+}}
+function currentLiveAd(){{
+  const w=wallForCurrent();
+  for(const[a,b]of liveAds){{if(w>=a&&w<b)return[a,b];}}
+  return null;
+}}
+function skipCurrentAd(){{
+  const a=currentLiveAd();if(!a)return;
+  const[s,e]=seekableRange();
+  const wallS=e>s?wallAt(s):null;
+  if(wallS===null)return;
+  v.currentTime=Math.max(s+0.5,Math.min(e-1,a[1]+0.5-wallS));
+  show();
+}}
+function refreshSkipAdBtn(){{
+  skipBtn.classList.toggle('on',currentLiveAd()!==null);
+}}
+function loadLiveAds(slug){{
+  fetch(HOST+'/api/live-ads/'+slug).then(r=>r.json()).then(d=>{{
+    if(slug!==current)return;
+    liveAds=d.ads||[];renderLiveAds();refreshSkipAdBtn();
+  }}).catch(()=>{{}});
+}}
 function seek(d){{
   const[s,e]=seekableRange();
   v.currentTime=Math.max(s,Math.min(e-1,(v.currentTime||0)+d));
@@ -1647,6 +1861,7 @@ function loadSrc(slug){{
   loadEpg(slug);
   loadEvents(slug);
   loadMediathekAvail(slug);
+  loadLiveAds(slug);
   showHint(slug);
 }}
 
@@ -2568,6 +2783,147 @@ def _rec_hls_spawn(uuid):
     return playlist
 
 
+_live_ads_lock = threading.Lock()
+_live_ads = {}   # slug -> {"generated": ts, "ads": [[wall_start, wall_stop], ...]}
+_live_ads_proc = {"slug": None, "started": 0}
+
+
+def _live_ads_analyze(slug):
+    """Concatenate the current HLS segments of a live channel, run
+    comskip to detect commercial blocks, and store the result keyed
+    by wall-clock seconds (so results stay valid as segments roll)."""
+    ch_dir = HLS_DIR / slug
+    playlist = ch_dir / "index.m3u8"
+    if not playlist.exists():
+        return False
+    # Anchor wall time: parse PROGRAM-DATE-TIME of the first segment
+    first_pdt = None
+    first_seg = None
+    try:
+        text = playlist.read_text().splitlines()
+        for i, line in enumerate(text):
+            if line.startswith("#EXT-X-PROGRAM-DATE-TIME:"):
+                from datetime import datetime
+                first_pdt = datetime.fromisoformat(
+                    line.split(":", 1)[1].strip()).timestamp()
+            elif line.startswith("#EXTINF") and i + 1 < len(text):
+                first_seg = text[i + 1].strip()
+                break
+    except Exception:
+        pass
+    if first_pdt is None:
+        return False
+    segs = sorted(ch_dir.glob("seg_*.ts"))
+    if len(segs) < 120:      # at least ~2 min of segments
+        return False
+    work = ch_dir / ".adskip"
+    work.mkdir(exist_ok=True)
+    for f in work.glob("*.txt"):
+        try: f.unlink()
+        except Exception: pass
+    concat = work / "concat.txt"
+    concat.write_text("\n".join(f"file '../{s.name}'" for s in segs))
+    merged = work / "merged.ts"
+    merged.unlink(missing_ok=True)
+    # Concatenate into a single MPEG-TS so comskip sees a continuous file
+    try:
+        subprocess.run(
+            ["nice", "-n", "15", "ffmpeg", "-y", "-hide_banner",
+             "-loglevel", "error", "-f", "concat", "-safe", "0",
+             "-i", str(concat), "-c", "copy", str(merged)],
+            cwd=str(work), timeout=180, check=False)
+    except Exception as e:
+        print(f"[{slug}] adskip concat: {e}", flush=True)
+        return False
+    if not merged.exists() or merged.stat().st_size < 1_000_000:
+        return False
+    # comskip
+    try:
+        subprocess.run(
+            ["nice", "-n", "15", "comskip", "--quiet",
+             "--output", str(work), str(merged)],
+            timeout=600, check=False)
+    except Exception as e:
+        print(f"[{slug}] adskip comskip: {e}", flush=True)
+    ads_sec = _rec_parse_comskip(work)
+    merged.unlink(missing_ok=True)
+    concat.unlink(missing_ok=True)
+    # Convert frame-based seconds (relative to concat start) to wall
+    ads_wall = [[round(first_pdt + a, 1), round(first_pdt + b, 1)]
+                for a, b in ads_sec]
+    with _live_ads_lock:
+        _live_ads[slug] = {"generated": time.time(), "ads": ads_wall}
+    print(f"[{slug}] adskip: {len(ads_wall)} blocks found", flush=True)
+    return True
+
+
+# Only scan channels where commercials are plausible — public
+# broadcasters have no regular ads primetime.
+LIVE_ADSKIP_SLUGS = {
+    "prosieben", "sat-1", "kabel-eins", "kabeleins", "prosiebenmaxx",
+    "rtl", "vox", "rtlzwei", "nitro", "rtlup", "superrtl",
+    "tele-5", "tele5", "sport1", "dmax", "sixx",
+}
+
+
+def _live_adskip_loop():
+    time.sleep(180)   # wait for streams to build up a useful window
+    while True:
+        try:
+            with active_lock:
+                candidates = [s for s, i in channels.items()
+                              if i["process"].poll() is None
+                              and s in LIVE_ADSKIP_SLUGS
+                              and (time.time() - i.get("started_at", 0)) > 120]
+            # Skip channels we've scanned within the last 12 min
+            with _live_ads_lock:
+                recent = {s for s, v in _live_ads.items()
+                          if time.time() - v.get("generated", 0) < 720}
+            todo = [s for s in candidates if s not in recent]
+            if todo:
+                slug = todo[0]
+                _live_ads_proc["slug"] = slug
+                _live_ads_proc["started"] = time.time()
+                try:
+                    _live_ads_analyze(slug)
+                finally:
+                    _live_ads_proc["slug"] = None
+        except Exception as e:
+            print(f"adskip loop: {e}", flush=True)
+        time.sleep(60)
+
+
+@app.route("/api/live-ads/<slug>/scan", methods=["POST"])
+def api_live_ads_scan(slug):
+    """Force an ad-detection pass on this channel's current live
+    buffer (bypasses the 12-min cache). Useful for testing."""
+    if slug not in LIVE_ADSKIP_SLUGS:
+        return _cors(Response(json.dumps({"skipped": True,
+                                           "reason": "not in commercial list"}),
+                               mimetype="application/json"))
+    def run():
+        try:
+            _live_ads_analyze(slug)
+        except Exception as e:
+            print(f"[{slug}] manual adskip: {e}", flush=True)
+    threading.Thread(target=run, daemon=True).start()
+    return _cors(Response(json.dumps({"started": True, "slug": slug}),
+                           mimetype="application/json"))
+
+
+@app.route("/api/live-ads/<slug>")
+def api_live_ads(slug):
+    with _live_ads_lock:
+        v = _live_ads.get(slug)
+    if not v:
+        return _cors(Response(json.dumps({"ads": [], "generated": 0}),
+                               mimetype="application/json"))
+    return _cors(Response(json.dumps({
+        "ads": v["ads"],
+        "generated": int(v["generated"]),
+    }), mimetype="application/json"))
+
+
 def _rec_prewarm_loop():
     """Background: remux finished DVR recordings to HLS so the player
     doesn't have to wait. Serial, low priority, skipped while live
@@ -3019,17 +3375,106 @@ def stop_all_endpoint():
 
 @app.route("/status")
 def status():
+    now = time.time()
     with active_lock:
         active = [{"slug": s,
                     "name": channel_map.get(s, {}).get("name", "?"),
-                    "idle_seconds": int(time.time() - i["last_seen"]),
+                    "idle_seconds": int(now - i["last_seen"]),
+                    "buffer_seconds": min(int(now - i.get("started_at", now)),
+                                           WINDOW_SECONDS),
+                    "always_warm": s in ALWAYS_WARM,
                     "codecs": codec_cache.get(s)}
                    for s, i in channels.items()]
     with codec_lock:
         probed = {s: c for s, c in codec_cache.items()}
     return {"total_channels": len(channel_map),
+            "max_warm": MAX_WARM_STREAMS,
+            "always_warm": sorted(ALWAYS_WARM),
             "active": active,
             "probed_codecs": probed}
+
+
+_dvr_upcoming_cache = {"count": 0, "expires": 0}
+
+
+def active_dvr_count():
+    """Count of tvheadend DVR entries that are either airing right now
+    or scheduled within the next 10 min — these will hold a tuner. We
+    cache for 30 s to keep the /warm-status poll lightweight."""
+    now = time.time()
+    if now < _dvr_upcoming_cache["expires"]:
+        return _dvr_upcoming_cache["count"]
+    count = 0
+    try:
+        data = json.loads(urllib.request.urlopen(
+            f"{TVH_BASE}/api/dvr/entry/grid_upcoming?limit=50",
+            timeout=4).read())
+        horizon = int(now) + 600
+        for e in data.get("entries", []):
+            start = e.get("start", 0)
+            stop = e.get("stop", 0)
+            if stop > now and start <= horizon:
+                count += 1
+    except Exception:
+        pass
+    _dvr_upcoming_cache["count"] = count
+    _dvr_upcoming_cache["expires"] = now + 30
+    return count
+
+
+@app.route("/api/always-warm/<slug>", methods=["POST"])
+def api_always_warm(slug):
+    """Toggle permanent-warm on a channel. Body: {"on": true|false}.
+    Refuses new pins that would exceed PIN_HARD_MAX - active DVR jobs."""
+    with cmap_lock:
+        if slug not in channel_map:
+            abort(404)
+    try:
+        body = json.loads(request.get_data() or b"{}")
+    except Exception:
+        body = {}
+    want = bool(body.get("on", True))
+    if want and slug not in ALWAYS_WARM:
+        pin_limit = max(0, PIN_HARD_MAX - active_dvr_count())
+        if len(ALWAYS_WARM) >= pin_limit:
+            return Response(json.dumps({
+                "slug": slug, "on": False, "changed": False,
+                "error": "Pin-Limit erreicht (Tuner-Reserve für DVR)",
+            }), status=409, mimetype="application/json")
+    changed = set_always_warm(slug, want)
+    return _cors(Response(json.dumps({"slug": slug, "on": want,
+                                        "changed": changed}),
+                           mimetype="application/json"))
+
+
+@app.route("/api/warm-status")
+def api_warm_status():
+    """Compact per-channel warm-state for the client (channel grid)."""
+    now = time.time()
+    with active_lock:
+        out = {s: {
+            "running": True,
+            "idle_seconds": int(now - i["last_seen"]),
+            "buffer_seconds": min(int(now - i.get("started_at", now)),
+                                    WINDOW_SECONDS),
+            "always_warm": s in ALWAYS_WARM,
+        } for s, i in channels.items()}
+    for s in ALWAYS_WARM:
+        out.setdefault(s, {"running": False, "always_warm": True,
+                            "idle_seconds": 0, "buffer_seconds": 0})
+    dvr_busy = active_dvr_count()
+    pins_used = len(ALWAYS_WARM)
+    pin_limit = max(0, PIN_HARD_MAX - dvr_busy)
+    pin_budget = max(0, pin_limit - pins_used)
+    return _cors(Response(json.dumps({
+        "channels": out,
+        "max_warm": MAX_WARM_STREAMS,
+        "window_seconds": WINDOW_SECONDS,
+        "pin_hard_max": PIN_HARD_MAX,
+        "pin_dvr_reserve": dvr_busy,
+        "pin_limit": pin_limit,
+        "pin_budget": pin_budget,
+    }), mimetype="application/json"))
 
 
 if __name__ == "__main__":
@@ -3038,8 +3483,11 @@ if __name__ == "__main__":
     load_stats()
     load_epg_archive()
     load_favorites()
+    load_always_warm()
     threading.Thread(target=idle_killer_loop, daemon=True).start()
     threading.Thread(target=prewarm_codecs, daemon=True).start()
     threading.Thread(target=epg_snapshot_loop, daemon=True).start()
     threading.Thread(target=_rec_prewarm_loop, daemon=True).start()
+    threading.Thread(target=always_warm_loop, daemon=True).start()
+    threading.Thread(target=_live_adskip_loop, daemon=True).start()
     app.run(host="0.0.0.0", port=8080, threaded=True)
