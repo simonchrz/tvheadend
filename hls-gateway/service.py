@@ -3314,10 +3314,17 @@ def _rec_prewarm_loop():
 
 
 def _rec_prewarm_once():
-    # Skip while any live stream is running — CPU goes to live
-    with active_lock:
-        if channels:
+    # Load-based gate: on a 4-core Pi each SD-MPEG-2 live stream eats
+    # ~0.7-1.0 core, so with 3+ pinned channels "any live active" was
+    # effectively "never prewarm". Instead skip only when the box is
+    # already under pressure — prewarm runs at nice 15 and won't
+    # preempt live transcodes, but we still want headroom for the
+    # scheduler to avoid segment-write stalls.
+    try:
+        if os.getloadavg()[0] > 6.0:
             return
+    except Exception:
+        pass
     # Skip while any remux is already in progress
     with _rec_hls_lock:
         for info in _rec_hls_procs.values():
