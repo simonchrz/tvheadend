@@ -2068,11 +2068,18 @@ window.addEventListener('pagehide',()=>navigator.sendBeacon(HOST+'/stop-all'));
 window.addEventListener('beforeunload',()=>navigator.sendBeacon(HOST+'/stop-all'));
 
 function toggleFs(){{
-  if(document.fullscreenElement||document.webkitFullscreenElement){{
+  const fsEl=document.fullscreenElement||document.webkitFullscreenElement;
+  if(fsEl){{
     (document.exitFullscreen||document.webkitExitFullscreen).call(document);
-  }} else if(v.requestFullscreen){{v.requestFullscreen();}}
-  else if(v.webkitRequestFullscreen){{v.webkitRequestFullscreen();}}
-  else if(v.webkitEnterFullscreen){{v.webkitEnterFullscreen();}}
+    return;
+  }}
+  const root=document.documentElement;
+  if(root.requestFullscreen){{root.requestFullscreen();return;}}
+  if(root.webkitRequestFullscreen){{root.webkitRequestFullscreen();return;}}
+  // iPhone Safari: native video fullscreen. iOS takes over with its
+  // own overlay controls and locks seek-back for live HLS — known
+  // limitation, there's no way around it without a PWA shell.
+  if(v.webkitEnterFullscreen){{v.webkitEnterFullscreen();}}
 }}
 function loadEpg(slug){{
   fetch(HOST+'/api/now/'+slug).then(r=>r.json()).then(d=>{{
@@ -2095,6 +2102,26 @@ document.addEventListener('touchend',e=>{{
     if(dx<0)nextCh();else prevCh();
   }}
 }},{{passive:true,capture:true}});
+// Double-tap on left/right of the video → seek ±10 s. Only triggers
+// from taps that land directly on the <video>, not on control buttons
+// or the scrub bar.
+let lastTapT=0,lastTapX=0;
+v.addEventListener('touchend',e=>{{
+  if(!e.changedTouches[0])return;
+  const now=Date.now();
+  const x=e.changedTouches[0].clientX;
+  if(now-lastTapT<300&&Math.abs(x-lastTapX)<60){{
+    const midX=window.innerWidth/2;
+    const delta=x<midX?-10:10;
+    seek(delta);
+    hint.textContent=(delta<0?'⏪ ':'⏩ ')+Math.abs(delta)+' s';
+    hint.classList.add('show');
+    setTimeout(()=>hint.classList.remove('show'),600);
+    lastTapT=0;
+  }} else {{
+    lastTapT=now;lastTapX=x;
+  }}
+}},{{passive:true}});
 function closePlayer(ev){{
   if(ev){{ev.preventDefault();}}
   try{{
@@ -3432,11 +3459,16 @@ def play_recording(uuid):
             f"v.addEventListener('play',()=>pp.textContent='\u23F8');"
             f"v.addEventListener('pause',()=>pp.textContent='\u25B6');"
             f"function toggleFs(){{"
-            f"  if(document.fullscreenElement||document.webkitFullscreenElement){{"
-            f"    (document.exitFullscreen||document.webkitExitFullscreen).call(document);"
-            f"  }} else if(v.requestFullscreen){{v.requestFullscreen();}}"
-            f"  else if(v.webkitRequestFullscreen){{v.webkitRequestFullscreen();}}"
-            f"  else if(v.webkitEnterFullscreen){{v.webkitEnterFullscreen();}}"
+            f"  const fsEl=document.fullscreenElement"
+            f"    ||document.webkitFullscreenElement;"
+            f"  if(fsEl){{"
+            f"    (document.exitFullscreen||document.webkitExitFullscreen)"
+            f"      .call(document);return;"
+            f"  }}"
+            f"  const root=document.documentElement;"
+            f"  if(root.requestFullscreen){{root.requestFullscreen();return;}}"
+            f"  if(root.webkitRequestFullscreen){{root.webkitRequestFullscreen();return;}}"
+            f"  if(v.webkitEnterFullscreen){{v.webkitEnterFullscreen();}}"
             f"}}"
             f"function currentAd(){{"
             f"  const t=v.currentTime||0;"
@@ -3504,6 +3536,26 @@ def play_recording(uuid):
             f"  else {{chrome.classList.add('hidden');"
             f"    topbar.classList.add('hidden');}}"
             f"}});"
+            # Double-tap on left/right of the recording video → seek ±10 s.
+            f"let lastTapT=0,lastTapX=0;"
+            f"v.addEventListener('touchend',e=>{{"
+            f"  if(!e.changedTouches[0])return;"
+            f"  const now=Date.now();"
+            f"  const x=e.changedTouches[0].clientX;"
+            f"  if(now-lastTapT<300&&Math.abs(x-lastTapX)<60){{"
+            f"    const delta=x<window.innerWidth/2?-10:10;"
+            f"    seek(delta);"
+            f"    const pill=document.createElement('div');"
+            f"    pill.textContent=(delta<0?'⏪ ':'⏩ ')+Math.abs(delta)+' s';"
+            f"    pill.style.cssText='position:fixed;left:50%;top:50%;"
+            f"transform:translate(-50%,-50%);font-size:1.4em;"
+            f"background:#000c;color:#fff;padding:12px 18px;"
+            f"border-radius:10px;z-index:40;pointer-events:none';"
+            f"    document.body.appendChild(pill);"
+            f"    setTimeout(()=>pill.remove(),600);"
+            f"    lastTapT=0;"
+            f"  }} else {{lastTapT=now;lastTapX=x;}}"
+            f"}},{{passive:true}});"
             f"document.addEventListener('mousemove',show);"
             f"const hideLoader=()=>loader.classList.add('hidden');"
             f"v.addEventListener('playing',hideLoader);"
