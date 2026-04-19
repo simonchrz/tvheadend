@@ -31,14 +31,14 @@ Alle drei als Docker-Container, `network_mode: host`.
 Nach Änderung an `service.py`:
 
 ```sh
-scp service.py simon@raspberrypi5lan:~/hls-gateway/service.py
-ssh simon@raspberrypi5lan 'docker restart hls-gateway'
+scp service.py <user>@<pi-host>:~/hls-gateway/service.py
+ssh <user>@<pi-host> 'docker restart hls-gateway'
 ```
 
 Beim Bauen des Image (z.B. comskip-Änderung):
 
 ```sh
-ssh simon@raspberrypi5lan 'cd ~/hls-gateway && docker compose build && docker compose up -d'
+ssh <user>@<pi-host> 'cd ~/hls-gateway && docker compose build && docker compose up -d'
 ```
 
 ## Ports
