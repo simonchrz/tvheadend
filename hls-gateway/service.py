@@ -1182,7 +1182,10 @@ function setSource(which){{
   if(which==='mediathek'){{
     const ch=channels[idx];
     const slug=(ch&&ch.slug)||current||'';
-    const label=slug.startsWith('zdf')||slug==='3sat-hd'?'ZDF Mediathek':'ARD Mediathek';
+    let label='ARD Mediathek';
+    if(slug.startsWith('zdf')||slug==='3sat-hd')label='ZDF Mediathek';
+    else if(slug==='arte-hd')label='arte.tv';
+    else if(slug==='kika-hd')label='KiKA';
     srcBadge.textContent=label;
     srcBadge.classList.add('mediathek');
     srcBadge.classList.remove('at-live');
@@ -1301,6 +1304,7 @@ function posForWall(ts){{
 function wallForCurrent(){{return wallAt(v.currentTime||0);}}
 let epgEvents=[];
 let mediathekAvailable=false;
+let mediathekWindow=0;
 function isReachable(ev){{
   /* Local: event start must be inside currently-seekable range.  */
   const[ss,ee]=seekableRange();
@@ -1309,8 +1313,8 @@ function isReachable(ev){{
     if(ev.start>=wallStart-2)return true;
   }}
   /* Mediathek: channel supported + event within the CDN DVR window
-     (ARD 2h / ZDF 3h — use the larger bound to avoid over-filtering).  */
-  if(mediathekAvailable&&ev.start>=Date.now()/1000-10800)return true;
+     (arte 30 min, ARD 2 h, ZDF 3 h — value per channel).  */
+  if(mediathekAvailable&&ev.start>=Date.now()/1000-mediathekWindow)return true;
   return false;
 }}
 function renderChapters(){{
@@ -1343,14 +1347,34 @@ function loadMediathekAvail(slug){{
   fetch(HOST+'/api/mediathek-live/'+slug).then(r=>r.json()).then(d=>{{
     if(slug!==current)return;
     mediathekAvailable=!!d.url;
+    mediathekWindow=d.window||0;
     renderChapters();
-  }}).catch(()=>{{mediathekAvailable=false;}});
+  }}).catch(()=>{{mediathekAvailable=false;mediathekWindow=0;}});
 }}
-function jumpToEvent(ev){{
+/* EPG start times are when the broadcast SLOT begins, but actual
+   content (after station ID / trailers) often starts 10-30 s later.
+   Seek a bit before the EPG start so we never miss the opener. ZDF
+   tends to have longer slot-padding than ARD, so give it more room. */
+function eventLeadIn(slug){{
+  return slug.startsWith('zdf')||slug==='3sat-hd'?5:15;
+}}
+/* Per-channel offset added to the authoritative broadcast start. ZDFs
+   API reports the EPG slot as "effective start" even when the show
+   itself begins ~10 s later after a station ID — so we nudge forward. */
+function postRollAdjust(slug){{
+  if(slug==='zdf-hd'||slug==='zdfinfo-hd'||slug==='zdfneo-hd'
+     ||slug==='3sat-hd'||slug==='arte-hd'||slug==='kika-hd'
+     ||slug==='phoenix-hd')return 10;
+  return 0;
+}}
+function doJump(actualStart,fromAuthoritative){{
+  const leadIn=fromAuthoritative?0:eventLeadIn(current);
+  const postRoll=fromAuthoritative?postRollAdjust(current):0;
+  const targetWall=actualStart-leadIn+postRoll;
   const[s,e]=seekableRange();
   const wallS=e>s?wallAt(s):null;
-  if(wallS!==null&&ev.start>=wallS){{
-    v.currentTime=Math.max(s+0.5,Math.min(e-1,ev.start-wallS));
+  if(wallS!==null&&targetWall>=wallS){{
+    v.currentTime=Math.max(s+0.5,Math.min(e-1,targetWall-wallS));
     show();return;
   }}
   fetch(HOST+'/api/mediathek-live/'+current)
@@ -1361,8 +1385,18 @@ function jumpToEvent(ev){{
        setTimeout(()=>hint.classList.remove('show'),2000);
        return;
      }}
-     switchToMediathek(d.url,ev.start);
+     /* Chapter-tap: no safety offset — the Now-Next / EPG time is
+        already the intended start point. */
+     switchToMediathek(d.url,targetWall,0);
    }}).catch(()=>{{}});
+}}
+function jumpToEvent(ev){{
+  fetch(HOST+'/api/show-actual-start/'+current+'?ts='+ev.start)
+   .then(r=>r.json()).then(d=>{{
+     const auth=(d.source==='ard-nownext'||d.source==='zdf-getepg');
+     doJump(d.actual||ev.start,auth);
+   }})
+   .catch(()=>doJump(ev.start,false));
 }}
 function currentEvent(){{
   const w=wallForCurrent();
@@ -1401,11 +1435,12 @@ function destroyHls(){{
   if(hlsInst){{try{{hlsInst.destroy();}}catch(e){{}}hlsInst=null;}}
   hlsCurrentUrl=null;
 }}
-function switchToMediathek(rawUrl,showStartTs){{
+function switchToMediathek(rawUrl,showStartTs,safetyOffset){{
   onMediathek=true;
   setSource('mediathek');
   destroyHls();
   hlsCurrentUrl=rawUrl;
+  if(typeof safetyOffset!=='number')safetyOffset=5;
   if(typeof Hls==='undefined'||!Hls.isSupported()){{
     hint.textContent='Mediathek nicht verfügbar';
     hint.classList.add('show');
@@ -1457,10 +1492,7 @@ function switchToMediathek(rawUrl,showStartTs){{
       try{{hls.stopLoad();}}catch(e){{}}
       hls.startLoad(targetT);
       let tries=0;
-      /* HLS segment snapping + iOS buffering latency can push resume
-         a few seconds past the pause point. Offset further back so we
-         always land before the pause, never after. */
-      const safeTarget=Math.max(0,targetT-5);
+      const safeTarget=Math.max(0,targetT-safetyOffset);
       const seekWhenReady=()=>{{
         const[ss,ee]=seekableRange();
         if(ss<=safeTarget&&ee>=safeTarget+2){{
@@ -1700,18 +1732,166 @@ fetch(HOST+'/api/channels').then(r=>r.json()).then(d=>{{
 
 
 MEDIATHEK_LIVE = {
-    "das-erste-hd":    "https://daserste-live.ard-mcdn.de/daserste/live/hls/de/master.m3u8",
-    "tagesschau24-hd": "https://tagesschau-live.ard-mcdn.de/tagesschau/live/hls/de/master.m3u8",
-    "zdf-hd":          "https://zdf-hls-15.akamaized.net/hls/live/2016498/de/veryhigh/master.m3u8",
-    "3sat-hd":         "https://zdf-hls-18.akamaized.net/hls/live/2016501/dach/veryhigh/master.m3u8",
+    # slug -> (url, dvr_window_seconds)
+    "das-erste-hd":    ("https://daserste-live.ard-mcdn.de/daserste/live/hls/de/master.m3u8",    7200),
+    "tagesschau24-hd": ("https://tagesschau-live.ard-mcdn.de/tagesschau/live/hls/de/master.m3u8", 7200),
+    "zdf-hd":          ("https://zdf-hls-15.akamaized.net/hls/live/2016498/de/veryhigh/master.m3u8", 10800),
+    "3sat-hd":         ("https://zdf-hls-18.akamaized.net/hls/live/2016501/dach/veryhigh/master.m3u8", 10800),
+    "arte-hd":         ("https://artesimulcast.akamaized.net/hls/live/2030993/artelive_de/index.m3u8", 1800),
+    "kika-hd":         ("https://kikageohls.akamaized.net/hls/live/2022693/livetvkika_de/master.m3u8", 7200),
 }
+
+# ARD now-next channel CRIDs for precise show-start lookup. Value is
+# the base64-encoded channel id that programm-api.ard.de expects.
+ARD_NOWNEXT_CRID = {
+    "das-erste-hd":    "Y3JpZDovL2Rhc2Vyc3RlLmRlL2xpdmUvY2xpcC9hYmNhMDdhMy0zNDc2LTQ4NTEtYjE2Mi1mZGU4ZjY0NmQ0YzQ",
+    "tagesschau24-hd": "Y3JpZDovL2Rhc2Vyc3RlLmRlL3RhZ2Vzc2NoYXUvbGl2ZXN0cmVhbQ",
+    "3sat-hd":         "Y3JpZDovLzNzYXQuZGUvTGl2ZXN0cmVhbS0zc2F0",
+}
+
+# ZDF broadcaster IDs (used with their getEpg GraphQL persisted query).
+# ZDFs API covers more than just ZDF — their EPG service delivers
+# precise now/next times for all public-broadcast partners they host.
+ZDF_BROADCASTER = {
+    "zdf-hd":      "ZDF",
+    "zdfinfo-hd":  "ZDFinfo",
+    "zdfneo-hd":   "ZDFneo",
+    "3sat-hd":     "3sat",
+    "kika-hd":     "KI.KA",
+    "phoenix-hd":  "PHOENIX",
+    "arte-hd":     "arte",
+}
+ZDF_API_TOKEN = "ahBaeMeekaiy5ohsai4bee4ki6Oopoi5quailieb"
+ZDF_GETEPG_HASH = "e36a71fb3206e75a82a5438737113b221e43daf0363d85f3eeceda288d158821"
+
+
+def _lookup_ard_actual_start(slug, ts):
+    crid = ARD_NOWNEXT_CRID.get(slug)
+    if not crid:
+        return None
+    try:
+        url = (f"https://programm-api.ard.de/nownext/api/channel"
+               f"?channel={crid}&pastHours=6&futureEvents=3")
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        data = json.loads(urllib.request.urlopen(req, timeout=5).read())
+    except Exception:
+        return None
+    from datetime import datetime
+    best = None
+    best_diff = 360
+    for ev in data.get("events", []):
+        scheduled = ev.get("startDate")
+        current = ev.get("currentStartDate") or scheduled
+        if not scheduled:
+            continue
+        try:
+            sched_ts = datetime.fromisoformat(scheduled).timestamp()
+        except Exception:
+            continue
+        diff = abs(sched_ts - ts)
+        if diff < best_diff:
+            try:
+                best = datetime.fromisoformat(current).timestamp()
+                best_diff = diff
+            except Exception:
+                pass
+    return int(best) if best is not None else None
+
+
+def _lookup_zdf_actual_start(slug, ts):
+    broadcaster_id = ZDF_BROADCASTER.get(slug)
+    if not broadcaster_id:
+        return None
+    from datetime import datetime, timezone
+    try:
+        base = datetime.fromtimestamp(ts, tz=timezone.utc)
+    except Exception:
+        return None
+    frm = base.replace(hour=0, minute=0, second=0, microsecond=0)
+    to  = frm.replace(hour=23, minute=59, second=59)
+    variables = urllib.parse.quote(json.dumps({
+        "filter": {
+            "broadcasterIds": [broadcaster_id],
+            "from": frm.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "to":  to.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        },
+    }, separators=(",", ":")))
+    extensions = urllib.parse.quote(json.dumps({
+        "persistedQuery": {"version": 1, "sha256Hash": ZDF_GETEPG_HASH},
+    }, separators=(",", ":")))
+    url = (f"https://api.zdf.de/graphql?operationName=getEpg"
+           f"&variables={variables}&extensions={extensions}")
+    try:
+        req = urllib.request.Request(url, headers={
+            "api-auth":                  f"Bearer {ZDF_API_TOKEN}",
+            "zdf-app-id":                "ngplayer_2_4",
+            "x-apollo-operation-name":   "getEpg",
+            "apollo-require-preflight":  "true",
+            "accept":                    "application/json",
+            "referer":                   "https://www.zdf.de/",
+        })
+        data = json.loads(urllib.request.urlopen(req, timeout=5).read())
+    except Exception:
+        return None
+    best = None
+    best_diff = 360
+    for entry in data.get("data", {}).get("epg", []):
+        bc = entry.get("broadcaster", {})
+        for slot in (bc.get("now"), bc.get("next")):
+            if not slot:
+                continue
+            scheduled = slot.get("airtimeBegin")
+            effective = slot.get("effectiveAirtimeBegin") or scheduled
+            if not scheduled:
+                continue
+            try:
+                sched_ts = datetime.fromisoformat(scheduled).timestamp()
+                eff_ts = datetime.fromisoformat(effective).timestamp()
+            except Exception:
+                continue
+            diff = abs(sched_ts - ts)
+            if diff < best_diff:
+                best = eff_ts
+                best_diff = diff
+    return int(best) if best is not None else None
+
+
+@app.route("/api/show-actual-start/<slug>")
+def api_show_actual_start(slug):
+    """Look up the ACTUAL broadcast start of the show whose EPG slot
+    starts at ?ts=<epoch>. Uses ARDs programm-api or ZDFs getEpg
+    persisted-query API, depending on the channel. Falls back to EPG
+    if no match within ±6 min."""
+    try:
+        ts = int(request.args.get("ts", "0"))
+    except ValueError:
+        ts = 0
+    if ts <= 0:
+        return _cors(Response(json.dumps({"actual": ts, "source": "epg"}),
+                               mimetype="application/json"))
+    actual = _lookup_ard_actual_start(slug, ts)
+    if actual is not None:
+        return _cors(Response(json.dumps({"actual": actual, "source": "ard-nownext"}),
+                               mimetype="application/json"))
+    actual = _lookup_zdf_actual_start(slug, ts)
+    if actual is not None:
+        return _cors(Response(json.dumps({"actual": actual, "source": "zdf-getepg"}),
+                               mimetype="application/json"))
+    return _cors(Response(json.dumps({"actual": ts, "source": "epg"}),
+                           mimetype="application/json"))
 
 
 @app.route("/api/mediathek-live/<slug>")
 def api_mediathek_live(slug):
     """Public HLS fallback URL (ARD Mediathek etc.) for restart beyond
-    the local DVR buffer. Returns { url } or { url: null }."""
-    return _cors(Response(json.dumps({"url": MEDIATHEK_LIVE.get(slug)}),
+    the local DVR buffer. Returns { url, window } or { url: null }."""
+    info = MEDIATHEK_LIVE.get(slug)
+    if info:
+        url, window = info
+        body = {"url": url, "window": window}
+    else:
+        body = {"url": None, "window": 0}
+    return _cors(Response(json.dumps(body),
                            mimetype="application/json"))
 
 
@@ -1720,9 +1900,10 @@ def mediathek_passthru_master(slug):
     """Transparently proxy ARD's master playlist, rewriting variant
     URIs to point back through us. All sub-playlists + segments also
     flow through our origin to avoid iOS cross-origin quirks."""
-    base_url = MEDIATHEK_LIVE.get(slug)
-    if not base_url:
+    info = MEDIATHEK_LIVE.get(slug)
+    if not info:
         abort(404)
+    base_url = info[0]
     try:
         txt = urllib.request.urlopen(base_url, timeout=8).read().decode()
     except Exception as e:
@@ -1878,9 +2059,10 @@ def mediathek_clip_master(slug):
     """Build a VOD master playlist with video+audio variants whose URIs
     point back to our /video.m3u8 and /audio.m3u8 (which rewrite from
     the corresponding ARD playlists)."""
-    base_url = MEDIATHEK_LIVE.get(slug)
-    if not base_url:
+    info = MEDIATHEK_LIVE.get(slug)
+    if not info:
         abort(404)
+    base_url = info[0]
     try:
         start_ts = int(request.args.get("start", "0"))
     except ValueError:
