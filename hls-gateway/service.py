@@ -2985,6 +2985,34 @@ def _rec_hls_spawn(uuid):
 _live_ads_lock = threading.Lock()
 _live_ads = {}   # slug -> {"generated": ts, "ads": [[wall_start, wall_stop], ...]}
 _live_ads_proc = {"slug": None, "started": 0}
+LIVE_ADS_FILE = HLS_DIR / ".live_ads.json"
+
+
+def load_live_ads():
+    if not LIVE_ADS_FILE.exists():
+        return
+    try:
+        data = json.loads(LIVE_ADS_FILE.read_text())
+        # Drop entries older than 2 h — the ad blocks' wall times would
+        # point outside any live buffer window anyway.
+        cutoff = time.time() - 2 * 3600
+        with _live_ads_lock:
+            _live_ads.update({
+                s: v for s, v in data.items()
+                if v.get("generated", 0) > cutoff
+            })
+        print(f"Loaded live-ads for {len(_live_ads)} channels", flush=True)
+    except Exception as e:
+        print(f"load live-ads: {e}", flush=True)
+
+
+def save_live_ads():
+    try:
+        with _live_ads_lock:
+            snap = {s: dict(v) for s, v in _live_ads.items()}
+        LIVE_ADS_FILE.write_text(json.dumps(snap))
+    except Exception as e:
+        print(f"save live-ads: {e}", flush=True)
 
 
 def _live_ads_analyze(slug):
@@ -3060,6 +3088,7 @@ def _live_ads_analyze(slug):
                 for a, b in ads_sec]
     with _live_ads_lock:
         _live_ads[slug] = {"generated": time.time(), "ads": ads_wall}
+    save_live_ads()
     print(f"[{slug}] adskip: {len(ads_wall)} blocks found", flush=True)
     return True
 
@@ -3792,7 +3821,9 @@ def _sighup_reload(signum, frame):
 def _file_watcher_loop():
     # Poll service.py mtime; self-exec when the mount picks up a new
     # version. Avoids `docker restart` on hot-reloads so the ffmpeg
-    # buffer survives.
+    # buffer survives. A broken scp would crash the fresh Python
+    # (container dies, cgroup kill, buffer gone) — so compile-check
+    # first and skip the reload if the file doesn't parse.
     path = os.path.abspath(__file__)
     try:
         last = os.path.getmtime(path)
@@ -3804,10 +3835,23 @@ def _file_watcher_loop():
             mt = os.path.getmtime(path)
         except OSError:
             continue
-        if mt != last:
-            # Wait a tick for scp to finish writing.
-            time.sleep(1)
-            _self_exec(f"{path} changed")
+        if mt == last:
+            continue
+        # Wait a tick for scp to finish writing.
+        time.sleep(1)
+        try:
+            src = open(path, "rb").read()
+            compile(src, path, "exec")
+        except SyntaxError as e:
+            print(f"hot-reload skipped: {path} has SyntaxError "
+                  f"at line {e.lineno}: {e.msg}", flush=True)
+            last = mt   # don't spam the log every 2 s; wait for next edit
+            continue
+        except Exception as e:
+            print(f"hot-reload skipped: compile failed: {e}", flush=True)
+            last = mt
+            continue
+        _self_exec(f"{path} changed")
 
 
 if __name__ == "__main__":
@@ -3817,6 +3861,7 @@ if __name__ == "__main__":
     load_epg_archive()
     load_favorites()
     load_always_warm()
+    load_live_ads()
     adopt_surviving_ffmpegs()
     signal.signal(signal.SIGHUP, _sighup_reload)
     threading.Thread(target=_file_watcher_loop, daemon=True).start()
