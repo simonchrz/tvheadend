@@ -3084,6 +3084,10 @@ def _rec_hls_spawn(uuid):
                                  "total_segs": total}
         print(f"[rec-hls {uuid[:8]}] ffmpeg spawned, ~{total} segments",
               flush=True)
+        # Kick off comskip right away — it reads the same .ts source
+        # (read-only) so it can run concurrently with the remux and
+        # commercial markers land on the scrub bar ~5 min sooner.
+        _rec_cskip_spawn(uuid)
 
         def _after_ffmpeg():
             proc.wait()
@@ -3097,8 +3101,6 @@ def _rec_hls_spawn(uuid):
                       flush=True)
                 shutil.rmtree(out_dir, ignore_errors=True)
                 _rec_hls_procs.pop(uuid, None)
-                return
-            _rec_cskip_spawn(uuid)
         threading.Thread(target=_after_ffmpeg, daemon=True).start()
     return playlist
 
@@ -3424,6 +3426,16 @@ def recording_hls_progress(uuid):
     if not st["playlist"].exists() and not st["running"]:
         _rec_hls_spawn(uuid)
         st = _rec_state(uuid)
+    # Make sure comskip is on its way — idempotent, safe on every
+    # poll. Covers pre-fix recordings that never got a scan, and
+    # cleans up 0-byte .txt leftovers from an aborted prior run that
+    # would otherwise make us think comskip already finished.
+    out_dir = HLS_DIR / f"_rec_{uuid}"
+    if out_dir.exists():
+        usable = [t for t in out_dir.glob("*.txt")
+                  if t.stat().st_size > 0]
+        if not usable:
+            _rec_cskip_spawn(uuid)
     return _cors(Response(json.dumps({"done": st["done"],
                                         "segments": st["segments"],
                                         "total": st["total"]}),
