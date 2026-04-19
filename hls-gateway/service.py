@@ -508,7 +508,7 @@ def start_ffmpeg(slug):
         # Scale anamorphic SD (720x576 SAR 64:45) to square pixels so
         # iOS/Safari renders the correct 16:9 aspect instead of 4:3-ish.
         video_opts = [
-            "-vf", "scale='trunc(iw*sar/2)*2':'trunc(ih/2)*2',setsar=1",
+            "-vf", "scale=trunc(iw*sar/2)*2:trunc(ih/2)*2,setsar=1",
             "-c:v", "libx264",
             "-preset", "ultrafast",
             "-tune", "zerolatency",
@@ -3039,7 +3039,11 @@ def _rec_hls_spawn(uuid):
         # return a truncated one from a prior crashed run.
         try: playlist.unlink()
         except FileNotFoundError: pass
-        src = f"{TVH_BASE}/dvrfile/{uuid}"
+        # Prefer the on-disk file over tvheadend's /dvrfile HTTP endpoint
+        # — ffmpeg 8.x's MPEG-2 decoder chokes on the HTTP stream (bails
+        # after 25× "Invalid frame dimensions 0x0" with zero output),
+        # while the same .ts file read directly decodes fine.
+        src = _rec_source_path(uuid) or f"{TVH_BASE}/dvrfile/{uuid}"
         # Probe video codec — copy if already H.264, transcode MPEG-2 etc.
         try:
             probe = subprocess.run(
@@ -3054,7 +3058,7 @@ def _rec_hls_spawn(uuid):
             v_opts = ["-c:v", "copy"]
         else:
             v_opts = ["-vf",
-                      "scale='trunc(iw*sar/2)*2':'trunc(ih/2)*2',setsar=1",
+                      "scale=trunc(iw*sar/2)*2:trunc(ih/2)*2,setsar=1",
                       "-c:v", "libx264", "-preset", "ultrafast",
                       "-profile:v", "main", "-pix_fmt", "yuv420p",
                       "-g", "50"]
@@ -3083,6 +3087,17 @@ def _rec_hls_spawn(uuid):
 
         def _after_ffmpeg():
             proc.wait()
+            if proc.returncode != 0:
+                # Self-heal on crash: wipe the partial HLS directory so
+                # the next player request re-spawns from scratch. Without
+                # this we'd serve a truncated playlist + premature
+                # ENDLIST, which looks like an instant-done empty clip.
+                print(f"[rec-hls {uuid[:8]}] ffmpeg failed "
+                      f"(rc={proc.returncode}) — wiping {out_dir.name}",
+                      flush=True)
+                shutil.rmtree(out_dir, ignore_errors=True)
+                _rec_hls_procs.pop(uuid, None)
+                return
             _rec_cskip_spawn(uuid)
         threading.Thread(target=_after_ffmpeg, daemon=True).start()
     return playlist
@@ -3332,9 +3347,13 @@ def _rec_prewarm_once():
                 return
 
 
-def _rec_playlist_as_vod(text):
+def _rec_playlist_as_vod(text, is_running=False):
     """Convert an EVENT-type playlist into VOD with ENDLIST so iOS
-    shows a scrub bar and starts from the beginning instead of live-edge."""
+    shows a scrub bar and starts from the beginning instead of live-edge.
+    When the remux is still running, keep EVENT type and omit ENDLIST
+    so iOS treats the playlist as growing and keeps polling."""
+    if is_running:
+        return text
     text = text.replace("#EXT-X-PLAYLIST-TYPE:EVENT",
                         "#EXT-X-PLAYLIST-TYPE:VOD")
     if "#EXT-X-PLAYLIST-TYPE" not in text:
@@ -3369,18 +3388,20 @@ def _rec_state(uuid):
 @app.route("/recording/<uuid>/index.m3u8")
 def recording_hls(uuid):
     """VOD playlist endpoint. Spawns ffmpeg in the background on first
-    call; returns 202 while remux is running so the player UI can keep
-    showing a loader instead of blocking on a slow HTTP request."""
+    call; serves the growing playlist as soon as ~10 segments are
+    ready (EVENT type so iOS keeps polling), then switches to VOD
+    with ENDLIST once the remux finishes."""
     st = _rec_state(uuid)
     if not st["playlist"].exists() and not st["running"]:
         _rec_hls_spawn(uuid)
         st = _rec_state(uuid)
-    if not st["done"]:
+    if not st["playlist"].exists() or st["segments"] < 10:
         return Response(json.dumps({"done": False,
                                      "segments": st["segments"],
                                      "total": st["total"]}),
                         status=202, mimetype="application/json")
-    return Response(_rec_playlist_as_vod(st["playlist"].read_text()),
+    return Response(_rec_playlist_as_vod(st["playlist"].read_text(),
+                                           is_running=st["running"]),
                     mimetype="application/vnd.apple.mpegurl")
 
 
@@ -3547,9 +3568,13 @@ def play_recording(uuid):
             f"function tick(){{"
             f"  fetch('{HOST_URL}/recording/{uuid}/progress').then(r=>r.json())"
             f"   .then(d=>{{"
+            # Start playback once ~10 segments (60 s at hls_time=6) are
+            # on disk — iOS can stream a growing EVENT playlist and will
+            # keep polling for new segments as we remux.
+            f"     const ready=d.done||d.segments>=10;"
+            f"     if(ready&&!srcSet){{srcSet=true;v.src='{src}';v.load();"
+            f"       v.play().catch(()=>{{}});}}"
             f"     if(d.done){{"
-            f"       if(!srcSet){{srcSet=true;v.src='{src}';v.load();"
-            f"         v.play().catch(()=>{{}});}}"
             f"       lmsg.textContent='Fertig — wird geladen…';"
             f"     }} else {{"
             f"       const pct=d.total>0?Math.min(99,Math.round(d.segments*100/d.total)):0;"
