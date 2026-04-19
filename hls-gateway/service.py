@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """HLS Gateway on-demand for tvheadend. Spawns ffmpeg per channel on request,
 stops after idle timeout. Serves an HLS playlist with 2h DVR window."""
-import os, re, json, time, shutil, subprocess, threading, urllib.request
+import os, re, sys, signal, json, time, shutil, subprocess, threading, urllib.request
 import urllib.parse
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -372,6 +372,77 @@ def prewarm_codecs():
     print(f"[prewarm] done", flush=True)
 
 
+class AdoptedProcess:
+    """Popen-compatible stand-in for an ffmpeg process that survived
+    a container restart (we spawn with start_new_session=True so the
+    children get orphaned from PID 1 instead of killed). We re-attach
+    by PID on the next hls-gateway startup."""
+    def __init__(self, pid):
+        self.pid = pid
+    def poll(self):
+        try:
+            os.kill(self.pid, 0)
+            return None
+        except OSError:
+            return 0
+    def terminate(self):
+        try: os.kill(self.pid, 15)
+        except OSError: pass
+    def kill(self):
+        try: os.kill(self.pid, 9)
+        except OSError: pass
+    def wait(self, timeout=None):
+        deadline = time.time() + (timeout or 1e9)
+        while time.time() < deadline:
+            if self.poll() is not None:
+                return 0
+            time.sleep(0.1)
+        raise subprocess.TimeoutExpired(cmd="", timeout=timeout)
+
+
+def adopt_surviving_ffmpegs():
+    """Look for PID files left behind by ffmpegs from a prior container
+    run. For each still-alive ffmpeg, register it in `channels` so the
+    HLS buffer continues uninterrupted."""
+    if not HLS_DIR.exists():
+        return
+    adopted = 0
+    for ch_dir in HLS_DIR.iterdir():
+        if not ch_dir.is_dir() or ch_dir.name.startswith((".", "_")):
+            continue
+        pid_file = ch_dir / ".ffmpeg.pid"
+        if not pid_file.exists():
+            continue
+        try:
+            data = json.loads(pid_file.read_text())
+            pid = int(data["pid"])
+            started_at = float(data.get("started_at", time.time()))
+        except Exception:
+            try: pid_file.unlink()
+            except Exception: pass
+            continue
+        try:
+            os.kill(pid, 0)
+        except OSError:
+            try: pid_file.unlink()
+            except Exception: pass
+            continue
+        slug = ch_dir.name
+        with cmap_lock:
+            if slug not in channel_map:
+                continue
+        with active_lock:
+            channels[slug] = {"process": AdoptedProcess(pid),
+                              "last_seen": time.time(),
+                              "started_at": started_at}
+        adopted += 1
+        age = int(time.time() - started_at)
+        print(f"[{slug}] adopted ffmpeg pid={pid} "
+              f"(buffer age {age}s)", flush=True)
+    if adopted:
+        print(f"adopted {adopted} surviving ffmpeg processes", flush=True)
+
+
 def start_ffmpeg(slug):
     info = channel_map.get(slug)
     if not info:
@@ -423,9 +494,18 @@ def start_ffmpeg(slug):
         str(ch_dir / "index.m3u8"),
     ]
     proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL,
-                             stderr=subprocess.DEVNULL)
+                             stderr=subprocess.DEVNULL,
+                             start_new_session=True)
     mode = "passthrough" if codecs["video"] in SAFE_VIDEO and codecs["audio"] in SAFE_AUDIO \
            else f"transcode v={codecs['video']} a={codecs['audio']}"
+    # Record pid + start time so we can re-adopt the ffmpeg if the
+    # hls-gateway container restarts (segments keep rolling meanwhile).
+    try:
+        (ch_dir / ".ffmpeg.pid").write_text(json.dumps({
+            "pid": proc.pid, "started_at": time.time(),
+        }))
+    except Exception as e:
+        print(f"[{slug}] pid-file write: {e}", flush=True)
     print(f"[{slug}] ffmpeg pid={proc.pid} ({mode})", flush=True)
     return proc
 
@@ -438,10 +518,14 @@ def stop_channel(slug):
             try:
                 info["process"].terminate()
                 try: info["process"].wait(timeout=5)
-                except: info["process"].kill()
+                except Exception: info["process"].kill()
             except Exception: pass
         record_stop(slug, info.get("started_at", time.time()))
         print(f"[{slug}] stopped", flush=True)
+    # Best-effort cleanup of the pid file so an orphaned ffmpeg from a
+    # prior container run isn't re-adopted after we intentionally stopped
+    try: (HLS_DIR / slug / ".ffmpeg.pid").unlink()
+    except Exception: pass
 
 
 def ensure_running(slug):
@@ -1065,13 +1149,13 @@ def epg_grid():
     # Current time marker — position inside timeline only (no offset for channel col)
     now_offset_px = int((now_ts - win_start) / 60 * px_per_min)
 
-    # Next 20:00 (Primetime) within the window
+    # Next 20:15 (Primetime) within the window
     now_lt = time.localtime(now_ts)
-    today_2000 = time.mktime((now_lt.tm_year, now_lt.tm_mon, now_lt.tm_mday,
-                              20, 0, 0, 0, 0, -1))
-    prime_ts = today_2000 if today_2000 >= now_ts else today_2000 + 86400
+    today_2015 = time.mktime((now_lt.tm_year, now_lt.tm_mon, now_lt.tm_mday,
+                              20, 15, 0, 0, 0, -1))
+    prime_ts = today_2015 if today_2015 >= now_ts else today_2015 + 86400
     if prime_ts > win_end:
-        prime_ts = today_2000  # fall back to today's 20:00 if tomorrow's is out
+        prime_ts = today_2015
     prime_px = int((prime_ts - win_start) / 60 * px_per_min)
     now_line = (f'<div class="epg-now-line" '
                 f'style="left:{now_offset_px}px"></div>')
@@ -1096,7 +1180,7 @@ def epg_grid():
             f"<a class='btn-now' href='#' onclick='jumpNow();return false'>"
             f"▶︎ Jetzt</a>"
             f"<a class='btn-now' href='#' onclick='jumpPrime();return false'>"
-            f"🕗 20:00</a>"
+            f"🕗 20:15</a>"
             f"<span style='color:var(--muted);font-size:.85em'>"
             f"<a href='?back=6&fwd=12'>6h↞</a> · "
             f"<a href='?back=12&fwd=18'>12h↞</a> · "
@@ -3477,6 +3561,45 @@ def api_warm_status():
     }), mimetype="application/json"))
 
 
+def _self_exec(reason):
+    # Replace this Python process in place. Child ffmpegs (spawned with
+    # start_new_session=True and tracked via PID files) remain our
+    # children by PID and are re-adopted by the fresh image.
+    print(f"self-exec ({reason})", flush=True)
+    try: sys.stdout.flush()
+    except Exception: pass
+    # Close inherited FDs (listening socket on :8080 above all) so the
+    # new image can rebind cleanly. Keep stdin/stdout/stderr (0,1,2).
+    try: os.closerange(3, 1024)
+    except Exception: pass
+    os.execv(sys.executable, [sys.executable, "-u", os.path.abspath(__file__)])
+
+
+def _sighup_reload(signum, frame):
+    _self_exec("SIGHUP")
+
+
+def _file_watcher_loop():
+    # Poll service.py mtime; self-exec when the mount picks up a new
+    # version. Avoids `docker restart` on hot-reloads so the ffmpeg
+    # buffer survives.
+    path = os.path.abspath(__file__)
+    try:
+        last = os.path.getmtime(path)
+    except OSError:
+        return
+    while True:
+        time.sleep(2)
+        try:
+            mt = os.path.getmtime(path)
+        except OSError:
+            continue
+        if mt != last:
+            # Wait a tick for scp to finish writing.
+            time.sleep(1)
+            _self_exec(f"{path} changed")
+
+
 if __name__ == "__main__":
     HLS_DIR.mkdir(parents=True, exist_ok=True)
     load_codec_cache()
@@ -3484,6 +3607,9 @@ if __name__ == "__main__":
     load_epg_archive()
     load_favorites()
     load_always_warm()
+    adopt_surviving_ffmpegs()
+    signal.signal(signal.SIGHUP, _sighup_reload)
+    threading.Thread(target=_file_watcher_loop, daemon=True).start()
     threading.Thread(target=idle_killer_loop, daemon=True).start()
     threading.Thread(target=prewarm_codecs, daemon=True).start()
     threading.Thread(target=epg_snapshot_loop, daemon=True).start()

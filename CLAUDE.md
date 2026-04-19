@@ -110,11 +110,20 @@ on an external USB-3 SSD at `/mnt/tv/`.
 ## Development workflow
 
 ```sh
-# hot-reload Python code (compose mounts service.py as read-only)
+# Hot-reload Python code. A file watcher inside the container notices
+# the mtime change on the mounted service.py and triggers an in-place
+# os.execv. Children (ffmpegs spawned with start_new_session=True) are
+# re-adopted by PID file on the next boot, so the 2 h DVR buffer
+# survives the reload. No `docker restart` needed — and crucially, a
+# full container restart DOES kill the ffmpegs (cgroup teardown), so
+# avoid it for code-only changes.
 scp hls-gateway/service.py <user>@<pi-host>:~/hls-gateway/service.py
-ssh <user>@<pi-host> 'docker restart hls-gateway'
 
-# Rebuild image (e.g. Dockerfile change)
+# Equivalent explicit trigger (if the file watcher is suppressed, e.g.
+# for bulk edits): SIGHUP the container's PID 1.
+ssh <user>@<pi-host> 'docker kill -s HUP hls-gateway'
+
+# Rebuild image (e.g. Dockerfile change) — buffer will reset.
 ssh <user>@<pi-host> 'cd ~/hls-gateway && docker compose build && docker compose up -d'
 ```
 

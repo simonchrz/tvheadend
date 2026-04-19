@@ -28,14 +28,22 @@ Alle drei als Docker-Container, `network_mode: host`.
 
 ## Entwicklung
 
-Nach Änderung an `service.py`:
+Nach Änderung an `service.py` reicht ein `scp`. Ein File-Watcher
+im Container erkennt die Änderung und ruft `os.execv` auf, um sich an
+Ort und Stelle durch die neue Version zu ersetzen. Die laufenden
+ffmpeg-Prozesse (mit `start_new_session=True` gestartet und per
+PID-Datei in `/mnt/tv/hls/<slug>/.ffmpeg.pid` getrackt) werden vom
+neuen Prozess wieder adoptiert — der 2-h-DVR-Puffer bleibt erhalten.
+Ein `docker restart` zerstört dagegen das cgroup und killt damit auch
+die ffmpegs, daher dafür nicht nutzen.
 
 ```sh
 scp service.py <user>@<pi-host>:~/hls-gateway/service.py
-ssh <user>@<pi-host> 'docker restart hls-gateway'
+# optional explizit: docker kill -s HUP hls-gateway
 ```
 
-Beim Bauen des Image (z.B. comskip-Änderung):
+Beim Bauen des Image (z.B. comskip-Änderung) — Puffer wird dabei
+resettet:
 
 ```sh
 ssh <user>@<pi-host> 'cd ~/hls-gateway && docker compose build && docker compose up -d'
