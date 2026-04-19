@@ -3179,10 +3179,12 @@ def _live_ads_analyze(slug):
         return False
     if not merged.exists() or merged.stat().st_size < 1_000_000:
         return False
-    # comskip
+    # comskip — maximum niceness and tight ionice so it loses to
+    # every live-TV ffmpeg whenever there's contention.
     try:
         subprocess.run(
-            ["nice", "-n", "15", "comskip", "--quiet",
+            ["nice", "-n", "19", "ionice", "-c", "3",
+             "comskip", "--quiet",
              "--output", str(work), str(merged)],
             timeout=600, check=False)
     except Exception as e:
@@ -3213,8 +3215,18 @@ def _live_adskip_loop():
     # The per-channel `started_at > 120s` check below is what actually
     # guarantees the buffer is long enough to bother analysing.
     time.sleep(10)
+    # 1-min loadavg threshold: we have 4 cores and 5 SD-MPEG-2 streams
+    # already running libx264, each eating ~0.7-1.0 core. Add comskip
+    # and the playing client, and ffmpeg starves — segment writes
+    # stall for 20 s, playback stutters. Hold off the scan until
+    # there's real headroom.
+    LOAD_CAP = 10.0
     while True:
         try:
+            load = os.getloadavg()[0]
+            if load > LOAD_CAP:
+                time.sleep(60)
+                continue
             with active_lock:
                 candidates = [s for s, i in channels.items()
                               if i["process"].poll() is None
@@ -3227,7 +3239,8 @@ def _live_adskip_loop():
             if todo:
                 slug = todo[0]
                 print(f"[{slug}] adskip: analysing "
-                      f"({len(todo)-1} more queued)", flush=True)
+                      f"(load={load:.1f}, {len(todo)-1} more queued)",
+                      flush=True)
                 _live_ads_proc["slug"] = slug
                 _live_ads_proc["started"] = time.time()
                 try:
