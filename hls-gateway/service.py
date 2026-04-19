@@ -1470,6 +1470,12 @@ const v=document.getElementById('v');
 const chrome=document.getElementById('chrome');
 const topbar=document.getElementById('topbar');
 const hint=document.getElementById('hint');
+const pp=document.getElementById('pp');
+const scrub=document.getElementById('scrub');
+const played=document.getElementById('played');
+const thumb=document.getElementById('thumb');
+v.addEventListener('play',()=>pp.textContent='\u23F8');
+v.addEventListener('pause',()=>pp.textContent='\u25B6');
 let _chromeT=null;
 function show(){
   chrome.classList.remove('hidden');
@@ -1502,6 +1508,14 @@ function closePlayer(ev){
   location.href=PLAYER_HOME;
   return false;
 }
+// Scrub-bar drag (mouse + touch). Per-mode seekTo(ev) is hoisted.
+let _dragging=false;
+scrub.addEventListener('mousedown',e=>{_dragging=true;seekTo(e);show();});
+window.addEventListener('mousemove',e=>{if(_dragging){seekTo(e);show();}});
+window.addEventListener('mouseup',()=>{_dragging=false;});
+scrub.addEventListener('touchstart',e=>{_dragging=true;seekTo(e);show();},{passive:true});
+scrub.addEventListener('touchmove',e=>{if(_dragging){seekTo(e);show();}},{passive:true});
+scrub.addEventListener('touchend',()=>{_dragging=false;},{passive:true});
 let _lastTapT=0,_lastTapX=0;
 v.addEventListener('touchend',e=>{
   if(!e.changedTouches[0])return;
@@ -1519,6 +1533,13 @@ v.addEventListener('touchend',e=>{
 """
 
 
+PLAYER_HEAD_META = (
+    "<meta name='viewport' content='width=device-width,"
+    "initial-scale=1,user-scalable=no,viewport-fit=cover'>"
+    "<meta name='color-scheme' content='dark'>"
+)
+
+
 @app.route("/watch/<slug>")
 def watch_player(slug):
     """Fullscreen HTML player with swipe-to-switch-channel gestures."""
@@ -1527,10 +1548,7 @@ def watch_player(slug):
     if not info:
         abort(404, "unknown channel")
     return f"""<!doctype html>
-<html><head><meta name='viewport'
- content='width=device-width,initial-scale=1,user-scalable=no,viewport-fit=cover'>
-<meta name='color-scheme' content='dark'>
-<title>{info['name']}</title>
+<html><head>{PLAYER_HEAD_META}<title>{info['name']}</title>
 <script src="https://cdn.jsdelivr.net/npm/hls.js@1/dist/hls.min.js"></script>
 <style>
 {PLAYER_BASE_CSS}
@@ -1633,12 +1651,8 @@ function updateLiveBadge(){{
   if(isAtLive())srcBadge.classList.add('at-live');
   else srcBadge.classList.remove('at-live');
 }}
-const pp=document.getElementById('pp');
 const cur=document.getElementById('cur');
-const scrub=document.getElementById('scrub');
-const played=document.getElementById('played');
 const avail=document.getElementById('avail');
-const thumb=document.getElementById('thumb');
 const WINDOW=7200;  /* fixed 2h scrub coordinate system */
 
 function fmt(s){{
@@ -2018,16 +2032,6 @@ function seekTo(ev){{
   const clamped=Math.max(wallS,Math.min(wallE-1,targetWall));
   v.currentTime=s+(clamped-wallS);
 }}
-let dragging=false;
-scrub.addEventListener('mousedown',e=>{{dragging=true;seekTo(e);show();}});
-window.addEventListener('mousemove',e=>{{if(dragging){{seekTo(e);show();}}}});
-window.addEventListener('mouseup',()=>{{dragging=false;}});
-scrub.addEventListener('touchstart',e=>{{dragging=true;seekTo(e);show();}},
-  {{passive:true}});
-scrub.addEventListener('touchmove',e=>{{if(dragging){{seekTo(e);show();}}}},
-  {{passive:true}});
-scrub.addEventListener('touchend',()=>{{dragging=false;}},{{passive:true}});
-
 let pauseState=null;
 function togglePlay(){{
   if(pauseState){{
@@ -2074,8 +2078,6 @@ function togglePlay(){{
   setTimeout(()=>{{if(pauseState)pp.textContent='\u25B6';}},80);
   setTimeout(()=>{{if(pauseState)pp.textContent='\u25B6';}},500);
 }}
-v.addEventListener('play',()=>pp.textContent='\u23F8');
-v.addEventListener('pause',()=>pp.textContent='\u25B6');
 
 function doUnmute(){{
   v.muted=false;v.play().catch(()=>{{}});unmuteBtn.style.display='none';
@@ -3345,9 +3347,7 @@ def play_recording(uuid):
     title_safe = title.replace("<", "&lt;")
     src = f"{HOST_URL}/recording/{uuid}/index.m3u8"
     html = (f"<!doctype html><html><head>"
-            f"<meta name='viewport' content='width=device-width,"
-            f"initial-scale=1,viewport-fit=cover,user-scalable=no'>"
-            f"<meta name='color-scheme' content='dark'>"
+            f"{PLAYER_HEAD_META}"
             f"<title>{title_safe}</title>"
             f"<style>{PLAYER_BASE_CSS}"
             f".pill.rec{{background:#e74c3c}}"
@@ -3393,12 +3393,8 @@ def play_recording(uuid):
             f"<script>"
             f"const PLAYER_HOME='{HOST_URL}/recordings';"
             f"{PLAYER_BASE_JS}"
-            f"const pp=document.getElementById('pp');"
             f"const cur=document.getElementById('cur');"
             f"const dur=document.getElementById('dur');"
-            f"const scrub=document.getElementById('scrub');"
-            f"const played=document.getElementById('played');"
-            f"const thumb=document.getElementById('thumb');"
             f"const loader=document.getElementById('loader');"
             f"const lmsg=document.getElementById('lmsg');"
             f"const skipBtn=document.getElementById('skipad');"
@@ -3418,8 +3414,6 @@ def play_recording(uuid):
             f"  v.currentTime=Math.max(0,Math.min(D-0.5,(v.currentTime||0)+d));"
             f"  show();"
             f"}}"
-            f"v.addEventListener('play',()=>pp.textContent='\u23F8');"
-            f"v.addEventListener('pause',()=>pp.textContent='\u25B6');"
             f"function currentAd(){{"
             f"  const t=v.currentTime||0;"
             f"  for(const a of ads){{if(t>=a[0]&&t<a[1])return a;}}"
@@ -3459,16 +3453,6 @@ def play_recording(uuid):
             f"  const D=isFinite(v.duration)?v.duration:0;"
             f"  if(D>0)v.currentTime=p*D;"
             f"}}"
-            f"let dragging=false;"
-            f"scrub.addEventListener('mousedown',e=>{{dragging=true;seekTo(e);show();}});"
-            f"window.addEventListener('mousemove',e=>{{if(dragging){{seekTo(e);show();}}}});"
-            f"window.addEventListener('mouseup',()=>{{dragging=false;}});"
-            f"scrub.addEventListener('touchstart',e=>{{dragging=true;seekTo(e);show();}},"
-            f"   {{passive:true}});"
-            f"scrub.addEventListener('touchmove',e=>{{if(dragging){{seekTo(e);show();}}}},"
-            f"   {{passive:true}});"
-            f"scrub.addEventListener('touchend',()=>{{dragging=false;}},"
-            f"   {{passive:true}});"
             f"v.addEventListener('click',()=>{{"
             f"  if(chrome.classList.contains('hidden'))show();"
             f"  else {{chrome.classList.add('hidden');"
