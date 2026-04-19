@@ -1398,6 +1398,127 @@ def root_cert():
     return resp
 
 
+# ---------------------------------------------------------------------
+# Shared player scaffold. Both the live `/watch/<slug>` player and the
+# recording `/recording/<uuid>` player inject these. Each mode still
+# defines its own seek(d), refresh(), scrub-bar HTML, plus mode-only
+# features (chapters, Mediathek fallback, progress loader, etc.).
+#
+# Requirements the caller must satisfy BEFORE the base JS runs:
+#   - An HTML #v, #chrome, #topbar, #hint in the DOM
+#   - const PLAYER_HOME = '...';        // fallback URL on close
+#   - function seek(d) {...}            // consumed by double-tap
+# ---------------------------------------------------------------------
+PLAYER_BASE_CSS = """\
+*{box-sizing:border-box;margin:0;padding:0}
+html,body{height:100%;background:#000;color:#eee;
+ font-family:-apple-system,BlinkMacSystemFont,sans-serif;
+ overflow:hidden;-webkit-user-select:none;user-select:none}
+#v{width:100%;height:100%;background:#000;object-fit:contain;display:block}
+#chrome{position:fixed;bottom:0;left:0;right:0;
+ padding:14px max(16px,env(safe-area-inset-right))
+         max(20px,env(safe-area-inset-bottom))
+         max(16px,env(safe-area-inset-left));
+ background:linear-gradient(transparent,#000d);z-index:10;
+ transition:opacity .3s}
+#topbar{position:fixed;top:0;left:0;right:0;z-index:10;
+ padding:max(12px,env(safe-area-inset-top)) max(16px,env(safe-area-inset-right))
+         14px max(16px,env(safe-area-inset-left));
+ display:flex;justify-content:space-between;align-items:center;
+ background:linear-gradient(#000d,transparent);transition:opacity .3s}
+.row{display:flex;align-items:center;gap:6px;margin-top:8px;
+ flex-wrap:wrap;row-gap:8px}
+.spacer{flex:1 1 auto}
+.iconbtn{background:#fff2;color:#fff;border:0;width:34px;height:34px;
+ border-radius:17px;font-size:1em;cursor:pointer;display:flex;
+ align-items:center;justify-content:center;text-decoration:none;
+ flex:0 0 auto;line-height:1}
+.iconbtn:active{opacity:.6}
+.iconbtn:disabled{background:#555;color:#bbb;cursor:default}
+.pill{background:#fff2;color:#fff;border:0;padding:7px 12px;
+ border-radius:16px;font-weight:600;font-size:.85em;cursor:pointer;
+ display:inline-flex;align-items:center;gap:5px;flex:0 0 auto;line-height:1}
+.pill:active{opacity:.7}
+.pill:disabled{background:#555;color:#bbb;cursor:default}
+.time{font-variant-numeric:tabular-nums;font-size:.85em;color:#ddd;
+ min-width:44px;text-align:center;flex:0 0 auto}
+#scrub{position:relative;width:100%;height:22px;
+ cursor:pointer;display:flex;align-items:center}
+#track{position:absolute;left:0;right:0;top:50%;transform:translateY(-50%);
+ height:3px;background:#fff1;border-radius:2px}
+#played{position:absolute;top:0;bottom:0;background:#f44;
+ border-radius:2px;width:0;left:0}
+#thumb{position:absolute;top:50%;transform:translate(-50%,-50%);
+ width:13px;height:13px;background:#fff;border-radius:50%;
+ pointer-events:none;box-shadow:0 0 2px #0008;left:0;z-index:2}
+.ad-block{position:absolute;top:50%;transform:translateY(-50%);
+ height:7px;border-radius:2px;pointer-events:none;
+ background:repeating-linear-gradient(45deg,
+ #ff8a65,#ff8a65 3px,#4d1c0f 3px,#4d1c0f 6px);
+ box-shadow:0 0 0 1px #000a;z-index:1}
+.hidden{opacity:0;pointer-events:none}
+#ttlrow{margin-top:8px;font-size:.85em;padding-left:4px;
+ white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+#hint{position:fixed;left:50%;top:50%;transform:translate(-50%,-50%);
+ font-size:1.6em;background:#000c;padding:14px 22px;border-radius:12px;
+ opacity:0;transition:opacity .2s;pointer-events:none;z-index:20}
+#hint.show{opacity:1}
+"""
+
+PLAYER_BASE_JS = """\
+const v=document.getElementById('v');
+const chrome=document.getElementById('chrome');
+const topbar=document.getElementById('topbar');
+const hint=document.getElementById('hint');
+let _chromeT=null;
+function show(){
+  chrome.classList.remove('hidden');
+  topbar.classList.remove('hidden');
+  clearTimeout(_chromeT);
+  _chromeT=setTimeout(()=>{
+    if(!v.paused){chrome.classList.add('hidden');topbar.classList.add('hidden');}
+  },3500);
+}
+show();
+function toggleFs(){
+  const fsEl=document.fullscreenElement||document.webkitFullscreenElement;
+  if(fsEl){
+    (document.exitFullscreen||document.webkitExitFullscreen).call(document);
+    return;
+  }
+  const root=document.documentElement;
+  if(root.requestFullscreen){root.requestFullscreen();return;}
+  if(root.webkitRequestFullscreen){root.webkitRequestFullscreen();return;}
+  if(v.webkitEnterFullscreen){v.webkitEnterFullscreen();}
+}
+function closePlayer(ev){
+  if(ev)ev.preventDefault();
+  try{
+    const ref=document.referrer?new URL(document.referrer):null;
+    if(ref&&ref.origin===location.origin&&history.length>1){
+      history.back();return false;
+    }
+  }catch(e){}
+  location.href=PLAYER_HOME;
+  return false;
+}
+let _lastTapT=0,_lastTapX=0;
+v.addEventListener('touchend',e=>{
+  if(!e.changedTouches[0])return;
+  const now=Date.now();
+  const x=e.changedTouches[0].clientX;
+  if(now-_lastTapT<300&&Math.abs(x-_lastTapX)<60){
+    const delta=x<window.innerWidth/2?-10:10;
+    seek(delta);
+    hint.textContent=(delta<0?'\u23EA ':'\u23E9 ')+Math.abs(delta)+' s';
+    hint.classList.add('show');
+    setTimeout(()=>hint.classList.remove('show'),600);
+    _lastTapT=0;
+  }else{_lastTapT=now;_lastTapX=x;}
+},{passive:true});
+"""
+
+
 @app.route("/watch/<slug>")
 def watch_player(slug):
     """Fullscreen HTML player with swipe-to-switch-channel gestures."""
@@ -1412,49 +1533,10 @@ def watch_player(slug):
 <title>{info['name']}</title>
 <script src="https://cdn.jsdelivr.net/npm/hls.js@1/dist/hls.min.js"></script>
 <style>
-*{{box-sizing:border-box;margin:0;padding:0}}
-html,body{{height:100%;background:#000;color:#eee;
-  font-family:-apple-system,BlinkMacSystemFont,sans-serif;
-  overflow:hidden;touch-action:pan-y;-webkit-user-select:none;user-select:none}}
-#v{{width:100%;height:100%;background:#000;object-fit:contain;display:block}}
-#chrome{{position:fixed;bottom:0;left:0;right:0;
-  padding:14px max(16px,env(safe-area-inset-right))
-          max(20px,env(safe-area-inset-bottom))
-          max(16px,env(safe-area-inset-left));
-  background:linear-gradient(transparent,#000d);z-index:10;
-  transition:opacity .3s}}
-#topbar{{position:fixed;top:0;left:0;right:0;z-index:10;
-  padding:max(12px,env(safe-area-inset-top)) max(16px,env(safe-area-inset-right))
-          14px max(16px,env(safe-area-inset-left));
-  display:flex;justify-content:space-between;align-items:center;
-  background:linear-gradient(#000d,transparent);transition:opacity .3s}}
-.row{{display:flex;align-items:center;gap:6px;margin-top:8px;flex-wrap:wrap;
-  row-gap:8px}}
-.spacer{{flex:1 1 auto}}
-.iconbtn{{background:#fff2;color:#fff;border:0;width:34px;height:34px;
-  border-radius:17px;font-size:1em;cursor:pointer;display:flex;
-  align-items:center;justify-content:center;text-decoration:none;
-  flex:0 0 auto;line-height:1}}
-.iconbtn:active{{opacity:.6}}
-.iconbtn:disabled{{background:#555;color:#bbb;cursor:default}}
-.pill{{background:#fff2;color:#fff;border:0;padding:7px 12px;
-  border-radius:16px;font-weight:600;font-size:.85em;cursor:pointer;
-  display:inline-flex;align-items:center;gap:5px;flex:0 0 auto;line-height:1}}
-.pill:active{{opacity:.7}}
-.pill:disabled{{background:#555;color:#bbb;cursor:default}}
-.time{{font-variant-numeric:tabular-nums;font-size:.85em;color:#ddd;
-  min-width:44px;text-align:center;flex:0 0 auto}}
-#scrub{{position:relative;width:100%;height:22px;
-  cursor:pointer;display:flex;align-items:center}}
-#track{{position:absolute;left:0;right:0;top:50%;transform:translateY(-50%);
-  height:3px;background:#fff1;border-radius:2px}}
+{PLAYER_BASE_CSS}
+body{{touch-action:pan-y}}
 #avail{{position:absolute;top:0;bottom:0;background:#fff4;
   border-radius:2px;width:0;left:0}}
-#played{{position:absolute;top:0;bottom:0;background:#f44;
-  border-radius:2px;width:0;left:0}}
-#thumb{{position:absolute;top:50%;transform:translate(-50%,-50%);
-  width:13px;height:13px;background:#fff;border-radius:50%;
-  pointer-events:none;box-shadow:0 0 2px #0008;left:0;z-index:2}}
 .chapter{{position:absolute;top:50%;transform:translate(-50%,-50%);
   width:6px;height:16px;background:#fff;border-radius:2px;
   opacity:.85;box-shadow:0 0 2px #000a;z-index:1;cursor:pointer;
@@ -1463,17 +1545,10 @@ html,body{{height:100%;background:#000;color:#eee;
   top:-12px;bottom:-12px}}
 .chapter.current{{background:#ffd84d;width:6px;height:18px}}
 .chapter:active{{opacity:.6}}
-.ad-block{{position:absolute;top:50%;transform:translateY(-50%);
-  height:7px;border-radius:2px;pointer-events:none;
-  background:repeating-linear-gradient(45deg,
-  #ff8a65,#ff8a65 3px,#4d1c0f 3px,#4d1c0f 6px);
-  box-shadow:0 0 0 1px #000a;z-index:1}}
 #skipad{{background:#e74c3c;color:#fff;padding:7px 12px;border:0;
   border-radius:16px;font-weight:600;font-size:.85em;cursor:pointer;
   display:none;flex:0 0 auto}}
 #skipad.on{{display:inline-flex}}
-#ttlrow{{margin-top:8px;font-size:.85em;padding-left:4px;
-  white-space:nowrap;overflow:hidden;text-overflow:ellipsis}}
 .chname{{font-weight:600;color:#fff;margin-right:8px}}
 .epg{{color:#bbb;margin-left:8px}}
 #srcbadge{{display:inline-block;font-size:.75em;font-weight:600;
@@ -1481,11 +1556,6 @@ html,body{{height:100%;background:#000;color:#eee;
   vertical-align:1px}}
 #srcbadge.mediathek{{background:#2980b9}}
 #srcbadge.at-live{{background:#27ae60}}
-.hidden{{opacity:0;pointer-events:none}}
-#hint{{position:fixed;left:50%;top:50%;transform:translate(-50%,-50%);
-  font-size:1.6em;background:#000c;padding:14px 22px;border-radius:12px;
-  opacity:0;transition:opacity .2s;pointer-events:none;z-index:20}}
-#hint.show{{opacity:1}}
 #unmute{{position:fixed;left:50%;top:50%;transform:translate(-50%,-50%);
   z-index:30;background:#fff;color:#000;padding:14px 22px;
   border-radius:30px;font-weight:600;font-size:1em;border:0;cursor:pointer;
@@ -1530,13 +1600,15 @@ html,body{{height:100%;background:#000;color:#eee;
 
 <script>
 const HOST='{HOST_URL}';
+const PLAYER_HOME=HOST+'/';
 let channels=[];let idx=0;let current='{slug}';
 
-const v=document.getElementById('v');
+// Shared scaffold: element refs, show(), toggleFs, closePlayer,
+// double-tap seek handler. Mode-specific `function seek(d)` is defined
+// further down and reached at call-time via function hoisting.
+{PLAYER_BASE_JS}
 const chname=document.getElementById('chname');
 const epgEl=document.getElementById('epg');
-const hint=document.getElementById('hint');
-const chrome=document.getElementById('chrome');
 const unmuteBtn=document.getElementById('unmute');
 const liveBtn=document.getElementById('liveBtn');
 const srcBadge=document.getElementById('srcbadge');
@@ -2067,26 +2139,13 @@ function prevCh(){{if(!channels.length)return;
 window.addEventListener('pagehide',()=>navigator.sendBeacon(HOST+'/stop-all'));
 window.addEventListener('beforeunload',()=>navigator.sendBeacon(HOST+'/stop-all'));
 
-function toggleFs(){{
-  const fsEl=document.fullscreenElement||document.webkitFullscreenElement;
-  if(fsEl){{
-    (document.exitFullscreen||document.webkitExitFullscreen).call(document);
-    return;
-  }}
-  const root=document.documentElement;
-  if(root.requestFullscreen){{root.requestFullscreen();return;}}
-  if(root.webkitRequestFullscreen){{root.webkitRequestFullscreen();return;}}
-  // iPhone Safari: native video fullscreen. iOS takes over with its
-  // own overlay controls and locks seek-back for live HLS — known
-  // limitation, there's no way around it without a PWA shell.
-  if(v.webkitEnterFullscreen){{v.webkitEnterFullscreen();}}
-}}
 function loadEpg(slug){{
   fetch(HOST+'/api/now/'+slug).then(r=>r.json()).then(d=>{{
     epgEl.textContent=d.title?(d.time+' · '+d.title):'';
   }}).catch(()=>{{epgEl.textContent='';}});
 }}
 
+// Swipe horizontally on the video to switch channels.
 let startX=0,startY=0,startT=0;
 document.addEventListener('touchstart',e=>{{
   if(!e.touches[0])return;
@@ -2102,64 +2161,15 @@ document.addEventListener('touchend',e=>{{
     if(dx<0)nextCh();else prevCh();
   }}
 }},{{passive:true,capture:true}});
-// Double-tap on left/right of the video → seek ±10 s. Only triggers
-// from taps that land directly on the <video>, not on control buttons
-// or the scrub bar.
-let lastTapT=0,lastTapX=0;
-v.addEventListener('touchend',e=>{{
-  if(!e.changedTouches[0])return;
-  const now=Date.now();
-  const x=e.changedTouches[0].clientX;
-  if(now-lastTapT<300&&Math.abs(x-lastTapX)<60){{
-    const midX=window.innerWidth/2;
-    const delta=x<midX?-10:10;
-    seek(delta);
-    hint.textContent=(delta<0?'⏪ ':'⏩ ')+Math.abs(delta)+' s';
-    hint.classList.add('show');
-    setTimeout(()=>hint.classList.remove('show'),600);
-    lastTapT=0;
-  }} else {{
-    lastTapT=now;lastTapX=x;
-  }}
-}},{{passive:true}});
-function closePlayer(ev){{
-  if(ev){{ev.preventDefault();}}
-  try{{
-    const ref=document.referrer?new URL(document.referrer):null;
-    if(ref&&ref.origin===location.origin&&history.length>1){{
-      history.back();return false;
-    }}
-  }}catch(e){{}}
-  location.href=HOST+'/';
-  return false;
-}}
 document.addEventListener('keydown',e=>{{
   if(e.key==='Escape')closePlayer();
   else if(e.key==='ArrowRight')nextCh();
   else if(e.key==='ArrowLeft')prevCh();
   else if(e.key===' '){{e.preventDefault();togglePlay();show();}}
 }});
-
-const topbar=document.getElementById('topbar');
-let t=null;
-function show(){{
-  chrome.classList.remove('hidden');
-  topbar.classList.remove('hidden');
-  clearTimeout(t);
-  t=setTimeout(()=>{{
-    if(!v.paused){{
-      chrome.classList.add('hidden');
-      topbar.classList.add('hidden');
-    }}
-  }},3500);
-}}
-show();
 v.addEventListener('click',()=>{{
   if(chrome.classList.contains('hidden'))show();
-  else {{
-    chrome.classList.add('hidden');
-    topbar.classList.add('hidden');
-  }}
+  else {{chrome.classList.add('hidden');topbar.classList.add('hidden');}}
 }});
 document.addEventListener('mousemove',show);
 
@@ -3339,58 +3349,8 @@ def play_recording(uuid):
             f"initial-scale=1,viewport-fit=cover,user-scalable=no'>"
             f"<meta name='color-scheme' content='dark'>"
             f"<title>{title_safe}</title>"
-            f"<style>"
-            f"*{{box-sizing:border-box;margin:0;padding:0}}"
-            f"html,body{{height:100%;background:#000;color:#eee;"
-            f"font-family:-apple-system,BlinkMacSystemFont,sans-serif;"
-            f"overflow:hidden;-webkit-user-select:none;user-select:none}}"
-            f"#v{{width:100%;height:100%;background:#000;object-fit:contain;"
-            f"display:block}}"
-            f"#chrome{{position:fixed;bottom:0;left:0;right:0;"
-            f"padding:14px max(16px,env(safe-area-inset-right)) "
-            f"max(20px,env(safe-area-inset-bottom)) "
-            f"max(16px,env(safe-area-inset-left));"
-            f"background:linear-gradient(transparent,#000d);z-index:10;"
-            f"transition:opacity .3s}}"
-            f"#topbar{{position:fixed;top:0;left:0;right:0;z-index:10;"
-            f"padding:max(12px,env(safe-area-inset-top)) max(16px,env(safe-area-inset-right)) "
-            f"14px max(16px,env(safe-area-inset-left));"
-            f"display:flex;justify-content:space-between;align-items:center;"
-            f"background:linear-gradient(#000d,transparent);transition:opacity .3s}}"
-            f".row{{display:flex;align-items:center;gap:6px;margin-top:8px;"
-            f"flex-wrap:wrap;row-gap:8px}}"
-            f".spacer{{flex:1 1 auto}}"
-            f".iconbtn{{background:#fff2;color:#fff;border:0;width:34px;"
-            f"height:34px;border-radius:17px;font-size:1em;cursor:pointer;"
-            f"display:flex;align-items:center;justify-content:center;"
-            f"text-decoration:none;flex:0 0 auto;line-height:1}}"
-            f".iconbtn:active{{opacity:.6}}"
-            f".pill{{background:#fff2;color:#fff;border:0;padding:7px 12px;"
-            f"border-radius:16px;font-weight:600;font-size:.85em;cursor:pointer;"
-            f"display:inline-flex;align-items:center;gap:5px;flex:0 0 auto;line-height:1}}"
-            f".pill:active{{opacity:.7}}"
+            f"<style>{PLAYER_BASE_CSS}"
             f".pill.rec{{background:#e74c3c}}"
-            f".time{{font-variant-numeric:tabular-nums;font-size:.85em;"
-            f"color:#ddd;min-width:44px;text-align:center;flex:0 0 auto}}"
-            f"#scrub{{position:relative;width:100%;height:22px;"
-            f"cursor:pointer;display:flex;align-items:center}}"
-            f"#track{{position:absolute;left:0;right:0;top:50%;"
-            f"transform:translateY(-50%);height:3px;background:#fff3;"
-            f"border-radius:2px}}"
-            f"#played{{position:absolute;left:0;top:0;bottom:0;"
-            f"background:#f44;border-radius:2px;width:0}}"
-            f".ad-block{{position:absolute;top:50%;transform:translateY(-50%);"
-            f"height:7px;border-radius:2px;pointer-events:none;"
-            f"background:repeating-linear-gradient(45deg,"
-            f"#ff8a65,#ff8a65 3px,#4d1c0f 3px,#4d1c0f 6px);"
-            f"box-shadow:0 0 0 1px #000a;z-index:1}}"
-            f"#thumb{{position:absolute;top:50%;transform:translate(-50%,-50%);"
-            f"width:13px;height:13px;background:#fff;border-radius:50%;"
-            f"pointer-events:none;box-shadow:0 0 2px #0008;left:0;z-index:2}}"
-            f"#ttlrow{{margin-top:8px;font-size:.85em;color:#ddd;"
-            f"overflow:hidden;text-overflow:ellipsis;white-space:nowrap;"
-            f"padding-left:4px}}"
-            f".hidden{{opacity:0;pointer-events:none}}"
             f"#loader{{position:fixed;inset:0;display:flex;flex-direction:column;"
             f"align-items:center;justify-content:center;background:#000c;"
             f"z-index:30;font-size:1.05em;gap:8px;transition:opacity .3s}}"
@@ -3408,8 +3368,10 @@ def play_recording(uuid):
             f"</div>"
             f"<div id='topbar'>"
             f"<button class='iconbtn' onclick='toggleFs()' aria-label='Vollbild'>⛶</button>"
-            f"<a class='iconbtn' href='{HOST_URL}/recordings' aria-label='Schließen'>✕</a>"
+            f"<a class='iconbtn' href='{HOST_URL}/recordings' aria-label='Schließen' "
+            f"onclick='return closePlayer(event)'>✕</a>"
             f"</div>"
+            f"<div id='hint'></div>"
             f"<div id='chrome'>"
             f"<div id='scrub'>"
             f"<div id='track'><div id='played'></div></div>"
@@ -3429,8 +3391,8 @@ def play_recording(uuid):
             f"<div id='ttlrow'>{title_safe}</div>"
             f"</div>"
             f"<script>"
-            f"const v=document.getElementById('v');"
-            f"const chrome=document.getElementById('chrome');"
+            f"const PLAYER_HOME='{HOST_URL}/recordings';"
+            f"{PLAYER_BASE_JS}"
             f"const pp=document.getElementById('pp');"
             f"const cur=document.getElementById('cur');"
             f"const dur=document.getElementById('dur');"
@@ -3458,18 +3420,6 @@ def play_recording(uuid):
             f"}}"
             f"v.addEventListener('play',()=>pp.textContent='\u23F8');"
             f"v.addEventListener('pause',()=>pp.textContent='\u25B6');"
-            f"function toggleFs(){{"
-            f"  const fsEl=document.fullscreenElement"
-            f"    ||document.webkitFullscreenElement;"
-            f"  if(fsEl){{"
-            f"    (document.exitFullscreen||document.webkitExitFullscreen)"
-            f"      .call(document);return;"
-            f"  }}"
-            f"  const root=document.documentElement;"
-            f"  if(root.requestFullscreen){{root.requestFullscreen();return;}}"
-            f"  if(root.webkitRequestFullscreen){{root.webkitRequestFullscreen();return;}}"
-            f"  if(v.webkitEnterFullscreen){{v.webkitEnterFullscreen();}}"
-            f"}}"
             f"function currentAd(){{"
             f"  const t=v.currentTime||0;"
             f"  for(const a of ads){{if(t>=a[0]&&t<a[1])return a;}}"
@@ -3519,43 +3469,11 @@ def play_recording(uuid):
             f"   {{passive:true}});"
             f"scrub.addEventListener('touchend',()=>{{dragging=false;}},"
             f"   {{passive:true}});"
-            f"const topbar=document.getElementById('topbar');"
-            f"let t=null;"
-            f"function show(){{"
-            f"  chrome.classList.remove('hidden');"
-            f"  topbar.classList.remove('hidden');"
-            f"  clearTimeout(t);"
-            f"  t=setTimeout(()=>{{"
-            f"    if(!v.paused){{chrome.classList.add('hidden');"
-            f"      topbar.classList.add('hidden');}}"
-            f"  }},3500);"
-            f"}}"
-            f"show();"
             f"v.addEventListener('click',()=>{{"
             f"  if(chrome.classList.contains('hidden'))show();"
             f"  else {{chrome.classList.add('hidden');"
             f"    topbar.classList.add('hidden');}}"
             f"}});"
-            # Double-tap on left/right of the recording video → seek ±10 s.
-            f"let lastTapT=0,lastTapX=0;"
-            f"v.addEventListener('touchend',e=>{{"
-            f"  if(!e.changedTouches[0])return;"
-            f"  const now=Date.now();"
-            f"  const x=e.changedTouches[0].clientX;"
-            f"  if(now-lastTapT<300&&Math.abs(x-lastTapX)<60){{"
-            f"    const delta=x<window.innerWidth/2?-10:10;"
-            f"    seek(delta);"
-            f"    const pill=document.createElement('div');"
-            f"    pill.textContent=(delta<0?'⏪ ':'⏩ ')+Math.abs(delta)+' s';"
-            f"    pill.style.cssText='position:fixed;left:50%;top:50%;"
-            f"transform:translate(-50%,-50%);font-size:1.4em;"
-            f"background:#000c;color:#fff;padding:12px 18px;"
-            f"border-radius:10px;z-index:40;pointer-events:none';"
-            f"    document.body.appendChild(pill);"
-            f"    setTimeout(()=>pill.remove(),600);"
-            f"    lastTapT=0;"
-            f"  }} else {{lastTapT=now;lastTapX=x;}}"
-            f"}},{{passive:true}});"
             f"document.addEventListener('mousemove',show);"
             f"const hideLoader=()=>loader.classList.add('hidden');"
             f"v.addEventListener('playing',hideLoader);"
@@ -3587,7 +3505,7 @@ def play_recording(uuid):
             f"}}"
             f"fetchAds();"
             f"document.addEventListener('keydown',e=>{{"
-            f"  if(e.key==='Escape')location.href='{HOST_URL}/recordings';"
+            f"  if(e.key==='Escape')closePlayer();"
             f"  else if(e.key==='ArrowRight')seek(10);"
             f"  else if(e.key==='ArrowLeft')seek(-10);"
             f"  else if(e.key===' '){{e.preventDefault();togglePlay();show();}}"
