@@ -412,11 +412,28 @@ class AdoptedProcess:
     def __init__(self, pid):
         self.pid = pid
     def poll(self):
+        # os.kill(pid, 0) treats zombies as alive — they're still in
+        # the process table. Read /proc/<pid>/status and treat state
+        # 'Z' as dead, and try to reap the zombie so the always-warm
+        # loop can respawn cleanly.
         try:
             os.kill(self.pid, 0)
-            return None
         except OSError:
             return 0
+        try:
+            with open(f"/proc/{self.pid}/status") as f:
+                for line in f:
+                    if line.startswith("State:"):
+                        if line.split()[1] == "Z":
+                            try: os.waitpid(self.pid, os.WNOHANG)
+                            except (ChildProcessError, OSError): pass
+                            return 0
+                        break
+        except FileNotFoundError:
+            return 0
+        except Exception:
+            pass
+        return None
     def terminate(self):
         try: os.kill(self.pid, 15)
         except OSError: pass
@@ -453,9 +470,8 @@ def adopt_surviving_ffmpegs():
             try: pid_file.unlink()
             except Exception: pass
             continue
-        try:
-            os.kill(pid, 0)
-        except OSError:
+        stub = AdoptedProcess(pid)
+        if stub.poll() is not None:
             try: pid_file.unlink()
             except Exception: pass
             continue
@@ -464,7 +480,7 @@ def adopt_surviving_ffmpegs():
             if slug not in channel_map:
                 continue
         with active_lock:
-            channels[slug] = {"process": AdoptedProcess(pid),
+            channels[slug] = {"process": stub,
                               "last_seen": time.time(),
                               "started_at": started_at}
         adopted += 1
@@ -718,8 +734,11 @@ def index():
         mu = info.get("mux_uuid") or ""
         if mu:
             mux_members.setdefault(mu, []).append(s)
-    MUX_PALETTE = ["#e67e22", "#27ae60", "#8e44ad", "#16a085",
-                   "#d35400", "#2980b9", "#c0392b", "#2c3e50"]
+    # Six hues chosen so every pair stays distinguishable at an 8 px
+    # dot: black, green, blue, pink, yellow, brown. No orange (reads
+    # as red), no cyan/purple (collapse into green/blue at that size).
+    MUX_PALETTE = ["#2c3e50", "#27ae60", "#2980b9",
+                   "#e91e63", "#f1c40f", "#795548"]
     mux_colour = {}
     for i, mu in enumerate(sorted(
             [m for m, ch in mux_members.items() if len(ch) > 1])):
