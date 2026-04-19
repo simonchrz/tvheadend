@@ -21,7 +21,9 @@ ARG FFMPEG_URL=https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ff
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
         curl xz-utils ca-certificates \
-        libargtable2-0 libsdl2-2.0-0 && \
+        libargtable2-0 libsdl2-2.0-0 \
+        libavutil59 libavcodec61 libavformat61 \
+        libswscale8 libswresample5 && \
     curl -fL "$FFMPEG_URL" -o /tmp/ffmpeg.tar.xz && \
     tar -xJf /tmp/ffmpeg.tar.xz -C /tmp && \
     cp /tmp/ffmpeg-*/bin/ffmpeg  /usr/local/bin/ffmpeg  && \
