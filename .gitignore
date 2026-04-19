@@ -1,0 +1,21 @@
+*.pyc
+__pycache__/
+.DS_Store
+
+# Runtime data — lives on /mnt/tv/hls
+hls-gateway/data/
+*.m3u8
+*.ts
+*.jsonl
+
+# tvheadend runtime config (contains credentials)
+tvheadend/config/
+
+# Caddy runtime data
+caddy/data/
+caddy/config/
+caddy-root.crt
+
+# Local secrets
+.ha_token
+.env
