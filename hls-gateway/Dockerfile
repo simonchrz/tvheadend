@@ -12,9 +12,22 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 FROM python:3.12-slim
 
+# Static ffmpeg from BtbN (ffmpeg.org's linked provider). Debian
+# Trixie freezes at 7.1.x; we want 8.1+ for HLS PDT fixes and the
+# native AAC improvements. The -latest link rebuilds nightly so a
+# `docker compose build` pulls whatever is current.
+ARG FFMPEG_URL=https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-n8.1-latest-linuxarm64-gpl-8.1.tar.xz
+
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
-        ffmpeg libargtable2-0 libsdl2-2.0-0 && \
+        curl xz-utils ca-certificates \
+        libargtable2-0 libsdl2-2.0-0 && \
+    curl -fL "$FFMPEG_URL" -o /tmp/ffmpeg.tar.xz && \
+    tar -xJf /tmp/ffmpeg.tar.xz -C /tmp && \
+    cp /tmp/ffmpeg-*/bin/ffmpeg  /usr/local/bin/ffmpeg  && \
+    cp /tmp/ffmpeg-*/bin/ffprobe /usr/local/bin/ffprobe && \
+    rm -rf /tmp/ffmpeg-* /tmp/ffmpeg.tar.xz && \
+    apt-get purge -y --auto-remove curl xz-utils && \
     rm -rf /var/lib/apt/lists/*
 
 COPY --from=build /out/comskip /usr/local/bin/comskip
