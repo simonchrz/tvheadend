@@ -249,6 +249,21 @@ def slugify(name):
 def load_favorites():
     data = json.loads(urllib.request.urlopen(
         f"{TVH_BASE}/api/channel/grid?limit=500", timeout=10).read())
+    # Map service UUID → transponder mux so we can tell the user which
+    # channels share a physical tuner. Channels on the same mux stream
+    # for free (tvheadend shares the transponder).
+    svc_to_mux = {}
+    try:
+        sdata = json.loads(urllib.request.urlopen(
+            f"{TVH_BASE}/api/mpegts/service/grid?limit=2000",
+            timeout=10).read())
+        for s in sdata.get("entries", []):
+            svc_to_mux[s["uuid"]] = (
+                s.get("multiplex_uuid", ""),
+                s.get("multiplex", ""),
+            )
+    except Exception as e:
+        print(f"service grid fetch: {e}", flush=True)
     new_map = {}
     for e in data.get("entries", []):
         if FAV_TAG_UUID not in e.get("tags", []):
@@ -259,8 +274,11 @@ def load_favorites():
         # (if HOST_URL is https) — Caddy reverse-proxies imagecache to tvheadend.
         if icon and not icon.startswith("http"):
             icon = f"{HOST_URL}/{icon.lstrip('/')}"
+        svcs = e.get("services", [])
+        mux_uuid, mux_name = svc_to_mux.get(svcs[0], ("", "")) if svcs else ("", "")
         new_map[slugify(e["name"])] = {
             "name": e["name"], "uuid": e["uuid"], "icon": icon,
+            "mux_uuid": mux_uuid, "mux_name": mux_name,
         }
     with cmap_lock:
         channel_map.clear()
@@ -691,6 +709,22 @@ def index():
         kv[1]["name"].lower(),
     ))
 
+    # Assign a stable colour per mux transponder so viewers can tell
+    # at a glance which channels share a tuner. Only show the dot if
+    # the mux has 2+ favourites on it — a solo channel's mux info is
+    # noise.
+    mux_members = {}
+    for s, info in items:
+        mu = info.get("mux_uuid") or ""
+        if mu:
+            mux_members.setdefault(mu, []).append(s)
+    MUX_PALETTE = ["#e67e22", "#27ae60", "#8e44ad", "#16a085",
+                   "#d35400", "#2980b9", "#c0392b", "#2c3e50"]
+    mux_colour = {}
+    for i, mu in enumerate(sorted(
+            [m for m, ch in mux_members.items() if len(ch) > 1])):
+        mux_colour[mu] = MUX_PALETTE[i % len(MUX_PALETTE)]
+
     rows = []
     for s, info in items:
         watch_url = f"{HOST_URL}/watch/{s}"
@@ -704,10 +738,21 @@ def index():
         usage = (f'<span class="usage">{starts}× · {hours:.1f} h</span>'
                  if starts > 0 else
                  '<span class="usage muted">neu</span>')
+        mu = info.get("mux_uuid", "")
+        mux_dot = ""
+        if mu in mux_colour:
+            mates = [channel_map[m]["name"] for m in mux_members[mu]
+                     if m != s]
+            title = (f'{info.get("mux_name","Mux")} — teilt Tuner mit '
+                     f'{", ".join(mates)}')
+            mux_dot = (f'<span class="mux-dot" '
+                       f'style="background:{mux_colour[mu]}" '
+                       f'title="{title}"></span>')
         rows.append(
             f'<li data-slug="{s}">'
             f'<a class="logo" href="{watch_url}">{logo}</a>'
             f'<div class="meta">'
+            f'{mux_dot}'
             f'<a href="{watch_url}">{info["name"]}</a> '
             f'<span class="warm-badge" data-slug="{s}"></span> '
             f'<button class="pin-btn" data-slug="{s}" title="Dauer-warm">📌</button> '
@@ -743,6 +788,9 @@ def index():
         "margin-left:10px;background:#34495e;color:#fff;letter-spacing:.03em}"
         ".tuner-badge.tight{background:#e67e22}"
         ".tuner-badge.full{background:#c0392b}"
+        ".mux-dot{display:inline-block;width:8px;height:8px;"
+        "border-radius:50%;margin-right:6px;vertical-align:1px;"
+        "cursor:help}"
     )
     js = (
         "async function refreshWarm(){"
