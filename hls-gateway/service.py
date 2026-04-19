@@ -29,6 +29,7 @@ STATS_FILE       = HLS_DIR / ".usage_stats.json"
 EPG_ARCHIVE_FILE = HLS_DIR / ".epg_archive.jsonl"
 ALWAYS_WARM_FILE = HLS_DIR / ".always_warm.json"
 PIN_HARD_MAX = 3   # tuner-driven upper bound; minus active/scheduled DVR jobs
+TUNER_TOTAL = int(os.environ.get("TUNER_TOTAL", "4"))   # FRITZ!Box DVB-C tuners
 EPG_SNAPSHOT_INTERVAL = 600   # 10 min
 EPG_ARCHIVE_KEEP_DAYS = 14
 
@@ -106,7 +107,7 @@ ul.channels .meta code { display: inline-block; margin-top: 2px; }
     overflow: hidden;
 }
 .epg-channels {
-    flex: 0 0 140px;
+    flex: 0 0 64px;
     background: var(--bg);
     border-right: 1px solid var(--border);
 }
@@ -121,19 +122,20 @@ ul.channels .meta code { display: inline-block; margin-top: 2px; }
 }
 .ch-cell {
     height: 52px;
-    display: flex; align-items: center; gap: .5em;
-    padding: 4px 8px;
+    display: flex; align-items: center; justify-content: center;
+    padding: 4px 6px;
     border-bottom: 1px solid var(--border);
     text-decoration: none; color: var(--fg);
     box-sizing: border-box;
 }
 .ch-cell:last-child { border-bottom: none; }
-.ch-cell img { width: 36px; height: 28px; object-fit: contain;
-               background: var(--logo-bg); border-radius: 4px; padding: 1px;
-               flex: 0 0 36px; }
-.ch-cell .name { font-weight: 600; font-size: .85em;
+.ch-cell img { width: 48px; height: 36px; object-fit: contain;
+               background: var(--logo-bg); border-radius: 4px; padding: 2px;
+               flex: 0 0 48px; }
+.ch-cell .name { font-weight: 600; font-size: .75em;
                  white-space: nowrap; overflow: hidden;
-                 text-overflow: ellipsis; }
+                 text-overflow: ellipsis; text-align: center; }
+.ch-cell .name.fallback { max-width: 52px; }
 .ch-cell.header {
     height: 32px;
     background: var(--stripe);
@@ -154,36 +156,47 @@ ul.channels .meta code { display: inline-block; margin-top: 2px; }
 .epg-event {
     position: absolute; top: 4px; bottom: 4px;
     background: var(--code-bg);
-    padding: 3px 8px; border-radius: 4px;
+    padding: 3px 6px; border-radius: 4px;
     overflow: hidden;
     border: 1px solid var(--border);
     font-size: .82em; line-height: 1.2;
     box-sizing: border-box;
     text-decoration: none; color: inherit;
+    -webkit-touch-callout: none;
+    -webkit-user-select: none; user-select: none;
+}
+.epg-event.scheduled::after {
+    content: ""; position: absolute;
+    top: 4px; right: 4px; width: 8px; height: 8px;
+    background: #27ae60; border-radius: 50%;
+    box-shadow: 0 0 0 2px var(--code-bg);
+}
+.epg-event.now.scheduled::after { box-shadow: 0 0 0 2px #1565c0; }
+.epg-event.lp-active {
+    box-shadow: 0 0 0 2px #e74c3c inset;
+    transition: box-shadow .1s;
 }
 .epg-event .t { font-weight: 600; display: block;
                 white-space: nowrap; overflow: hidden;
                 text-overflow: ellipsis; }
 .epg-event .ts { color: var(--muted); font-size: .75em; }
+/* Short events (<10 min) — strip padding, shrink font, hide the
+   timestamp line so the title gets every pixel it can. */
+.epg-event.tight { padding: 2px 3px; font-size: .66em;
+                    font-stretch: condensed; }
+.epg-event.tight .ts { display: none; }
+.epg-event.tight .t { letter-spacing: -.03em; line-height: 1.1;
+                       white-space: normal;
+                       display: -webkit-box;
+                       -webkit-line-clamp: 3;
+                       -webkit-box-orient: vertical;
+                       text-overflow: clip;
+                       word-break: break-word; }
 .epg-event.now {
     background: #1565c0; color: #fff; border-color: #0d47a1;
 }
 .epg-event.now .ts { color: rgba(255,255,255,.85); }
 .epg-event.past { opacity: 0.55; }
-.epg-rec-btn {
-    position: absolute; top: 2px; right: 2px; width: 22px; height: 22px;
-    display: flex; align-items: center; justify-content: center;
-    background: #e74c3cd0; color: #fff; border: 0; border-radius: 50%;
-    font-size: .75em; cursor: pointer; line-height: 1;
-    opacity: 0; transition: opacity .15s; z-index: 2;
-}
-.epg-event:hover .epg-rec-btn, .epg-rec-btn.pending,
-.epg-rec-btn.scheduled {
-    opacity: 1;
-}
-.epg-rec-btn.scheduled { background: #27ae60d0; }
-.epg-rec-btn:disabled { background: #888; cursor: default; }
-
 .epg-time-marker {
     position: absolute; top: 8px;
     font-size: .75em; color: var(--muted);
@@ -208,12 +221,13 @@ ul.channels .meta code { display: inline-block; margin-top: 2px; }
 }
 .btn-now {
     display: inline-block;
-    background: #e74c3c; color: #fff;
+    background: var(--code-bg); color: var(--fg);
     padding: .4em .9em; border-radius: 4px;
     font-size: .9em; font-weight: 600;
     text-decoration: none;
+    border: 1px solid var(--border);
 }
-.btn-now:hover { background: #c0392b; text-decoration: none; }
+.btn-now:hover { background: var(--stripe); text-decoration: none; }
 
 table { border-collapse: collapse; width: 100%; }
 th, td {
@@ -718,12 +732,17 @@ def index():
         ".warm-badge{display:none;font-size:.72em;font-weight:600;"
         "padding:1px 7px;border-radius:10px;vertical-align:2px;"
         "margin-left:4px;color:#fff}"
-        ".warm-badge.running{display:inline-block;background:#27ae60}"
-        ".warm-badge.running.pinned{background:#2980b9}"
+        ".warm-badge.running{display:inline-block;background:#27ae60;cursor:pointer}"
+        ".warm-badge.running.pinned{background:#2980b9;cursor:default}"
         ".pin-btn{background:none;border:0;cursor:pointer;font-size:1em;"
         "opacity:.3;padding:0 4px;vertical-align:1px;transition:opacity .15s}"
         ".pin-btn:hover{opacity:.65}"
         ".pin-btn.active{opacity:1;filter:drop-shadow(0 0 1px #2980b9)}"
+        ".tuner-badge{display:inline-block;font-size:.6em;font-weight:600;"
+        "padding:3px 10px;border-radius:12px;vertical-align:6px;"
+        "margin-left:10px;background:#34495e;color:#fff;letter-spacing:.03em}"
+        ".tuner-badge.tight{background:#e67e22}"
+        ".tuner-badge.full{background:#c0392b}"
     )
     js = (
         "async function refreshWarm(){"
@@ -745,8 +764,8 @@ def index():
         "        else time=bs+'s';"
         "        el.textContent='● '+time;"
         "        el.className='warm-badge running'+(e.always_warm?' pinned':'');"
-        "        el.title=(e.always_warm?'Dauer-warm':'Warm-Tuner')+"
-        "          ' · Puffer '+time+(full?' (voll)':'');"
+        "        el.title=e.always_warm?'Dauer-warm · Puffer '+time+(full?' (voll)':''):"
+        "          'Warm-Tuner · Puffer '+time+(full?' (voll)':'')+' · Klick: Tuner freigeben';"
         "      }"
         "    }"
         "    const budget=(d.pin_budget||0);"
@@ -762,6 +781,16 @@ def index():
         "      }"
         "      b.title=pinned?'Dauer-warm aktiv — klick zum Deaktivieren':"
         "                     'Kanal dauer-warm halten (max '+(d.pin_limit||0)+' bei '+(d.pin_dvr_reserve||0)+' DVR-Jobs)';"
+        "    }"
+        "    const tb=document.getElementById('tuner-badge');"
+        "    if(tb){"
+        "      const u=d.tuners_used,t=d.tuners_total||4;"
+        "      if(u===null||u===undefined){tb.textContent='';tb.className='tuner-badge';}"
+        "      else{"
+        "        tb.textContent='📡 '+u+'/'+t+' Tuner';"
+        "        tb.className='tuner-badge'+(u>=t?' full':u>=t-1?' tight':'');"
+        "        tb.title='DVB-C Tuner in Nutzung (FRITZ!Box SAT>IP). Kanäle auf demselben Mux teilen sich einen Tuner.';"
+        "      }"
         "    }"
         "  }catch(e){}"
         "}"
@@ -786,7 +815,14 @@ def index():
         "}"
         "document.addEventListener('click',e=>{"
         "  const b=e.target.closest('.pin-btn');"
-        "  if(b){e.preventDefault();togglePin(b);}"
+        "  if(b){e.preventDefault();togglePin(b);return;}"
+        "  const w=e.target.closest('.warm-badge.running');"
+        "  if(w&&!w.classList.contains('pinned')){"
+        "    e.preventDefault();"
+        "    const slug=w.dataset.slug;"
+        "    if(!slug)return;"
+        "    fetch('/stop/'+slug).then(()=>refreshWarm()).catch(()=>{});"
+        "  }"
         "});"
         "refreshWarm();setInterval(refreshWarm,5000);"
     )
@@ -794,7 +830,7 @@ def index():
             f"content='width=device-width,initial-scale=1'>"
             f"<meta name='color-scheme' content='light dark'>"
             f"<style>{BASE_CSS}{extra_css}</style></head>"
-            f"<body><h1>HLS Gateway</h1>"
+            f"<body><h1>HLS Gateway <span id='tuner-badge' class='tuner-badge'></span></h1>"
             f"<h2>Tools</h2><ul class='tools'>{tool_rows}</ul>"
             f"<h2>Kanäle</h2><ul class='channels'>{''.join(rows)}</ul>"
             f"<script>{js}</script>"
@@ -1058,7 +1094,7 @@ def epg_grid():
     now_ts = data["now"]
     win_start = data["window_start"]
     win_end   = data["window_end"]
-    px_per_min = 8
+    px_per_min = 5
     total_min = (win_end - win_start) // 60
     total_px  = total_min * px_per_min
 
@@ -1105,11 +1141,15 @@ def epg_grid():
 
     for slug, info in items:
         icon = info.get("icon", "")
-        logo = f'<img src="{icon}" alt="" loading="lazy">' if icon else ""
+        name_escaped = info["name"].replace('"', "&quot;")
         stream_url = f"{HOST_URL}/watch/{slug}"
+        if icon:
+            inner = f'<img src="{icon}" alt="{name_escaped}" loading="lazy">'
+        else:
+            inner = f'<span class="name fallback">{info["name"]}</span>'
         channel_col.append(
-            f'<a class="ch-cell" href="{stream_url}">'
-            f'{logo}<span class="name">{info["name"]}</span></a>')
+            f'<a class="ch-cell" href="{stream_url}" title="{name_escaped}">'
+            f'{inner}</a>')
 
         evts = data["events"].get(slug, [])
         event_html = []
@@ -1117,33 +1157,31 @@ def epg_grid():
             start = max(e["start"], win_start)
             stop  = min(e["stop"],  win_end)
             left_px  = ((start - win_start) // 60) * px_per_min
-            width_px = max(int(((stop - start) / 60) * px_per_min) - 2, 20)
+            width_px = max(int(((stop - start) / 60) * px_per_min) - 2, 40)
             is_now  = e["start"] <= now_ts < e["stop"]
             is_past = e["stop"] <= now_ts
+            is_tight = (e["stop"] - e["start"]) < 10 * 60
             cls = "epg-event"
             if is_now: cls += " now"
             elif is_past: cls += " past"
+            if is_tight: cls += " tight"
             ts_label = time.strftime("%H:%M", time.localtime(e["start"]))
             title = (e["title"] or "—").replace("<", "&lt;")
             eid = e.get("event_id") or ""
-            rec_btn = ""
             dvr_uuid = scheduled.get((info["uuid"], e["start"]))
+            data_attrs = ""
             if dvr_uuid:
-                rec_btn = (f'<button type="button" class="epg-rec-btn scheduled" '
-                           f'data-uuid="{dvr_uuid}" data-eid="{eid}" '
-                           f'onclick="cancelRec(event,this)" '
-                           f'title="Aufnahme entfernen">✕</button>')
-            elif eid and not is_past:
-                rec_btn = (f'<button type="button" class="epg-rec-btn" '
-                           f'data-eid="{eid}" '
-                           f'onclick="recEvent(event,this)" '
-                           f'title="Aufnahme planen">⏺</button>')
+                cls += " scheduled"
+                data_attrs += f' data-uuid="{dvr_uuid}"'
+            if eid and not is_past:
+                data_attrs += f' data-eid="{eid}"'
             event_html.append(
                 f'<a class="{cls}" '
                 f'style="left:{left_px}px;width:{width_px}px" '
-                f'href="{stream_url}" title="{title} — {ts_label}">'
+                f'href="{stream_url}" aria-label="{title} — {ts_label}"'
+                f'{data_attrs}>'
                 f'<span class="t">{title}</span>'
-                f'<span class="ts">{ts_label}</span>{rec_btn}</a>')
+                f'<span class="ts">{ts_label}</span></a>')
         tl_rows.append(f'<div class="tl-row">{"".join(event_html)}</div>')
 
     # Current time marker — position inside timeline only (no offset for channel col)
@@ -1170,17 +1208,22 @@ def epg_grid():
     body = (f"<html><head><meta name='viewport' "
             f"content='width=device-width,initial-scale=1'>"
             f"<meta name='color-scheme' content='light dark'>"
-            f"<meta http-equiv='refresh' content='60'>"
-            f"<style>{BASE_CSS}</style></head><body>"
+            f"<style>{BASE_CSS}"
+            f".auto-refresh{{display:inline-flex;align-items:center;gap:.35em;"
+            f"font-size:.85em;color:var(--muted);cursor:pointer;user-select:none}}"
+            f".auto-refresh input{{accent-color:#1565c0;cursor:pointer}}"
+            f"</style></head><body>"
             f"<h1>Programm</h1>"
             f"<p><a href='{HOST_URL}/'>← Kanäle</a> · "
-            f"Stand {time.strftime('%H:%M', time.localtime(now_ts))}, "
-            f"aktualisiert sich automatisch alle 60 s.</p>"
+            f"Stand {time.strftime('%H:%M', time.localtime(now_ts))}</p>"
             f"<div class='epg-controls'>"
             f"<a class='btn-now' href='#' onclick='jumpNow();return false'>"
             f"▶︎ Jetzt</a>"
             f"<a class='btn-now' href='#' onclick='jumpPrime();return false'>"
             f"🕗 20:15</a>"
+            f"<label class='auto-refresh' title='Seite alle 60 s neu laden'>"
+            f"<input type='checkbox' id='auto-refresh'>"
+            f"<span>🔄 Auto 60s</span></label>"
             f"<span style='color:var(--muted);font-size:.85em'>"
             f"<a href='?back=6&fwd=12'>6h↞</a> · "
             f"<a href='?back=12&fwd=18'>12h↞</a> · "
@@ -1198,39 +1241,100 @@ def epg_grid():
             f"  const w=document.getElementById('tlscroll');"
             f"  if(w)w.scrollTo({{left:Math.max(0,PRIME_PX-100),behavior:'smooth'}});"
             f"}}"
-            f"function recEvent(ev,btn){{"
-            f"  ev.preventDefault();ev.stopPropagation();"
-            f"  if(btn.disabled)return;"
-            f"  btn.disabled=true;btn.classList.add('pending');"
-            f"  btn.textContent='…';"
-            f"  fetch('{HOST_URL}/record-event/'+btn.dataset.eid)"
-            f"   .then(r=>r.json()).then(d=>{{"
-            f"     if(d.ok&&d.uuid){{"
-            f"       btn.dataset.uuid=d.uuid;btn.removeAttribute('data-eid');"
-            f"       btn.classList.remove('pending');btn.classList.add('scheduled');"
-            f"       btn.textContent='✕';btn.title='Aufnahme entfernen';"
-            f"       btn.disabled=false;btn.setAttribute('onclick','cancelRec(event,this)');"
-            f"     }} else {{btn.textContent='✗';}}"
-            f"   }}).catch(()=>{{btn.textContent='✗';}});"
+            f"const LP_MS=500, LP_MOVE=10;"
+            f"let lpTimer=null,lpX=0,lpY=0,lpEl=null,lpFired=false;"
+            f"function lpCancel(){{"
+            f"  if(lpTimer){{clearTimeout(lpTimer);lpTimer=null;}}"
+            f"  if(lpEl){{lpEl.classList.remove('lp-active');lpEl=null;}}"
             f"}}"
-            f"function cancelRec(ev,btn){{"
-            f"  ev.preventDefault();ev.stopPropagation();"
-            f"  if(btn.disabled)return;"
-            f"  if(!confirm('Geplante Aufnahme entfernen?'))return;"
-            f"  btn.disabled=true;btn.textContent='…';"
-            f"  fetch('{HOST_URL}/cancel-recording/'+btn.dataset.uuid)"
-            f"   .then(r=>r.json()).then(d=>{{"
-            f"     if(d.ok){{"
-            f"       btn.classList.remove('scheduled');btn.textContent='⏺';"
-            f"       btn.title='Aufnahme planen';btn.disabled=false;"
-            f"       btn.dataset.eid=btn.dataset.eid||'';"
-            f"       btn.setAttribute('onclick','recEvent(event,this)');"
-            f"     }} else {{btn.textContent='✗';}}"
-            f"   }}).catch(()=>{{btn.textContent='✗';}});"
+            f"function lpStart(ev){{"
+            f"  const el=ev.target.closest('.epg-event');"
+            f"  if(!el)return;"
+            f"  const hasEid=el.dataset.eid||el.dataset.uuid;"
+            f"  if(!hasEid)return;"
+            f"  const p=ev.touches?ev.touches[0]:ev;"
+            f"  lpX=p.clientX;lpY=p.clientY;lpEl=el;lpFired=false;"
+            f"  el.classList.add('lp-active');"
+            f"  clearTimeout(lpTimer);"
+            f"  lpTimer=setTimeout(()=>{{"
+            f"    lpFired=true;"
+            f"    try{{navigator.vibrate&&navigator.vibrate(25);}}catch(e){{}}"
+            f"    const tgt=lpEl;lpCancel();handleLP(tgt);"
+            f"  }},LP_MS);"
             f"}}"
+            f"function lpMove(ev){{"
+            f"  if(!lpTimer)return;"
+            f"  const p=ev.touches?ev.touches[0]:ev;"
+            f"  if(Math.abs(p.clientX-lpX)>LP_MOVE||Math.abs(p.clientY-lpY)>LP_MOVE)"
+            f"    lpCancel();"
+            f"}}"
+            f"function handleLP(el){{"
+            f"  const ttl=(el.querySelector('.t')||{{}}).textContent||'diese Sendung';"
+            # Disable the anchor while the confirm sits. iOS queues the
+            # synthesized click behind the modal; by the time Cancel
+            # dismisses, our document-level preventDefault is too late
+            # and Safari navigates via href. pointer-events:none stops
+            # the click entirely.
+            f"  el.style.pointerEvents='none';"
+            f"  const release=()=>setTimeout(()=>{{"
+            f"    el.style.pointerEvents='';"
+            f"  }},400);"
+            f"  if(el.dataset.uuid){{"
+            f"    const ok=confirm('Geplante Aufnahme entfernen?\\n\\n'+ttl);"
+            f"    release();"
+            f"    if(ok)fetch('{HOST_URL}/cancel-recording/'+el.dataset.uuid)"
+            f"        .then(r=>r.json()).then(d=>{{"
+            f"          if(d.ok){{el.classList.remove('scheduled');"
+            f"            delete el.dataset.uuid;}}"
+            f"        }}).catch(()=>{{}});"
+            f"  }} else if(el.dataset.eid){{"
+            f"    const ok=confirm('Aufnahme planen?\\n\\n'+ttl);"
+            f"    release();"
+            f"    if(ok)fetch('{HOST_URL}/record-event/'+el.dataset.eid)"
+            f"        .then(r=>r.json()).then(d=>{{"
+            f"          if(d.ok&&d.uuid){{el.classList.add('scheduled');"
+            f"            el.dataset.uuid=d.uuid;}}"
+            f"        }}).catch(()=>{{}});"
+            f"  }} else {{"
+            f"    release();"
+            f"  }}"
+            f"}}"
+            f"document.addEventListener('touchstart',lpStart,{{passive:true}});"
+            f"document.addEventListener('touchmove',lpMove,{{passive:true}});"
+            f"document.addEventListener('touchend',lpCancel);"
+            f"document.addEventListener('touchcancel',lpCancel);"
+            f"document.addEventListener('mousedown',ev=>{{"
+            f"  if(ev.button===0)lpStart(ev);"
+            f"}});"
+            f"document.addEventListener('mousemove',lpMove);"
+            f"document.addEventListener('mouseup',lpCancel);"
+            f"document.addEventListener('mouseleave',lpCancel);"
+            # Suppress the anchor click that follows a long-press.
+            f"document.addEventListener('click',ev=>{{"
+            f"  if(lpFired&&ev.target.closest('.epg-event')){{"
+            f"    ev.preventDefault();ev.stopPropagation();lpFired=false;"
+            f"  }}"
+            f"}},true);"
+            f"document.addEventListener('contextmenu',ev=>{{"
+            f"  if(ev.target.closest('.epg-event'))ev.preventDefault();"
+            f"}});"
             f"window.addEventListener('load',()=>{{"
             f"  const w=document.getElementById('tlscroll');"
             f"  if(w)w.scrollLeft=Math.max(0,NOW_PX-100);"
+            f"  const cb=document.getElementById('auto-refresh');"
+            f"  if(cb){{"
+            f"    cb.checked=localStorage.getItem('epgAutoRefresh')==='1';"
+            f"    let timer=null;"
+            f"    function arm(){{"
+            f"      if(timer){{clearTimeout(timer);timer=null;}}"
+            f"      if(cb.checked)timer=setTimeout(()=>location.reload(),60000);"
+            f"    }}"
+            f"    cb.addEventListener('change',()=>{{"
+            f"      localStorage.setItem('epgAutoRefresh',cb.checked?'1':'0');"
+            f"      arm();"
+            f"    }});"
+            f"    arm();"
+            f"  }}"
             f"}});"
             f"</script>"
             f"</body></html>")
@@ -1392,7 +1496,7 @@ html,body{{height:100%;background:#000;color:#eee;
 <button id='unmute' onclick='doUnmute()'>🔊 Ton an</button>
 <div id='topbar'>
  <button class='iconbtn' onclick='toggleFs()' aria-label='Vollbild'>⛶</button>
- <a class='iconbtn' href='{HOST_URL}/' aria-label='Schließen'>✕</a>
+ <a class='iconbtn' href='{HOST_URL}/' aria-label='Schließen' onclick='return closePlayer(event)'>✕</a>
 </div>
 <div id='chrome'>
  <div id='scrub'>
@@ -1991,8 +2095,19 @@ document.addEventListener('touchend',e=>{{
     if(dx<0)nextCh();else prevCh();
   }}
 }},{{passive:true,capture:true}});
+function closePlayer(ev){{
+  if(ev){{ev.preventDefault();}}
+  try{{
+    const ref=document.referrer?new URL(document.referrer):null;
+    if(ref&&ref.origin===location.origin&&history.length>1){{
+      history.back();return false;
+    }}
+  }}catch(e){{}}
+  location.href=HOST+'/';
+  return false;
+}}
 document.addEventListener('keydown',e=>{{
-  if(e.key==='Escape')location.href=HOST+'/';
+  if(e.key==='Escape')closePlayer();
   else if(e.key==='ArrowRight')nextCh();
   else if(e.key==='ArrowLeft')prevCh();
   else if(e.key===' '){{e.preventDefault();togglePlay();show();}}
@@ -2880,44 +2995,53 @@ def _live_ads_analyze(slug):
     playlist = ch_dir / "index.m3u8"
     if not playlist.exists():
         return False
-    # Anchor wall time: parse PROGRAM-DATE-TIME of the first segment
+    # Anchor wall time: parse the first #EXT-X-PROGRAM-DATE-TIME. ffmpeg
+    # writes one per segment, between the EXTINF line and the .ts name,
+    # so we just scan until we find the first occurrence.
     first_pdt = None
-    first_seg = None
     try:
-        text = playlist.read_text().splitlines()
-        for i, line in enumerate(text):
+        from datetime import datetime
+        for line in playlist.read_text().splitlines():
             if line.startswith("#EXT-X-PROGRAM-DATE-TIME:"):
-                from datetime import datetime
                 first_pdt = datetime.fromisoformat(
                     line.split(":", 1)[1].strip()).timestamp()
-            elif line.startswith("#EXTINF") and i + 1 < len(text):
-                first_seg = text[i + 1].strip()
                 break
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"[{slug}] adskip PDT parse: {e}", flush=True)
     if first_pdt is None:
+        print(f"[{slug}] adskip skip: no PROGRAM-DATE-TIME found",
+              flush=True)
         return False
-    segs = sorted(ch_dir.glob("seg_*.ts"))
-    if len(segs) < 120:      # at least ~2 min of segments
+    all_segs = sorted(ch_dir.glob("seg_*.ts"))
+    if len(all_segs) < 120:      # at least ~2 min of segments
         return False
+    # Concatenating the full 1-2 h buffer blows past the 180 s ffmpeg
+    # timeout (thousands of file-open syscalls even with -c copy). 30
+    # min is plenty to spot a commercial pattern; we shift the PDT
+    # anchor to the first retained segment (segments are 1 s each).
+    WINDOW_SEGS = 1800
+    segs = all_segs[-WINDOW_SEGS:] if len(all_segs) > WINDOW_SEGS else all_segs
+    first_pdt += (len(all_segs) - len(segs)) * SEGMENT_TIME
     work = ch_dir / ".adskip"
     work.mkdir(exist_ok=True)
     for f in work.glob("*.txt"):
         try: f.unlink()
         except Exception: pass
-    concat = work / "concat.txt"
-    concat.write_text("\n".join(f"file '../{s.name}'" for s in segs))
     merged = work / "merged.ts"
     merged.unlink(missing_ok=True)
-    # Concatenate into a single MPEG-TS so comskip sees a continuous file
+    # Concatenate into a single MPEG-TS so comskip sees a continuous
+    # file. TS is self-synchronising so raw cat works — much faster
+    # than ffmpeg's concat demuxer which was bottlenecked on per-file
+    # parsing.
     try:
-        subprocess.run(
-            ["nice", "-n", "15", "ffmpeg", "-y", "-hide_banner",
-             "-loglevel", "error", "-f", "concat", "-safe", "0",
-             "-i", str(concat), "-c", "copy", str(merged)],
-            cwd=str(work), timeout=180, check=False)
+        with open(merged, "wb") as out:
+            for s in segs:
+                try:
+                    out.write(s.read_bytes())
+                except Exception:
+                    pass
     except Exception as e:
-        print(f"[{slug}] adskip concat: {e}", flush=True)
+        print(f"[{slug}] adskip cat: {e}", flush=True)
         return False
     if not merged.exists() or merged.stat().st_size < 1_000_000:
         return False
@@ -2931,7 +3055,6 @@ def _live_ads_analyze(slug):
         print(f"[{slug}] adskip comskip: {e}", flush=True)
     ads_sec = _rec_parse_comskip(work)
     merged.unlink(missing_ok=True)
-    concat.unlink(missing_ok=True)
     # Convert frame-based seconds (relative to concat start) to wall
     ads_wall = [[round(first_pdt + a, 1), round(first_pdt + b, 1)]
                 for a, b in ads_sec]
@@ -2951,7 +3074,10 @@ LIVE_ADSKIP_SLUGS = {
 
 
 def _live_adskip_loop():
-    time.sleep(180)   # wait for streams to build up a useful window
+    # Short warm-up: threads and adopted ffmpegs settle in a few seconds.
+    # The per-channel `started_at > 120s` check below is what actually
+    # guarantees the buffer is long enough to bother analysing.
+    time.sleep(10)
     while True:
         try:
             with active_lock:
@@ -2959,13 +3085,14 @@ def _live_adskip_loop():
                               if i["process"].poll() is None
                               and s in LIVE_ADSKIP_SLUGS
                               and (time.time() - i.get("started_at", 0)) > 120]
-            # Skip channels we've scanned within the last 12 min
             with _live_ads_lock:
                 recent = {s for s, v in _live_ads.items()
                           if time.time() - v.get("generated", 0) < 720}
             todo = [s for s in candidates if s not in recent]
             if todo:
                 slug = todo[0]
+                print(f"[{slug}] adskip: analysing "
+                      f"({len(todo)-1} more queued)", flush=True)
                 _live_ads_proc["slug"] = slug
                 _live_ads_proc["started"] = time.time()
                 try:
@@ -2974,7 +3101,7 @@ def _live_adskip_loop():
                     _live_ads_proc["slug"] = None
         except Exception as e:
             print(f"adskip loop: {e}", flush=True)
-        time.sleep(60)
+        time.sleep(30)
 
 
 @app.route("/api/live-ads/<slug>/scan", methods=["POST"])
@@ -3479,6 +3606,86 @@ def status():
 
 
 _dvr_upcoming_cache = {"count": 0, "expires": 0}
+_tuner_cache = {"used": None, "total": None, "expires": 0}
+
+
+def tuner_status():
+    """Return (used, total) for FRITZ!Box SAT>IP tuners. tvheadend's
+    /api/status/inputs lists every configured tuner; `subs > 0` marks
+    the ones currently tuned to a mux (channels on the same mux share
+    one tuner). Cached 5 s."""
+    now = time.time()
+    if now < _tuner_cache["expires"]:
+        return _tuner_cache["used"], _tuner_cache["total"]
+    used, total = None, TUNER_TOTAL
+    try:
+        data = json.loads(urllib.request.urlopen(
+            f"{TVH_BASE}/api/status/inputs", timeout=2).read())
+        entries = data.get("entries", [])
+        total = len(entries) or TUNER_TOTAL
+        used = sum(1 for e in entries if e.get("subs", 0) > 0)
+    except Exception:
+        pass
+    _tuner_cache["used"] = used
+    _tuner_cache["total"] = total
+    _tuner_cache["expires"] = now + 5
+    return used, total
+
+
+_pinned_mux_cache = {"muxes": set(), "running": 0, "expires": 0}
+
+
+def _mux_from_svc(svc):
+    # tvheadend subscription 'service' looks like
+    # "SAT>IP DVB-C Tuner #1 (...)/FritzBox DVB-C/546MHz/VOX"
+    # The second-to-last slash-separated component is the mux id.
+    parts = (svc or "").split("/")
+    return parts[-2] if len(parts) >= 2 else None
+
+
+def pinned_mux_info():
+    """Return (distinct_mux_count, running_pin_count) for pinned channels
+    with an active tvheadend subscription. Lets us give a mux-sharing
+    bonus to the pin limit — two pins on the same transponder cost one
+    tuner, not two."""
+    now = time.time()
+    if now < _pinned_mux_cache["expires"]:
+        return len(_pinned_mux_cache["muxes"]), _pinned_mux_cache["running"]
+    muxes, running = set(), 0
+    with cmap_lock:
+        name_to_slug = {info["name"]: s for s, info in channel_map.items()}
+    try:
+        data = json.loads(urllib.request.urlopen(
+            f"{TVH_BASE}/api/status/subscriptions", timeout=2).read())
+        for e in data.get("entries", []):
+            slug = name_to_slug.get(e.get("channel", ""))
+            if slug and slug in ALWAYS_WARM:
+                running += 1
+                m = _mux_from_svc(e.get("service"))
+                if m:
+                    muxes.add(m)
+    except Exception:
+        pass
+    _pinned_mux_cache["muxes"] = muxes
+    _pinned_mux_cache["running"] = running
+    _pinned_mux_cache["expires"] = now + 5
+    return len(muxes), running
+
+
+def compute_pin_limit():
+    """Tuner-based pin cap. Base = total tuners minus 1 reserved for
+    ad-hoc viewing minus active DVR jobs. Bonus = pins that share muxes
+    with other pins (they cost a fractional tuner each). Falls back to
+    the static PIN_HARD_MAX if tvheadend status is unavailable."""
+    used, total = tuner_status()
+    total = total or TUNER_TOTAL
+    dvr = active_dvr_count()
+    base = max(0, total - 1 - dvr)
+    distinct_muxes, running_pins = pinned_mux_info()
+    mux_bonus = max(0, running_pins - distinct_muxes)
+    limit = base + mux_bonus
+    # Never retroactively shrink below what's already pinned.
+    return max(limit, len(ALWAYS_WARM))
 
 
 def active_dvr_count():
@@ -3509,7 +3716,7 @@ def active_dvr_count():
 @app.route("/api/always-warm/<slug>", methods=["POST"])
 def api_always_warm(slug):
     """Toggle permanent-warm on a channel. Body: {"on": true|false}.
-    Refuses new pins that would exceed PIN_HARD_MAX - active DVR jobs."""
+    Refuses new pins that would exceed the tuner-derived dynamic cap."""
     with cmap_lock:
         if slug not in channel_map:
             abort(404)
@@ -3519,7 +3726,7 @@ def api_always_warm(slug):
         body = {}
     want = bool(body.get("on", True))
     if want and slug not in ALWAYS_WARM:
-        pin_limit = max(0, PIN_HARD_MAX - active_dvr_count())
+        pin_limit = compute_pin_limit()
         if len(ALWAYS_WARM) >= pin_limit:
             return Response(json.dumps({
                 "slug": slug, "on": False, "changed": False,
@@ -3548,16 +3755,19 @@ def api_warm_status():
                             "idle_seconds": 0, "buffer_seconds": 0})
     dvr_busy = active_dvr_count()
     pins_used = len(ALWAYS_WARM)
-    pin_limit = max(0, PIN_HARD_MAX - dvr_busy)
+    pin_limit = compute_pin_limit()
     pin_budget = max(0, pin_limit - pins_used)
+    tuners_used, tuners_total = tuner_status()
     return _cors(Response(json.dumps({
         "channels": out,
         "max_warm": MAX_WARM_STREAMS,
         "window_seconds": WINDOW_SECONDS,
-        "pin_hard_max": PIN_HARD_MAX,
+        "pin_hard_max": pin_limit,
         "pin_dvr_reserve": dvr_busy,
         "pin_limit": pin_limit,
         "pin_budget": pin_budget,
+        "tuners_used": tuners_used,
+        "tuners_total": tuners_total,
     }), mimetype="application/json"))
 
 

@@ -19,11 +19,31 @@ on an external USB-3 SSD at `/mnt/tv/`.
   through libx264 ultrafast with explicit `setsar=1` so iOS renders
   anamorphic content at the correct 16:9 display aspect (otherwise
   SD channels show up as 4:3).
-- **Warm-tuner LRU**: switching channel does not immediately stop the
-  previous stream. Up to `MAX_WARM_STREAMS` (default 3, leaving 1 of 4
-  FRITZ!Box tuners for DVR jobs) keep running so the 2 h DVR buffer
-  stays populated for instant time-shift on return. Eviction is LRU;
-  new channel request frees the oldest idle.
+- **Warm-tuner LRU + UI pins**: switching channel does not immediately
+  stop the previous stream. LRU cache (`MAX_WARM_STREAMS`) plus any
+  channels pinned via the UI (📌 on the startpage, persisted to
+  `.always_warm.json`) keep running so the 2 h DVR buffer stays
+  populated for instant time-shift. Pin cap is **dynamic**, derived
+  from real tuner usage: `TUNER_TOTAL - 1 - active_dvr` plus a mux-
+  sharing bonus — two pins on the same transponder cost one tuner, so
+  the cap grows by 1. Tuner count is read live from tvheadend
+  `/api/status/inputs` (entries with `subs > 0`). Header badge
+  `📡 n/4 Tuner` on the startpage reflects this in real time; tap on a
+  green warm-badge stops the LRU channel to free its tuner.
+- **Hot-reload without buffer loss**: editing `service.py` triggers an
+  in-container file watcher (mtime poll) that does `os.execv` on the
+  Python process. ffmpegs are spawned with `start_new_session=True`
+  and tracked via a PID file (`.ffmpeg.pid` per channel) so the new
+  image adopts them on startup. `docker restart` still nukes them
+  (cgroup teardown), so it's deliberately avoided for code changes.
+- **Live commercial detection**: a background loop (`_live_adskip_loop`)
+  picks one warm private-sender channel every 30 s, concatenates the
+  last 30 min of TS segments (raw `cat` — self-synchronising, much
+  faster than `ffmpeg -f concat`), and runs comskip. Ad blocks are
+  stored keyed by wall-clock via `EXT-X-PROGRAM-DATE-TIME`, so
+  rewinding into the buffer on a warm channel lets the player skip
+  commercials. Re-scanned every ~12 min so fresh content gets picked
+  up. Public broadcasters are excluded (no regular ad breaks).
 - **Recording playback via lazy HLS-VOD remux**. tvheadend stores as
   `.ts` with `content-disposition: attachment`, which iOS treats as
   a download. We remux on demand into an HLS-VOD playlist under

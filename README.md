@@ -17,14 +17,21 @@ Alle drei als Docker-Container, `network_mode: host`.
 - „Von Anfang" springt an den Sendungsstart, falls im lokalen Puffer
 - **Mediathek-Fallback** für ARD/ZDF-Sender (hls.js + MSE, iOS 17.1+): überspringt Safaris Live-HLS-Einschränkungen
 - **Aufnahmen** (tvheadend-DVR) werden nach Fertigstellung automatisch zu iOS-kompatiblem HLS-VOD umgepackt, Werbeblöcke per comskip erkannt und im Scrubber schraffiert markiert
-- LRU-Warm-Tuner: Kanäle laufen nach Kanalwechsel weiter (DVR bleibt warm), max 3 parallel — Live-TV bekommt Priorität über Prewarm
+- **Live-Werbeerkennung** (Privatsender) — rollender comskip-Durchlauf auf den warmen Kanälen alle ~12 min, Werbeblöcke überspringbar im 2-h-Puffer
+- **Warm-Tuner** mit konfigurierbaren Pins (Startseite): gepinnte Kanäle laufen dauerhaft, zusätzlich LRU-Cache für zuletzt geschaute. Pin-Cap dynamisch nach Tuner-Belegung (Mux-Sharing wird angerechnet)
+- **Kanalübersicht**: Badge pro Kanal zeigt Puffergröße (grün = LRU-warm, blau = gepinnt); Klick auf grünen Badge gibt Tuner frei. Header zeigt `📡 n/4 Tuner` live
+- **EPG**: Logo-only-Spalte, kompakte Zeitachse, Kurzsendungen mit 2-Zeilen-Wrap. Langes Drücken auf Sendung → Aufnahme-Dialog (geplante Sendungen mit grünem Punkt). Tap auf Live-Sendung öffnet Player; Close bringt dich zurück ins EPG (scroll-Position bleibt)
+- **Hot-Reload ohne Puffer-Verlust**: `scp service.py` reicht — File-Watcher im Container triggert `os.execv`, ffmpeg-Kinder werden per PID-Datei re-adoptiert
 - Pause mit src-strip (Live) bzw. Destroy/Restart-hls.js (Mediathek) — iOS-Live-HLS lässt sich nicht nativ pausieren
 
 ## Pfade auf dem Pi
 
 - `/mnt/tv/` — SSD (ext4, Samsung T5 USB3), Aufnahmen + HLS-Segmente
-- `~/hls-gateway/service.py` per Volume gemountet → Hot-Reload nach `docker compose restart`
+- `~/hls-gateway/service.py` per Volume gemountet → Hot-Reload allein durch `scp` (siehe Entwicklung)
 - `/mnt/tv/hls/` — HLS-Segmente für Live (`<slug>/`) und VOD-Aufnahmen (`_rec_<uuid>/`)
+- `/mnt/tv/hls/<slug>/.ffmpeg.pid` — Kind-PID + Startzeit für Re-Adoption nach Hot-Reload
+- `/mnt/tv/hls/<slug>/.adskip/` — comskip-Artefakte für die Live-Werbeerkennung
+- `/mnt/tv/hls/.always_warm.json` — Pin-State (persistent)
 
 ## Entwicklung
 
