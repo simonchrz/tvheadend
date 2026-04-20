@@ -1385,26 +1385,53 @@ def epg_grid():
             f"        }}).catch(()=>{{}});"
             f"    }});"
             f"  }} else if(el.dataset.eid){{"
-            f"    lpDialog({{msg:'Aufnahme planen?<br><br>'+ttl,"
-            f"      buttons:[{{label:'Einzelne Episode',value:'ep',primary:true}},"
-            f"               {{label:'Ganze Serie',value:'series'}},"
-            f"               {{label:'Abbrechen',value:''}}]}}).then(v=>{{"
-            f"      release();"
-            f"      if(v==='ep')fetch('{HOST_URL}/record-event/'+el.dataset.eid)"
-            f"        .then(r=>r.json()).then(d=>{{"
-            f"          if(d.ok&&d.uuid){{el.classList.add('scheduled');"
-            f"            el.dataset.uuid=d.uuid;}}"
-            f"        }}).catch(()=>{{}});"
-            f"      else if(v==='series')fetch('{HOST_URL}/record-series/'+el.dataset.eid)"
-            f"        .then(r=>r.json()).then(d=>{{"
-            f"          if(d.ok){{"
-            f"            const n=d.scheduled||0;"
-            f"            const ep=n===1?'Folge':'Folgen';"
-            f"            lpDialog({{msg:'<b>'+d.title+'</b> auf '+d.channel+"
+            # Query the Mediathek lookup in parallel with opening the
+            # dialog. If it returns a match in time we include an extra
+            # button; otherwise the dialog stays the usual two options.
+            f"    const mtFetch=fetch('{HOST_URL}/api/mediathek-lookup/'"
+            f"+el.dataset.eid).then(r=>r.json()).catch(()=>({{match:null}}));"
+            f"    const dialogBtns=[{{label:'Einzelne Episode',value:'ep',"
+            f"primary:true}},{{label:'Ganze Serie',value:'series'}},"
+            f"{{label:'Abbrechen',value:''}}];"
+            f"    mtFetch.then(m=>{{"
+            f"      if(m&&m.match){{"
+            f"        const avail=new Date(m.match.available_to*1000);"
+            f"        const dStr=String(avail.getDate()).padStart(2,'0')+'.'"
+            f"+String(avail.getMonth()+1).padStart(2,'0');"
+            f"        dialogBtns.splice(1,0,{{"
+            f"          label:'Aus ARD Mediathek (bis '+dStr+')',"
+            f"          value:'mediathek'}});"
+            f"      }}"
+            f"      lpDialog({{msg:'Aufnahme planen?<br><br>'+ttl,"
+            f"        buttons:dialogBtns}}).then(v=>{{"
+            f"        release();"
+            f"        if(v==='ep')fetch('{HOST_URL}/record-event/'+el.dataset.eid)"
+            f"          .then(r=>r.json()).then(d=>{{"
+            f"            if(d.ok&&d.uuid){{el.classList.add('scheduled');"
+            f"              el.dataset.uuid=d.uuid;}}"
+            f"          }}).catch(()=>{{}});"
+            f"        else if(v==='series')fetch('{HOST_URL}/record-series/'+el.dataset.eid)"
+            f"          .then(r=>r.json()).then(d=>{{"
+            f"            if(d.ok){{"
+            f"              const n=d.scheduled||0;"
+            f"              const ep=n===1?'Folge':'Folgen';"
+            f"              lpDialog({{msg:'<b>'+d.title+'</b> auf '+d.channel+"
             f"'<br><br>'+n+' '+ep+' aktuell geplant',"
-            f"              buttons:[{{label:'OK',value:'',primary:true}}]}});"
-            f"          }}"
-            f"        }}).catch(()=>{{}});"
+            f"                buttons:[{{label:'OK',value:'',primary:true}}]}});"
+            f"            }}"
+            f"          }}).catch(()=>{{}});"
+            f"        else if(v==='mediathek')"
+            f"          fetch('{HOST_URL}/api/mediathek-schedule/'+el.dataset.eid,"
+            f"            {{method:'POST'}})"
+            f"            .then(r=>r.json()).then(d=>{{"
+            f"              if(d.ok)lpDialog({{msg:'<b>'+d.title+"
+            f"'</b><br><br>Aus Mediathek gespeichert. Unter Aufnahmen "
+            f"abrufbar.',"
+            f"                buttons:[{{label:'OK',value:'',primary:true}}]}});"
+            f"              else lpDialog({{msg:'Fehler: '+(d.error||'?'),"
+            f"                buttons:[{{label:'OK',value:'',primary:true}}]}});"
+            f"            }}).catch(()=>{{}});"
+            f"      }});"
             f"    }});"
             f"  }} else {{"
             f"    release();"
@@ -2828,6 +2855,167 @@ def record_event(event_id):
                         status=500, mimetype="application/json")
 
 
+# DVB channels where the ARD Mediathek is likely to have coverage.
+# We don't filter further by Mediathek publicationService because
+# ARD-aired shows are produced by various regional broadcasters
+# (WDR, NDR, BR, …) and appear in search under the producing
+# broadcaster's name, not under "Das Erste".
+ARD_SEARCH_CHANNELS = {
+    "das-erste-hd", "tagesschau24-hd", "rbb-berlin-hd",
+    "arte-hd", "kika-hd", "3sat-hd",
+}
+
+
+@app.route("/api/mediathek-lookup/<event_id>")
+def api_mediathek_lookup(event_id):
+    """For an EPG event, try to find the same show in the ARD
+    Mediathek and return its availability window + player URL."""
+    try:
+        ev = json.loads(urllib.request.urlopen(
+            f"{TVH_BASE}/api/epg/events/load?eventId={event_id}",
+            timeout=6).read())
+        entry = (ev.get("entries") or [{}])[0]
+        title = (entry.get("title") or "").strip()
+        ch_name = entry.get("channelName") or ""
+        start_ts = entry.get("start", 0)
+    except Exception as e:
+        return _cors(Response(json.dumps({"match": None,
+                                           "error": f"lookup: {e}"}),
+                               mimetype="application/json"))
+    if not title:
+        return _cors(Response(json.dumps({"match": None}),
+                               mimetype="application/json"))
+    # Only query Mediathek for channels we know it covers — keeps the
+    # match rate honest and avoids pestering the ARD API for RTL shows.
+    slug = slugify(ch_name)
+    if slug not in ARD_SEARCH_CHANNELS:
+        return _cors(Response(json.dumps({
+            "match": None, "reason": "channel not in ARD coverage"}),
+            mimetype="application/json"))
+    try:
+        qs = urllib.parse.urlencode({
+            "searchString": title,
+            "searchResultsPageSize": "24",
+        })
+        data = json.loads(urllib.request.urlopen(
+            f"https://api.ardmediathek.de/page-gateway/pages/ard/"
+            f"search?{qs}", timeout=6).read())
+    except Exception as e:
+        return _cors(Response(json.dumps({
+            "match": None, "error": f"mediathek: {e}"}),
+            mimetype="application/json"))
+    best = None
+    from datetime import datetime
+    title_l = title.lower()
+    # Broadcast date must land within ±48h of the DVB event. Mediathek
+    # returns every clip/archive result matching the title otherwise,
+    # which drowns the true pre-/post-release episode in noise.
+    MAX_DELTA = 48 * 3600
+    for v in data.get("vodResults", []):
+        svc = (v.get("publicationService") or {}).get("name", "")
+        # Title match: the mediathek title often appends episode info
+        # ("Tatort - Der dunkle Ort"); accept substring either way.
+        vt = (v.get("longTitle") or v.get("mediumTitle") or "").strip()
+        vt_l = vt.lower()
+        if title_l not in vt_l and vt_l not in title_l:
+            continue
+        bt = 0
+        if v.get("broadcastedOn"):
+            try:
+                bt = int(datetime.fromisoformat(
+                    v["broadcastedOn"].replace("Z", "+00:00")).timestamp())
+            except Exception:
+                pass
+        if not bt or not start_ts:
+            continue
+        delta = abs(bt - start_ts)
+        if delta > MAX_DELTA:
+            continue
+        if best is None or delta < best["_delta"]:
+            avail_to = 0
+            if v.get("availableTo"):
+                try:
+                    avail_to = int(datetime.fromisoformat(
+                        v["availableTo"].replace("Z", "+00:00")).timestamp())
+                except Exception:
+                    pass
+            best = {
+                "_delta": delta,
+                "title": vt,
+                "channel": svc,
+                "broadcast": bt,
+                "available_to": avail_to,
+                "duration": v.get("duration", 0),
+                "id": v.get("id"),
+                "player_url": f"https://www.ardmediathek.de/video/{v.get('id')}",
+            }
+    if not best:
+        return _cors(Response(json.dumps({"match": None}),
+                               mimetype="application/json"))
+    best.pop("_delta", None)
+    return _cors(Response(json.dumps({"match": best}),
+                           mimetype="application/json"))
+
+
+@app.route("/api/mediathek-schedule/<event_id>", methods=["POST"])
+def api_mediathek_schedule(event_id):
+    """Store a virtual recording that streams from ARD Mediathek on
+    playback. Uses the lookup we already have, resolves the item's
+    HLS master URL, and saves a local stub so /recordings + the
+    recording player pick it up."""
+    # Re-run the lookup in-process
+    try:
+        ev = json.loads(urllib.request.urlopen(
+            f"{TVH_BASE}/api/epg/events/load?eventId={event_id}",
+            timeout=6).read())
+        entry = (ev.get("entries") or [{}])[0]
+        ev_title = (entry.get("title") or "").strip()
+        ch_name = entry.get("channelName") or ""
+        ev_start = entry.get("start", 0)
+        ev_stop = entry.get("stop", 0)
+    except Exception as e:
+        return Response(json.dumps({"ok": False, "error": f"lookup: {e}"}),
+                        status=500, mimetype="application/json")
+    # Re-run the lookup. Loopback HTTP is simpler than refactoring
+    # the matcher into a shared helper for one more caller.
+    try:
+        res = urllib.request.urlopen(
+            f"http://localhost:8080/api/mediathek-lookup/{event_id}",
+            timeout=8).read()
+        match = json.loads(res).get("match")
+    except Exception as e:
+        return Response(json.dumps({"ok": False, "error": f"match: {e}"}),
+                        status=500, mimetype="application/json")
+    if not match or not match.get("id"):
+        return Response(json.dumps({"ok": False,
+                                     "error": "no mediathek match"}),
+                        status=404, mimetype="application/json")
+    hls_url = _resolve_mediathek_hls(match["id"])
+    if not hls_url:
+        return Response(json.dumps({"ok": False,
+                                     "error": "no hls url"}),
+                        status=500, mimetype="application/json")
+    import uuid as uuid_mod
+    vuuid = "mt_" + uuid_mod.uuid4().hex[:16]
+    with _mediathek_rec_lock:
+        _mediathek_rec[vuuid] = {
+            "title": match.get("title") or ev_title,
+            "channel": ch_name,
+            "start": ev_start,
+            "stop": ev_stop,
+            "hls_url": hls_url,
+            "available_to": match.get("available_to", 0),
+            "eid": event_id,
+            "created_at": int(time.time()),
+        }
+    save_mediathek_rec()
+    return _cors(Response(json.dumps({
+        "ok": True, "uuid": vuuid,
+        "title": _mediathek_rec[vuuid]["title"],
+        "available_to": _mediathek_rec[vuuid]["available_to"],
+    }), mimetype="application/json"))
+
+
 @app.route("/record-series/<event_id>")
 def record_series(event_id):
     """Create a tvheadend autorec rule to capture every future airing of
@@ -3091,6 +3279,46 @@ def recordings_page():
                    + '</tbody></table></details></td></tr>')
         rows.append(summary)
 
+    # Virtual Mediathek recordings — stream via hls.js on play. Sorted
+    # newest-first, with an expiry reminder.
+    with _mediathek_rec_lock:
+        mt_entries = [(k, v) for k, v in _mediathek_rec.items()]
+    mt_entries.sort(key=lambda kv: kv[1].get("created_at", 0), reverse=True)
+    from datetime import datetime as _dt
+    for vuuid, m in mt_entries:
+        mt_title = m.get("title", "?").replace("<", "&lt;")
+        when = time.strftime("%d.%m %H:%M",
+                              time.localtime(m.get("start", 0)))
+        dur_min = max(0, (m.get("stop", 0) - m.get("start", 0)) // 60)
+        avail_to = m.get("available_to", 0)
+        avail_str = ""
+        if avail_to:
+            try:
+                avail_str = _dt.fromtimestamp(avail_to).strftime("%d.%m.")
+            except Exception:
+                pass
+        expired = avail_to and now_ts > avail_to
+        if expired:
+            mt_badge = '<span class="badge expired">✗ abgelaufen</span>'
+        else:
+            mt_badge = '<span class="badge mediathek">📡 Mediathek</span>'
+        avail_cell = (f'<small style="color:var(--muted)">bis '
+                      f'{avail_str}</small>' if avail_str and not expired
+                      else ('<small>abgelaufen</small>' if expired else ''))
+        if expired:
+            title_cell = f'<span>{mt_title}</span>'
+        else:
+            title_cell = f'<a href="{HOST_URL}/recording/{vuuid}">{mt_title}</a>'
+        rows.append(
+            f'<tr><td>{mt_badge}</td>'
+            f'<td>{title_cell}</td>'
+            f'<td>{when}</td>'
+            f'<td>{dur_min} min</td>'
+            f'<td>{avail_cell}</td>'
+            f'<td></td>'
+            f'<td><a href="{HOST_URL}/mediathek-rec/{vuuid}/delete" '
+            f'onclick="return confirm(\'Aus Liste entfernen?\')">🗑</a></td></tr>')
+
     body = (f"<html><head><meta name='viewport' "
             f"content='width=device-width,initial-scale=1'>"
             f"<meta name='color-scheme' content='light dark'>"
@@ -3104,6 +3332,8 @@ def recordings_page():
             f".badge.warming{{background:#f39c12;color:#fff}}"
             f".badge.pending{{background:var(--stripe);color:var(--muted)}}"
             f".badge.series{{background:#8e44ad;color:#fff}}"
+            f".badge.mediathek{{background:#2980b9;color:#fff}}"
+            f".badge.expired{{background:#7f8c8d;color:#fff}}"
             f"tr.series-head td{{padding:0}}"
             f"tr.series-head summary{{cursor:pointer;padding:6px 8px;"
             f"background:var(--stripe);display:flex;align-items:center;"
@@ -3323,6 +3553,51 @@ _live_ads_lock = threading.Lock()
 _live_ads = {}   # slug -> {"generated": ts, "ads": [[wall_start, wall_stop], ...]}
 _live_ads_proc = {"slug": None, "started": 0}
 LIVE_ADS_FILE = HLS_DIR / ".live_ads.json"
+MEDIATHEK_REC_FILE = HLS_DIR / ".mediathek_recordings.json"
+_mediathek_rec_lock = threading.Lock()
+_mediathek_rec = {}  # uuid -> {title, channel, start, stop, hls_url,
+                     #         available_to, eid, created_at}
+
+
+def load_mediathek_rec():
+    if not MEDIATHEK_REC_FILE.exists():
+        return
+    try:
+        with _mediathek_rec_lock:
+            _mediathek_rec.update(json.loads(MEDIATHEK_REC_FILE.read_text()))
+        print(f"Loaded {len(_mediathek_rec)} mediathek recordings", flush=True)
+    except Exception as e:
+        print(f"load mediathek recordings: {e}", flush=True)
+
+
+def save_mediathek_rec():
+    try:
+        with _mediathek_rec_lock:
+            snap = dict(_mediathek_rec)
+        MEDIATHEK_REC_FILE.write_text(json.dumps(snap))
+    except Exception as e:
+        print(f"save mediathek recordings: {e}", flush=True)
+
+
+def _resolve_mediathek_hls(item_id):
+    """Given an ARD Mediathek item id (from search), fetch the detail
+    page and pick out the adaptive HLS master playlist URL."""
+    try:
+        url = (f"https://api.ardmediathek.de/page-gateway/pages/ard/"
+               f"item/{item_id}?devicetype=pc&embedded=true")
+        data = json.loads(urllib.request.urlopen(url, timeout=6).read())
+        media = (data.get("widgets", [{}])[0]
+                     .get("mediaCollection", {})
+                     .get("embedded", {})
+                     .get("streams", [{}])[0]
+                     .get("media", []))
+        for m in media:
+            u = m.get("url", "")
+            if ".m3u8" in u or m.get("forcedLabel") == "Auto":
+                return u
+    except Exception as e:
+        print(f"mediathek hls resolve: {e}", flush=True)
+    return None
 
 
 def load_live_ads():
@@ -3663,10 +3938,123 @@ def recording_hls_progress(uuid):
                            mimetype="application/json"))
 
 
+def _render_mediathek_player(uuid, entry):
+    """HTML for a virtual Mediathek recording — no remux, no comskip,
+    no progress polling. Plays the ARD HLS URL via hls.js so iOS
+    Safari doesn't punt to its native video overlay."""
+    title_safe = entry["title"].replace("<", "&lt;")
+    hls_url = entry["hls_url"].replace("'", "%27")
+    avail_to = entry.get("available_to", 0)
+    from datetime import datetime
+    avail_str = ""
+    if avail_to:
+        try:
+            avail_str = datetime.fromtimestamp(avail_to).strftime("%d.%m.%Y")
+        except Exception:
+            pass
+    src_badge = (f"<span class='src-badge'>ARD Mediathek"
+                 f"{' · bis ' + avail_str if avail_str else ''}</span>")
+    return (f"<!doctype html><html><head>"
+            f"{PLAYER_HEAD_META}"
+            f"<title>{title_safe}</title>"
+            f"<script src='https://cdn.jsdelivr.net/npm/hls.js@1/"
+            f"dist/hls.min.js'></script>"
+            f"<style>{PLAYER_BASE_CSS}"
+            f".src-badge{{display:inline-block;background:#2980b9;"
+            f"color:#fff;padding:2px 8px;border-radius:10px;"
+            f"font-size:.75em;margin-left:8px;vertical-align:1px}}"
+            f"</style></head><body>"
+            f"<video id='v' autoplay playsinline webkit-playsinline></video>"
+            f"<div id='topbar'>"
+            f"<button class='iconbtn' onclick='toggleFs()' aria-label='Vollbild'>⛶</button>"
+            f"<a class='iconbtn' href='{HOST_URL}/recordings' "
+            f"onclick='return closePlayer(event)' aria-label='Schließen'>✕</a>"
+            f"</div>"
+            f"<div id='hint'></div>"
+            f"<div id='chrome'>"
+            f"<div id='scrub'><div id='track'><div id='played'></div></div>"
+            f"<div id='thumb'></div></div>"
+            f"<div class='row'>"
+            f"<button class='iconbtn' onclick='seek(-10)'>⏪</button>"
+            f"<button id='pp' class='iconbtn' onclick='togglePlay()'>▶</button>"
+            f"<button class='iconbtn' onclick='seek(10)'>⏩</button>"
+            f"<span id='cur' class='time'>0:00</span>"
+            f"<span class='spacer'></span>"
+            f"<span id='dur' class='time'>0:00</span>"
+            f"</div>"
+            f"<div id='ttlrow'>{title_safe}{src_badge}</div>"
+            f"</div>"
+            f"<script>"
+            f"const PLAYER_HOME='{HOST_URL}/recordings';"
+            f"{PLAYER_BASE_JS}"
+            f"const cur=document.getElementById('cur');"
+            f"const dur=document.getElementById('dur');"
+            f"function fmt(s){{"
+            f"  if(!isFinite(s)||s<0)s=0;"
+            f"  const m=Math.floor(s/60),ss=Math.floor(s%60);"
+            f"  const h=Math.floor(m/60);"
+            f"  return h>0?h+':'+String(m%60).padStart(2,'0')+':'+String(ss).padStart(2,'0')"
+            f"           :m+':'+String(ss).padStart(2,'0');"
+            f"}}"
+            f"function togglePlay(){{"
+            f"  if(v.paused||v.ended){{v.play().catch(()=>{{}});}}else{{v.pause();}}"
+            f"}}"
+            f"function seek(d){{"
+            f"  const D=isFinite(v.duration)?v.duration:Infinity;"
+            f"  v.currentTime=Math.max(0,Math.min(D-0.5,(v.currentTime||0)+d));"
+            f"  show();"
+            f"}}"
+            f"function refresh(){{"
+            f"  const D=isFinite(v.duration)?v.duration:0;"
+            f"  const T=v.currentTime||0;"
+            f"  cur.textContent=fmt(T);dur.textContent=fmt(D);"
+            f"  const pct=D>0?(T/D)*100:0;"
+            f"  played.style.width=pct+'%';thumb.style.left=pct+'%';"
+            f"}}"
+            f"v.addEventListener('timeupdate',refresh);"
+            f"v.addEventListener('loadedmetadata',refresh);"
+            f"function seekTo(ev){{"
+            f"  const r=scrub.getBoundingClientRect();"
+            f"  const x=(ev.touches?ev.touches[0]:ev).clientX-r.left;"
+            f"  const p=Math.max(0,Math.min(1,x/r.width));"
+            f"  const D=isFinite(v.duration)?v.duration:0;"
+            f"  if(D>0)v.currentTime=p*D;"
+            f"}}"
+            f"document.addEventListener('keydown',e=>{{"
+            f"  if(e.key==='Escape')closePlayer();"
+            f"  else if(e.key==='ArrowRight')seek(10);"
+            f"  else if(e.key==='ArrowLeft')seek(-10);"
+            f"  else if(e.key===' '){{e.preventDefault();togglePlay();show();}}"
+            f"}});"
+            f"v.addEventListener('click',()=>{{"
+            f"  if(chrome.classList.contains('hidden'))show();"
+            f"  else {{chrome.classList.add('hidden');topbar.classList.add('hidden');}}"
+            f"}});"
+            f"document.addEventListener('mousemove',show);"
+            f"const rawUrl='{hls_url}';"
+            f"if(window.Hls&&Hls.isSupported()){{"
+            f"  const hls=new Hls({{forceMseHlsOnAppleDevices:true}});"
+            f"  hls.loadSource(rawUrl);hls.attachMedia(v);"
+            f"}} else if(v.canPlayType('application/vnd.apple.mpegurl')){{"
+            f"  v.src=rawUrl;"
+            f"}} else {{"
+            f"  document.body.innerHTML='<p style=color:#fff;padding:20px>"
+            f"HLS wird von diesem Browser nicht unterstützt.</p>';"
+            f"}}"
+            f"</script></body></html>")
+
+
 @app.route("/recording/<uuid>")
 def play_recording(uuid):
     """Player page for a DVR recording — wraps tvheadend's dvrfile in
-    a styled <video> so iOS Safari doesn't force native fullscreen."""
+    a styled <video> so iOS Safari doesn't force native fullscreen.
+    Virtual mt_* UUIDs stream directly from ARD Mediathek via hls.js."""
+    if uuid.startswith("mt_"):
+        with _mediathek_rec_lock:
+            entry = _mediathek_rec.get(uuid)
+        if not entry:
+            abort(404, "unknown mediathek recording")
+        return _render_mediathek_player(uuid, entry)
     title = "Aufnahme"
     try:
         data = json.loads(urllib.request.urlopen(
@@ -3834,6 +4222,15 @@ def play_recording(uuid):
             f"}});"
             f"</script></body></html>")
     return html
+
+
+@app.route("/mediathek-rec/<uuid>/delete")
+def delete_mediathek_rec(uuid):
+    """Drop a virtual Mediathek recording from the local list."""
+    with _mediathek_rec_lock:
+        _mediathek_rec.pop(uuid, None)
+    save_mediathek_rec()
+    return Response("", status=302, headers={"Location": f"{HOST_URL}/recordings"})
 
 
 @app.route("/recording/<uuid>/delete")
@@ -4154,6 +4551,7 @@ if __name__ == "__main__":
     load_favorites()
     load_always_warm()
     load_live_ads()
+    load_mediathek_rec()
     adopt_surviving_ffmpegs()
     signal.signal(signal.SIGHUP, _sighup_reload)
     threading.Thread(target=_file_watcher_loop, daemon=True).start()
