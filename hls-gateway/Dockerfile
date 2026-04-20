@@ -34,7 +34,7 @@ RUN apt-get update && \
 
 COPY --from=build /out/comskip /usr/local/bin/comskip
 
-RUN pip install --no-cache-dir flask
+RUN pip install --no-cache-dir flask waitress
 
 COPY service.py /app/service.py
 WORKDIR /app

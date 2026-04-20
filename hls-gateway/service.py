@@ -581,6 +581,9 @@ def ensure_running(slug):
     recently-watched channels warm (idle ffmpeg still filling DVR
     buffer) so switching back gives instant timeshift. If we hit
     MAX_WARM_STREAMS, evict LRU warm channels first to free tuners."""
+    # Any viewer request wakes a dormant pin back up.
+    with _dormant_pins_lock:
+        _dormant_pins.discard(slug)
     victims = []
     with active_lock:
         info = channels.get(slug)
@@ -674,25 +677,40 @@ def set_always_warm(slug, on):
     return changed
 
 
+PIN_IDLE_HOURS = 6
+_dormant_pins = set()
+_dormant_pins_lock = threading.Lock()
+
+
 def always_warm_loop():
-    """Background watchdog: make sure each slug in ALWAYS_WARM has a
-    live ffmpeg. Re-spawns if the process died. Nudges last_seen so
-    LRU ordering keeps these channels ahead of ad-hoc viewers."""
+    """Background watchdog for pinned channels. Respawns a dead
+    ffmpeg for anything in ALWAYS_WARM unless the channel is dormant
+    (hit the idle timeout). Kills a warm ffmpeg after PIN_IDLE_HOURS
+    without a viewer — saves a tuner + CPU while still auto-restarting
+    on the next tap (ensure_running clears the dormant flag)."""
     time.sleep(15)
+    idle_cutoff = PIN_IDLE_HOURS * 3600
     while True:
         try:
             now = time.time()
             for slug in list(ALWAYS_WARM):
+                with _dormant_pins_lock:
+                    dormant = slug in _dormant_pins
                 with active_lock:
                     info = channels.get(slug)
                     alive = info and info["process"].poll() is None
-                if not alive:
+                if alive:
+                    idle = now - (info.get("last_seen") or now)
+                    if idle > idle_cutoff:
+                        print(f"[{slug}] pin idle {idle/3600:.1f}h — "
+                              f"stopping, will re-arm on next tap",
+                              flush=True)
+                        stop_channel(slug)
+                        with _dormant_pins_lock:
+                            _dormant_pins.add(slug)
+                elif not dormant:
                     print(f"[{slug}] always-warm respawn", flush=True)
                     ensure_running(slug)
-                else:
-                    with active_lock:
-                        if slug in channels:
-                            channels[slug]["last_seen"] = now
         except Exception as e:
             print(f"always-warm loop: {e}", flush=True)
         time.sleep(30)
@@ -3801,6 +3819,7 @@ def save_mediathek_rec():
 # so the show survives the availability window.
 RIP_THRESHOLD_SECONDS = 48 * 3600
 RIP_LOAD_CAP = 8.0
+RIP_MIN_FREE_GB = 5.0   # don't start a new rip if <5 GB free on /mnt/tv
 
 
 def _mediathek_rip_file(vuuid):
@@ -3872,6 +3891,18 @@ def _mediathek_rip_loop():
             except Exception:
                 load = 0
             if load <= RIP_LOAD_CAP:
+                # Disk-full guard — don't start a new multi-GB rip if
+                # the SSD is almost full. 5 GB floor so in-flight
+                # recordings + tvheadend DVR still have room.
+                try:
+                    free_gb = shutil.disk_usage(HLS_DIR).free / (1024 ** 3)
+                except Exception:
+                    free_gb = 0
+                if free_gb < RIP_MIN_FREE_GB:
+                    print(f"mt-rip: only {free_gb:.1f} GB free, "
+                          f"deferring", flush=True)
+                    time.sleep(3600)
+                    continue
                 with _mediathek_rec_lock:
                     todo = [
                         u for u, v in _mediathek_rec.items()
@@ -4081,6 +4112,13 @@ def _live_ads_analyze(slug):
     all_segs = sorted(ch_dir.glob("seg_*.ts"))
     if len(all_segs) < 120:      # at least ~2 min of segments
         return False
+    # Skip if no new segments since last run — the result would be
+    # identical and comskip on the same bytes produces the same ads.
+    latest_name = all_segs[-1].name
+    with _live_ads_lock:
+        prev = _live_ads.get(slug) or {}
+    if prev.get("latest_seg") == latest_name:
+        return False
     # Concatenating the full 1-2 h buffer blows past the 180 s ffmpeg
     # timeout (thousands of file-open syscalls even with -c copy). 30
     # min is plenty to spot a commercial pattern; we shift the PDT
@@ -4127,7 +4165,8 @@ def _live_ads_analyze(slug):
     ads_wall = [[round(first_pdt + a, 1), round(first_pdt + b, 1)]
                 for a, b in ads_sec]
     with _live_ads_lock:
-        _live_ads[slug] = {"generated": time.time(), "ads": ads_wall}
+        _live_ads[slug] = {"generated": time.time(), "ads": ads_wall,
+                            "latest_seg": latest_name}
     save_live_ads()
     print(f"[{slug}] adskip: {len(ads_wall)} blocks found", flush=True)
     return True
@@ -5030,7 +5069,7 @@ def _file_watcher_loop():
     except OSError:
         return
     while True:
-        time.sleep(2)
+        time.sleep(0.5)
         try:
             mt = os.path.getmtime(path)
         except OSError:
@@ -5073,4 +5112,15 @@ if __name__ == "__main__":
     threading.Thread(target=always_warm_loop, daemon=True).start()
     threading.Thread(target=_live_adskip_loop, daemon=True).start()
     threading.Thread(target=_mediathek_rip_loop, daemon=True).start()
-    app.run(host="0.0.0.0", port=8080, threaded=True)
+    # waitress in production; fall back to Flask's built-in only if
+    # waitress somehow isn't importable (e.g. an older image).
+    try:
+        from waitress import serve
+        # threads=16 handles our iOS polling load comfortably; ident
+        # removed so server banner doesn't leak the version.
+        print("serving via waitress on 0.0.0.0:8080", flush=True)
+        serve(app, host="0.0.0.0", port=8080, threads=16, ident=None)
+    except ImportError:
+        print("waitress not installed, falling back to flask dev server",
+              flush=True)
+        app.run(host="0.0.0.0", port=8080, threaded=True)

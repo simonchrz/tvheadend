@@ -6,6 +6,11 @@ services:
     user: "1000:1000"
     restart: unless-stopped
     network_mode: host
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "3"
     volumes:
       - /mnt/tv/hls:/data/hls
       - ./service.py:/app/service.py:ro
@@ -15,4 +20,5 @@ services:
       - HOST_URL=https://raspberrypi5lan:8443
       - IDLE_TIMEOUT=30
       - FAV_TAG_UUID=ed43d130b6d7f8e56b063db6de8d2b06
+      - ALWAYS_WARM=
       - TZ=Europe/Berlin
