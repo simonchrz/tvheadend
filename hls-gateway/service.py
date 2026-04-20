@@ -1049,7 +1049,8 @@ def append_epg_archive(events_by_slug):
                     continue
                 rec = {"slug": slug, "start": e["start"], "stop": e["stop"],
                        "title": e.get("title", ""),
-                       "subtitle": e.get("subtitle", "")}
+                       "subtitle": e.get("subtitle", ""),
+                       "event_id": e.get("event_id")}
                 _epg_archive[key] = rec
                 new_lines.append(json.dumps(rec, ensure_ascii=False))
     if new_lines:
@@ -1082,6 +1083,8 @@ def _fetch_channel_events(ch_uuid, now_ts, horizon_ts):
         out = []
         for e in data.get("entries", []):
             s = e.get("start", 0); stop = e.get("stop", 0)
+            # `now_ts` here is actually the window_start we were called
+            # with; filter events that ended before our window opens.
             if stop <= now_ts or s >= horizon_ts:
                 continue
             out.append({"start": s, "stop": stop,
@@ -1135,6 +1138,7 @@ def fetch_epg(window_before=900, window_after=6 * 3600, force=False):
                 "start": rec["start"], "stop": rec["stop"],
                 "title": rec.get("title", ""),
                 "subtitle": rec.get("subtitle", ""),
+                "event_id": rec.get("event_id"),
             })
     # sort each channel's events
     for slug in events_by_slug:
@@ -1240,8 +1244,15 @@ def epg_grid():
             if dvr_uuid:
                 cls += " scheduled"
                 data_attrs += f' data-uuid="{dvr_uuid}"'
-            if eid and not is_past:
+            # Use the tvheadend event_id when we have it. Past events
+            # that are archive-only (old entries without event_id) get
+            # a synthetic "arc_<slug>_<start>" key the lookup endpoint
+            # understands — so yesterday's Tatort still gets Mediathek
+            # even though tvheadend dropped it from its live EPG.
+            if eid:
                 data_attrs += f' data-eid="{eid}"'
+            elif is_past:
+                data_attrs += f' data-eid="arc_{slug}_{e["start"]}"'
             event_html.append(
                 f'<a class="{cls}" '
                 f'style="left:{left_px}px;width:{width_px}px" '
@@ -1385,22 +1396,36 @@ def epg_grid():
             f"        }}).catch(()=>{{}});"
             f"    }});"
             f"  }} else if(el.dataset.eid){{"
-            # Query the Mediathek lookup in parallel with opening the
-            # dialog. If it returns a match in time we include an extra
-            # button; otherwise the dialog stays the usual two options.
+            f"    const isPast=el.classList.contains('past');"
+            # Query the Mediathek lookup in parallel. Past events can
+            # only be retrieved via Mediathek, so we build a different
+            # button list for them (no DVR options).
             f"    const mtFetch=fetch('{HOST_URL}/api/mediathek-lookup/'"
             f"+el.dataset.eid).then(r=>r.json()).catch(()=>({{match:null}}));"
-            f"    const dialogBtns=[{{label:'Einzelne Episode',value:'ep',"
-            f"primary:true}},{{label:'Ganze Serie',value:'series'}},"
-            f"{{label:'Abbrechen',value:''}}];"
+            f"    const dialogBtns=isPast?[]:[{{label:'Einzelne Episode',"
+            f"value:'ep',primary:true}},{{label:'Ganze Serie',value:'series'}}];"
+            f"    dialogBtns.push({{label:'Abbrechen',value:''}});"
             f"    mtFetch.then(m=>{{"
             f"      if(m&&m.match){{"
             f"        const avail=new Date(m.match.available_to*1000);"
             f"        const dStr=String(avail.getDate()).padStart(2,'0')+'.'"
             f"+String(avail.getMonth()+1).padStart(2,'0');"
-            f"        dialogBtns.splice(1,0,{{"
-            f"          label:'Aus ARD Mediathek (bis '+dStr+')',"
-            f"          value:'mediathek'}});"
+            f"        const mtBtn={{label:'Aus ARD Mediathek (bis '+dStr+')',"
+            f"value:'mediathek'}};"
+            # For past events the Mediathek button becomes the primary
+            # and only action (before "Abbrechen"). For future events
+            # it slots between "Einzelne Episode" and "Ganze Serie".
+            f"        if(isPast){{mtBtn.primary=true;"
+            f"          dialogBtns.splice(dialogBtns.length-1,0,mtBtn);}}"
+            f"        else{{dialogBtns.splice(1,0,mtBtn);}}"
+            f"      }} else if(isPast){{"
+            # Past event with no Mediathek match: there's nothing we
+            # can do, show a brief note and bail.
+            f"        release();"
+            f"        lpDialog({{msg:'Sendung ist bereits ausgestrahlt "
+            f"und in der ARD Mediathek nicht (mehr) verfügbar.',"
+            f"          buttons:[{{label:'OK',value:'',primary:true}}]}});"
+            f"        return;"
             f"      }}"
             f"      lpDialog({{msg:'Aufnahme planen?<br><br>'+ttl,"
             f"        buttons:dialogBtns}}).then(v=>{{"
@@ -1448,9 +1473,21 @@ def epg_grid():
             f"document.addEventListener('mouseup',lpCancel);"
             f"document.addEventListener('mouseleave',lpCancel);"
             # Suppress the anchor click that follows a long-press.
+            # Also: for past events a plain tap means "I want to watch
+            # this show" — which on DVB means "nope, it's over". Route
+            # those taps through the long-press handler so the Mediathek
+            # option shows up instead of navigating to the live stream
+            # of a now-unrelated current programme.
             f"document.addEventListener('click',ev=>{{"
-            f"  if(lpFired&&ev.target.closest('.epg-event')){{"
+            f"  const evEl=ev.target.closest('.epg-event');"
+            f"  if(!evEl)return;"
+            f"  if(lpFired){{"
             f"    ev.preventDefault();ev.stopPropagation();lpFired=false;"
+            f"    return;"
+            f"  }}"
+            f"  if(evEl.classList.contains('past')&&evEl.dataset.eid){{"
+            f"    ev.preventDefault();ev.stopPropagation();"
+            f"    handleLP(evEl);"
             f"  }}"
             f"}},true);"
             f"document.addEventListener('contextmenu',ev=>{{"
@@ -2870,18 +2907,44 @@ ARD_SEARCH_CHANNELS = {
 def api_mediathek_lookup(event_id):
     """For an EPG event, try to find the same show in the ARD
     Mediathek and return its availability window + player URL."""
-    try:
-        ev = json.loads(urllib.request.urlopen(
-            f"{TVH_BASE}/api/epg/events/load?eventId={event_id}",
-            timeout=6).read())
-        entry = (ev.get("entries") or [{}])[0]
-        title = (entry.get("title") or "").strip()
-        ch_name = entry.get("channelName") or ""
-        start_ts = entry.get("start", 0)
-    except Exception as e:
-        return _cors(Response(json.dumps({"match": None,
-                                           "error": f"lookup: {e}"}),
-                               mimetype="application/json"))
+    title, ch_name, start_ts = "", "", 0
+    # Synthetic archive key: arc_<slug>_<start> for past events that
+    # were archived before we started persisting the tvheadend eid.
+    if event_id.startswith("arc_"):
+        try:
+            _, slug_, start_s = event_id.split("_", 2)
+            start_ts = int(start_s)
+            with _epg_archive_lock:
+                rec = _epg_archive.get((slug_, start_ts)) or {}
+            title = rec.get("title", "")
+            with cmap_lock:
+                ch_name = channel_map.get(slug_, {}).get("name", slug_)
+        except Exception:
+            pass
+    else:
+        try:
+            ev = json.loads(urllib.request.urlopen(
+                f"{TVH_BASE}/api/epg/events/load?eventId={event_id}",
+                timeout=6).read())
+            entry = (ev.get("entries") or [{}])[0]
+            title = (entry.get("title") or "").strip()
+            ch_name = entry.get("channelName") or ""
+            start_ts = entry.get("start", 0)
+        except Exception:
+            pass
+        if not title:
+            try:
+                with _epg_archive_lock:
+                    for (slug_, start), rec in _epg_archive.items():
+                        if str(rec.get("event_id")) == str(event_id):
+                            title = rec.get("title", "")
+                            start_ts = start
+                            with cmap_lock:
+                                ch_name = (channel_map.get(slug_, {})
+                                            .get("name", slug_))
+                            break
+            except Exception:
+                pass
     if not title:
         return _cors(Response(json.dumps({"match": None}),
                                mimetype="application/json"))
@@ -2963,19 +3026,46 @@ def api_mediathek_schedule(event_id):
     playback. Uses the lookup we already have, resolves the item's
     HLS master URL, and saves a local stub so /recordings + the
     recording player pick it up."""
-    # Re-run the lookup in-process
-    try:
-        ev = json.loads(urllib.request.urlopen(
-            f"{TVH_BASE}/api/epg/events/load?eventId={event_id}",
-            timeout=6).read())
-        entry = (ev.get("entries") or [{}])[0]
-        ev_title = (entry.get("title") or "").strip()
-        ch_name = entry.get("channelName") or ""
-        ev_start = entry.get("start", 0)
-        ev_stop = entry.get("stop", 0)
-    except Exception as e:
-        return Response(json.dumps({"ok": False, "error": f"lookup: {e}"}),
-                        status=500, mimetype="application/json")
+    ev_title, ch_name, ev_start, ev_stop = "", "", 0, 0
+    if event_id.startswith("arc_"):
+        try:
+            _, slug_, start_s = event_id.split("_", 2)
+            ev_start = int(start_s)
+            with _epg_archive_lock:
+                rec = _epg_archive.get((slug_, ev_start)) or {}
+            ev_title = rec.get("title", "")
+            ev_stop = rec.get("stop", 0)
+            with cmap_lock:
+                ch_name = channel_map.get(slug_, {}).get("name", slug_)
+        except Exception:
+            pass
+    else:
+        try:
+            ev = json.loads(urllib.request.urlopen(
+                f"{TVH_BASE}/api/epg/events/load?eventId={event_id}",
+                timeout=6).read())
+            entry = (ev.get("entries") or [{}])[0]
+            ev_title = (entry.get("title") or "").strip()
+            ch_name = entry.get("channelName") or ""
+            ev_start = entry.get("start", 0)
+            ev_stop = entry.get("stop", 0)
+        except Exception:
+            pass
+        if not ev_title:
+            with _epg_archive_lock:
+                for (slug_, start), rec in _epg_archive.items():
+                    if str(rec.get("event_id")) == str(event_id):
+                        ev_title = rec.get("title", "")
+                        ev_start = start
+                        ev_stop = rec.get("stop", 0)
+                        with cmap_lock:
+                            ch_name = (channel_map.get(slug_, {})
+                                        .get("name", slug_))
+                        break
+    if not ev_title:
+        return Response(json.dumps({"ok": False,
+                                     "error": "event not found"}),
+                        status=404, mimetype="application/json")
     # Re-run the lookup. Loopback HTTP is simpler than refactoring
     # the matcher into a shared helper for one more caller.
     try:
@@ -3294,7 +3384,7 @@ def recordings_page():
         avail_str = ""
         if avail_to:
             try:
-                avail_str = _dt.fromtimestamp(avail_to).strftime("%d.%m.")
+                avail_str = _dt.fromtimestamp(avail_to).strftime("%d.%m.%Y")
             except Exception:
                 pass
         expired = avail_to and now_ts > avail_to
@@ -3314,8 +3404,8 @@ def recordings_page():
             f'<td>{title_cell}</td>'
             f'<td>{when}</td>'
             f'<td>{dur_min} min</td>'
+            f'<td>—</td>'
             f'<td>{avail_cell}</td>'
-            f'<td></td>'
             f'<td><a href="{HOST_URL}/mediathek-rec/{vuuid}/delete" '
             f'onclick="return confirm(\'Aus Liste entfernen?\')">🗑</a></td></tr>')
 
