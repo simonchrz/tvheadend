@@ -3499,14 +3499,28 @@ def recordings_page():
             except Exception:
                 pass
         expired = avail_to and now_ts > avail_to
-        if expired:
+        # Ripped MP4 takes over once V3's background worker finishes —
+        # playable forever after that, no remote HLS dependency.
+        ripped_path = m.get("ripped_path", "")
+        has_local = (ripped_path and
+                     (HLS_DIR / f"_{vuuid}" / "file.mp4").exists())
+        if has_local:
+            mt_badge = '<span class="badge mediathek local">💾 Mediathek lokal</span>'
+        elif expired:
             mt_badge = '<span class="badge expired">✗ abgelaufen</span>'
         else:
             mt_badge = '<span class="badge mediathek">📡 Mediathek</span>'
-        avail_cell = (f'<small style="color:var(--muted)">bis '
-                      f'{avail_str}</small>' if avail_str and not expired
-                      else ('<small>abgelaufen</small>' if expired else ''))
-        if expired:
+        if has_local:
+            size_mb = (m.get("ripped_bytes", 0) or 0) / (1024 * 1024)
+            avail_cell = f'<small>lokal ({size_mb:.0f} MB)</small>'
+        elif avail_str and not expired:
+            avail_cell = (f'<small style="color:var(--muted)">bis '
+                          f'{avail_str}</small>')
+        elif expired:
+            avail_cell = '<small>abgelaufen</small>'
+        else:
+            avail_cell = ''
+        if expired and not has_local:
             title_cell = f'<span>{mt_title}</span>'
         else:
             title_cell = f'<a href="{HOST_URL}/recording/{vuuid}">{mt_title}</a>'
@@ -3534,6 +3548,7 @@ def recordings_page():
             f".badge.pending{{background:var(--stripe);color:var(--muted)}}"
             f".badge.series{{background:#8e44ad;color:#fff}}"
             f".badge.mediathek{{background:#2980b9;color:#fff}}"
+            f".badge.mediathek.local{{background:#27ae60}}"
             f".badge.expired{{background:#7f8c8d;color:#fff}}"
             f"tr.series-head td{{padding:0}}"
             f"tr.series-head summary{{cursor:pointer;padding:6px 8px;"
@@ -3778,6 +3793,101 @@ def save_mediathek_rec():
         MEDIATHEK_REC_FILE.write_text(json.dumps(snap))
     except Exception as e:
         print(f"save mediathek recordings: {e}", flush=True)
+
+
+# V3 — pre-expiry rip of virtual Mediathek recordings to a local MP4.
+# Mediathek HLS is already H.264/AAC, so ffmpeg -c copy just swaps the
+# container, fast and lossless. Rip when Mediathek expiry approaches
+# so the show survives the availability window.
+RIP_THRESHOLD_SECONDS = 48 * 3600
+RIP_LOAD_CAP = 8.0
+
+
+def _mediathek_rip_file(vuuid):
+    """Absolute path for the ripped MP4 of a virtual recording."""
+    return HLS_DIR / f"_{vuuid}" / "file.mp4"
+
+
+def _rip_mediathek(vuuid):
+    """Run ffmpeg to fetch the Mediathek HLS stream into a local MP4.
+    Copy-mux only (no re-encode). Records success / failure back in
+    the state dict."""
+    with _mediathek_rec_lock:
+        entry = dict(_mediathek_rec.get(vuuid) or {})
+    hls_url = entry.get("hls_url")
+    if not hls_url:
+        return False
+    out_dir = HLS_DIR / f"_{vuuid}"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_file = out_dir / "file.mp4"
+    tmp_file = out_dir / "file.mp4.part"
+    print(f"[mt-rip {vuuid[:10]}] starting → {out_file}", flush=True)
+    cmd = ["nice", "-n", "15", "ffmpeg", "-y",
+           "-hide_banner", "-loglevel", "warning",
+           "-i", hls_url,
+           "-c", "copy",
+           "-bsf:a", "aac_adtstoasc",
+           "-movflags", "+faststart",
+           "-f", "mp4", str(tmp_file)]
+    try:
+        r = subprocess.run(cmd, timeout=3600, check=False,
+                           stdout=subprocess.DEVNULL,
+                           stderr=subprocess.PIPE)
+    except Exception as e:
+        print(f"[mt-rip {vuuid[:10]}] exception: {e}", flush=True)
+        return False
+    if r.returncode != 0 or not tmp_file.exists() \
+       or tmp_file.stat().st_size < 1_000_000:
+        err = (r.stderr or b"")[-500:].decode("utf-8", "replace").strip()
+        print(f"[mt-rip {vuuid[:10]}] failed rc={r.returncode} {err}",
+              flush=True)
+        with _mediathek_rec_lock:
+            if vuuid in _mediathek_rec:
+                _mediathek_rec[vuuid]["rip_error"] = err[:200] or "unknown"
+                _mediathek_rec[vuuid]["rip_attempt_at"] = int(time.time())
+        save_mediathek_rec()
+        try: tmp_file.unlink()
+        except Exception: pass
+        return False
+    tmp_file.rename(out_file)
+    size = out_file.stat().st_size
+    with _mediathek_rec_lock:
+        if vuuid in _mediathek_rec:
+            _mediathek_rec[vuuid]["ripped_path"] = str(out_file)
+            _mediathek_rec[vuuid]["ripped_at"] = int(time.time())
+            _mediathek_rec[vuuid]["ripped_bytes"] = size
+            _mediathek_rec[vuuid].pop("rip_error", None)
+    save_mediathek_rec()
+    print(f"[mt-rip {vuuid[:10]}] done {size/1e6:.1f} MB", flush=True)
+    return True
+
+
+def _mediathek_rip_loop():
+    time.sleep(120)
+    while True:
+        try:
+            now = time.time()
+            try:
+                load = os.getloadavg()[0]
+            except Exception:
+                load = 0
+            if load <= RIP_LOAD_CAP:
+                with _mediathek_rec_lock:
+                    todo = [
+                        u for u, v in _mediathek_rec.items()
+                        if not v.get("ripped_path")
+                        and v.get("available_to")
+                        and (v["available_to"] - now) < RIP_THRESHOLD_SECONDS
+                        and (v["available_to"] - now) > 60  # still playable
+                        # don't retry a recent failure within 6 h
+                        and (now - v.get("rip_attempt_at", 0)) > 6 * 3600
+                    ]
+                if todo:
+                    # One at a time to keep disk I/O polite.
+                    _rip_mediathek(todo[0])
+        except Exception as e:
+            print(f"mt-rip loop: {e}", flush=True)
+        time.sleep(3600)
 
 
 def _zdf_search(title):
@@ -4255,11 +4365,19 @@ def recording_hls_progress(uuid):
 
 
 def _render_mediathek_player(uuid, entry):
-    """HTML for a virtual Mediathek recording — no remux, no comskip,
-    no progress polling. Plays the ARD HLS URL via hls.js so iOS
-    Safari doesn't punt to its native video overlay."""
+    """HTML for a virtual Mediathek recording. If we've already ripped
+    the show to a local MP4 (V3), play that directly via <video src>.
+    Otherwise stream the remote HLS via hls.js."""
     title_safe = entry["title"].replace("<", "&lt;")
     hls_url = entry["hls_url"].replace("'", "%27")
+    ripped_path = entry.get("ripped_path", "")
+    has_local = False
+    if ripped_path and uuid != "preview":
+        try:
+            has_local = Path(ripped_path).exists()
+        except Exception:
+            has_local = False
+    local_url = f"{HOST_URL}/mediathek-rec/{uuid}/file.mp4"
     avail_to = entry.get("available_to", 0)
     from datetime import datetime
     avail_str = ""
@@ -4268,8 +4386,10 @@ def _render_mediathek_player(uuid, entry):
             avail_str = datetime.fromtimestamp(avail_to).strftime("%d.%m.%Y")
         except Exception:
             pass
-    src_badge = (f"<span class='src-badge'>ARD Mediathek"
-                 f"{' · bis ' + avail_str if avail_str else ''}</span>")
+    badge_label = ("Mediathek · lokal" if has_local else "ARD Mediathek")
+    badge_extra = (" · bis " + avail_str if avail_str and not has_local
+                   else "")
+    src_badge = (f"<span class='src-badge'>{badge_label}{badge_extra}</span>")
     return (f"<!doctype html><html><head>"
             f"{PLAYER_HEAD_META}"
             f"<title>{title_safe}</title>"
@@ -4354,6 +4474,8 @@ def _render_mediathek_player(uuid, entry):
             f"}});"
             f"document.addEventListener('mousemove',show);"
             f"const rawUrl='{hls_url}';"
+            f"const localUrl='{local_url}';"
+            f"const hasLocal={'true' if has_local else 'false'};"
             f"const unmuteBtn=document.getElementById('unmute');"
             f"const disableCaptions=()=>{{"
             f"  for(const t of v.textTracks)t.mode='disabled';"
@@ -4372,7 +4494,12 @@ def _render_mediathek_player(uuid, entry):
             f"  v.play().then(()=>{{unmuteBtn.style.display='inline-flex';}})"
             f"    .catch(()=>{{unmuteBtn.style.display='inline-flex';}});"
             f"}}"
-            f"if(window.Hls&&Hls.isSupported()){{"
+            # If we already ripped the show to MP4, play the local file
+            # directly — iOS handles MP4 natively, no hls.js needed.
+            f"if(hasLocal){{"
+            f"  v.src=localUrl;"
+            f"  v.addEventListener('loadedmetadata',startPlayback,{{once:true}});"
+            f"}} else if(window.Hls&&Hls.isSupported()){{"
             f"  const hls=new Hls({{forceMseHlsOnAppleDevices:true,"
             f"    renderTextTracksNatively:false,subtitleDisplay:false}});"
             f"  hls.loadSource(rawUrl);hls.attachMedia(v);"
@@ -4593,12 +4720,27 @@ def play_recording(uuid):
     return html
 
 
+@app.route("/mediathek-rec/<uuid>/file.mp4")
+def mediathek_rec_file(uuid):
+    """Serve a ripped Mediathek recording. send_from_directory handles
+    HTTP range requests correctly, which iOS needs for MP4 seeking."""
+    out_dir = HLS_DIR / f"_{uuid}"
+    if not (out_dir / "file.mp4").exists():
+        abort(404)
+    return send_from_directory(out_dir, "file.mp4",
+                                  mimetype="video/mp4",
+                                  conditional=True)
+
+
 @app.route("/mediathek-rec/<uuid>/delete")
 def delete_mediathek_rec(uuid):
-    """Drop a virtual Mediathek recording from the local list."""
+    """Drop a virtual Mediathek recording from the local list. Also
+    cleans up the ripped MP4 if one exists — the whole point of
+    "delete" is freeing the disk."""
     with _mediathek_rec_lock:
         _mediathek_rec.pop(uuid, None)
     save_mediathek_rec()
+    shutil.rmtree(HLS_DIR / f"_{uuid}", ignore_errors=True)
     return Response("", status=302, headers={"Location": f"{HOST_URL}/recordings"})
 
 
@@ -4930,4 +5072,5 @@ if __name__ == "__main__":
     threading.Thread(target=_rec_prewarm_loop, daemon=True).start()
     threading.Thread(target=always_warm_loop, daemon=True).start()
     threading.Thread(target=_live_adskip_loop, daemon=True).start()
+    threading.Thread(target=_mediathek_rip_loop, daemon=True).start()
     app.run(host="0.0.0.0", port=8080, threaded=True)
