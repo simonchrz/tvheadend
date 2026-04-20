@@ -110,24 +110,36 @@ code {
     word-break: break-all;
 }
 ul.tools { line-height: 1.8; padding-left: 1.2em; }
-ul.channels { list-style: none; padding: 0; }
+ul.channels {
+    list-style: none; padding: 0; margin: 0;
+    display: grid; grid-template-columns: repeat(auto-fill, minmax(110px, 1fr));
+    gap: 10px;
+}
 ul.channels li {
-    display: flex; align-items: center; gap: .8em;
-    padding: .5em 0; border-bottom: 1px solid var(--border);
+    position: relative;
+    display: flex; align-items: center; justify-content: center;
+    padding: 12px 6px;
+    border: 1px solid var(--border); border-left-width: 4px;
+    border-radius: 8px;
+    background: var(--stripe);
 }
 ul.channels .logo {
-    width: 56px; height: 42px; flex: 0 0 56px;
+    width: 80px; height: 60px;
     display: flex; align-items: center; justify-content: center;
-    background: var(--logo-bg); border-radius: 6px; overflow: hidden;
+    background: #9a9a9a; border-radius: 6px; overflow: hidden;
+    transition: background .2s;
 }
-ul.channels .logo img { max-width: 100%; max-height: 100%; }
-ul.channels .meta { flex: 1; min-width: 0; }
-ul.channels .meta a { font-weight: 600; }
-ul.channels .meta code { display: inline-block; margin-top: 2px; }
-.usage { font-size: .8em; color: var(--muted); margin-left: .4em; }
-.usage.muted { opacity: .6; }
-.ch-actions { font-size: .85em; color: var(--muted); }
-.ch-actions a { margin-right: 2px; }
+ul.channels .logo img {
+    max-width: 100%; max-height: 100%;
+    filter: saturate(0.5) opacity(0.85);
+    transition: filter .2s;
+}
+ul.channels li:has(.pin-btn.active) .logo {
+    background: var(--logo-bg);
+}
+ul.channels li:has(.pin-btn.active) .logo img {
+    filter: none;
+}
 
 /* ===== EPG layout: wrap scrolls h+v, channels column sticky ===== */
 .epg-wrap {
@@ -897,22 +909,15 @@ def index():
             mux_dot = (f'<span class="mux-dot" '
                        f'style="background:{mux_colour[mu]}" '
                        f'title="{title}"></span>')
+        mux_style = (f' style="border-color:{mux_colour[mu]}"'
+                     if mu in mux_colour else "")
         rows.append(
-            f'<li data-slug="{s}">'
+            f'<li data-slug="{s}" title="{info["name"]}"{mux_style}>'
+            f'<button class="pin-btn" data-slug="{s}" title="Dauer-warm">📌</button>'
             f'<a class="logo" href="{watch_url}">{logo}</a>'
-            f'<div class="meta">'
-            f'{mux_dot}'
-            f'<a href="{watch_url}">{info["name"]}</a> '
-            f'<span class="warm-badge" data-slug="{s}"></span> '
-            f'<button class="pin-btn" data-slug="{s}" title="Dauer-warm">📌</button> '
-            f'{usage}<br>'
-            f'<span class="ch-actions">'
-            f'<a href="{watch_url}">⚡ Live</a> · '
-            f'<a href="{dvr_url}">📺 Timeshift</a>'
-            f'</span></div></li>')
+            f'<span class="buffer-bar" data-slug="{s}"></span>'
+            f'</li>')
     tools = [
-        ("Programm (EPG-Übersicht)",            f"{HOST_URL}/epg"),
-        ("Aufnahmen",                           f"{HOST_URL}/recordings"),
         ("Alle Kanäle als M3U (für IPTV-Apps)", f"{HOST_URL}/playlist.m3u"),
         ("Nutzungsstatistik / Top-Sender",      f"{HOST_URL}/stats"),
         ("Status (gerade aktive Streams)",      f"{HOST_URL}/status"),
@@ -923,21 +928,48 @@ def index():
         f'<code style="font-size:0.8em;color:#888">{url}</code></li>'
         for label, url in tools)
     extra_css = (
-        ".warm-badge{display:none;font-size:.72em;font-weight:600;"
-        "padding:1px 7px;border-radius:10px;vertical-align:2px;"
-        "margin-left:4px;color:#fff}"
-        ".warm-badge.running{display:inline-block;background:#27ae60;cursor:pointer}"
-        ".warm-badge.running.pinned{background:#2980b9;cursor:default}"
-        ".pin-btn{background:none;border:0;cursor:pointer;font-size:1em;"
-        "opacity:.3;padding:0 4px;vertical-align:1px;transition:opacity .15s}"
-        ".pin-btn:hover{opacity:.65}"
-        ".pin-btn.active{opacity:1;filter:drop-shadow(0 0 1px #2980b9)}"
-        ".pin-btn.dormant{opacity:.55;filter:none}"
-        ".tuner-badge{display:inline-block;font-size:.6em;font-weight:600;"
-        "padding:3px 10px;border-radius:12px;vertical-align:6px;"
-        "margin-left:10px;background:#34495e;color:#fff;letter-spacing:.03em}"
+        ".buffer-bar{position:absolute;left:4px;right:4px;bottom:3px;"
+        "height:4px;border-radius:3px;background:transparent;z-index:3}"
+        ".buffer-bar.running{background:#00000022;cursor:pointer;"
+        "box-shadow:inset 0 0 0 1px #0001}"
+        "@media (prefers-color-scheme:dark){"
+        ".buffer-bar.running{background:#ffffff33;box-shadow:none}"
+        "}"
+        ".buffer-bar::before{content:'';display:block;height:100%;"
+        "width:var(--pct,0);background:#27ae60;border-radius:3px;"
+        "transition:width .4s}"
+        # Invisible tap-extender: bottom band of the tile is clickable.
+        ".buffer-bar.running::after{content:'';position:absolute;"
+        "left:-4px;right:-4px;top:-14px;bottom:-6px}"
+        ".pin-btn{position:absolute;top:-9px;right:-8px;"
+        "background:none;border:0;cursor:pointer;font-size:1.1em;"
+        "opacity:.2;padding:3px;line-height:1;transform:rotate(35deg);"
+        "transform-origin:center;transition:opacity .15s,transform .15s;z-index:2;"
+        "filter:drop-shadow(0 1px 2px #0008)}"
+        ".pin-btn:hover{opacity:.75;transform:rotate(45deg) scale(1.1)}"
+        ".pin-btn.active{opacity:1;transform:rotate(45deg);"
+        "filter:drop-shadow(0 2px 3px #0009)}"
+        "ul.channels li:has(.pin-btn.active){"
+        "box-shadow:0 3px 10px #0003;transform:translateY(-1px)}"
+        ".pin-btn.dormant{opacity:.6}"
+        ".tuner-badge{display:inline-block;font-size:.72em;font-weight:600;"
+        "padding:3px 10px;border-radius:12px;"
+        "background:#34495e;color:#fff;letter-spacing:.03em}"
+        ".tuner-badge:empty{display:none}"
         ".tuner-badge.tight{background:#e67e22}"
         ".tuner-badge.full{background:#c0392b}"
+        ".host-badges{display:flex;flex-wrap:wrap;gap:6px;margin:-4px 0 12px}"
+        ".quick-links{display:flex;gap:10px;margin:16px 0 24px}"
+        ".quick-links a{flex:1;background:var(--stripe);border:1px solid var(--border);"
+        "border-radius:10px;padding:14px 16px;display:flex;flex-direction:column;"
+        "align-items:flex-start;gap:2px;text-decoration:none;color:var(--fg);"
+        "font-weight:600;font-size:1em;transition:background .15s}"
+        ".quick-links a:hover{background:var(--code-bg);text-decoration:none}"
+        ".quick-links span{font-size:1.6em;line-height:1}"
+        ".quick-links small{font-weight:400;color:var(--muted);font-size:.82em}"
+        "h2.tools-head{margin-top:2em;font-size:1em;color:var(--muted);"
+        "font-weight:500;border-top:1px solid var(--border);padding-top:1em}"
+        "ul.tools li{font-size:.9em;opacity:.75}"
         ".mux-dot{display:inline-block;width:8px;height:8px;"
         "border-radius:50%;margin-right:6px;vertical-align:1px;"
         "cursor:help}"
@@ -958,11 +990,13 @@ def index():
         "    const r=await fetch('/api/warm-status');"
         "    const d=await r.json();"
         "    const W=d.window_seconds||7200;"
-        "    for(const el of document.querySelectorAll('.warm-badge')){"
-        "      const s=el.dataset.slug;"
+        "    for(const bar of document.querySelectorAll('.buffer-bar')){"
+        "      const s=bar.dataset.slug;"
         "      const e=d.channels[s];"
-        "      if(!e||!e.running){el.className='warm-badge';el.textContent='';}"
-        "      else {"
+        "      if(!e||!e.running){"
+        "        bar.style.setProperty('--pct','0');bar.title='';"
+        "        bar.classList.remove('running','pinned');"
+        "      } else {"
         "        const bs=e.buffer_seconds;"
         "        const full=bs>=W-30;"
         "        let time;"
@@ -970,10 +1004,11 @@ def index():
         "        else if(bs>=3600)time=Math.floor(bs/3600)+'h'+Math.floor((bs%3600)/60)+'m';"
         "        else if(bs>=60)time=Math.floor(bs/60)+'m';"
         "        else time=bs+'s';"
-        "        el.textContent='● '+time;"
-        "        el.className='warm-badge running'+(e.always_warm?' pinned':'');"
-        "        el.title=e.always_warm?'Dauer-warm · Puffer '+time+(full?' (voll)':''):"
+        "        bar.classList.add('running');"
+        "        bar.classList.toggle('pinned',!!e.always_warm);"
+        "        bar.title=e.always_warm?'Dauer-warm · Puffer '+time+(full?' (voll)':''):"
         "          'Warm-Tuner · Puffer '+time+(full?' (voll)':'')+' · Klick: Tuner freigeben';"
+        "        bar.style.setProperty('--pct',Math.min(100,bs*100/W)+'%');"
         "      }"
         "    }"
         "    const budget=(d.pin_budget||0);"
@@ -996,12 +1031,15 @@ def index():
         "    }"
         "    const tb=document.getElementById('tuner-badge');"
         "    if(tb){"
-        "      const u=d.tuners_used,t=d.tuners_total||4;"
+        "      const u=d.tuners_used,t=d.tuners_total||4,epg=d.tuners_epggrab||0;"
         "      if(u===null||u===undefined){tb.textContent='';tb.className='tuner-badge';}"
         "      else{"
-        "        tb.textContent='📡 '+u+'/'+t+' Tuner';"
+        "        const epgSuffix=epg>0?' ('+epg+'× EPG)':'';"
+        "        tb.textContent='📡 '+u+'/'+t+' Tuner'+epgSuffix;"
         "        tb.className='tuner-badge'+(u>=t?' full':u>=t-1?' tight':'');"
-        "        tb.title='DVB-C Tuner in Nutzung (FRITZ!Box SAT>IP). Kanäle auf demselben Mux teilen sich einen Tuner.';"
+        "        tb.title='DVB-C Tuner in Nutzung (FRITZ!Box SAT>IP). '+"
+        "          (epg>0?epg+' davon für EPG-OTA-Grab (läuft nach tvheadend-Restart auto durch). ':'')+"
+        "          'Kanäle auf demselben Mux teilen sich einen Tuner.';"
         "      }"
         "    }"
         "    const fb=document.getElementById('ffmpeg-badge');"
@@ -1013,6 +1051,38 @@ def index():
         "        fb.className='tuner-badge'+(n>=8?' full':n>=5?' tight':'');"
         "        fb.title='Laufende ffmpeg-Prozesse: Live-Streams, Recording-Remuxe, Thumbnails, Ad-Detection.';"
         "      }"
+        "    }"
+        "    const lb=document.getElementById('load-badge');"
+        "    if(lb){"
+        "      if(d.load1===null||d.load1===undefined){lb.textContent='';lb.className='tuner-badge';}"
+        "      else{"
+        "        const c=d.cpu_count||4;"
+        "        const ratio=d.load1/c;"
+        "        lb.textContent='💻 '+d.load1.toFixed(2)+'/'+c;"
+        "        lb.className='tuner-badge'+(ratio>=1.5?' full':ratio>=1.0?' tight':'');"
+        "        lb.title='Load-Average über 1 min geteilt durch Kerne.';"
+        "      }"
+        "    }"
+        "    const mb=document.getElementById('mem-badge');"
+        "    if(mb&&d.mem_total_mb){"
+        "      const used=d.mem_total_mb-d.mem_avail_mb;"
+        "      const pct=used/d.mem_total_mb;"
+        "      mb.textContent='🧠 '+(used/1024).toFixed(1)+'/'+(d.mem_total_mb/1024).toFixed(1)+'G';"
+        "      mb.className='tuner-badge'+(pct>=0.9?' full':pct>=0.75?' tight':'');"
+        "      mb.title='RAM genutzt / gesamt (Pi 5 mit '+(d.mem_total_mb/1024).toFixed(0)+' GB).';"
+        "    }"
+        "    const tb2=document.getElementById('temp-badge');"
+        "    if(tb2&&d.cpu_temp_c){"
+        "      tb2.textContent='🌡 '+d.cpu_temp_c+'°';"
+        "      tb2.className='tuner-badge'+(d.cpu_temp_c>=75?' full':d.cpu_temp_c>=65?' tight':'');"
+        "      tb2.title='CPU-Temperatur. Throttling ab ~80 °C.';"
+        "    }"
+        "    const db=document.getElementById('disk-badge');"
+        "    if(db&&d.disk_free_gb!=null){"
+        "      const pct=1-d.disk_free_gb/d.disk_total_gb;"
+        "      db.textContent='💾 '+d.disk_free_gb+'G frei';"
+        "      db.className='tuner-badge'+(d.disk_free_gb<10?' full':d.disk_free_gb<25?' tight':'');"
+        "      db.title='/mnt/tv freier Platz auf der SSD ('+d.disk_total_gb+' GB gesamt).';"
         "    }"
         "  }catch(e){}"
         "}"
@@ -1038,9 +1108,9 @@ def index():
         "document.addEventListener('click',e=>{"
         "  const b=e.target.closest('.pin-btn');"
         "  if(b){e.preventDefault();togglePin(b);return;}"
-        "  const w=e.target.closest('.warm-badge.running');"
+        "  const w=e.target.closest('.buffer-bar.running');"
         "  if(w&&!w.classList.contains('pinned')){"
-        "    e.preventDefault();"
+        "    e.preventDefault();e.stopPropagation();"
         "    const slug=w.dataset.slug;"
         "    if(!slug)return;"
         "    fetch('/stop/'+slug).then(()=>refreshWarm()).catch(()=>{});"
@@ -1099,11 +1169,23 @@ def index():
             f"content='width=device-width,initial-scale=1'>"
             f"<meta name='color-scheme' content='light dark'>"
             f"<style>{BASE_CSS}{extra_css}</style></head>"
-            f"<body><h1>HLS Gateway "
-            f"<span id='tuner-badge' class='tuner-badge'></span> "
-            f"<span id='ffmpeg-badge' class='tuner-badge'></span></h1>"
-            f"<h2>Tools</h2><ul class='tools'>{tool_rows}</ul>"
-            f"<h2>Kanäle</h2><ul class='channels'>{''.join(rows)}</ul>"
+            f"<body><h1>HLS Gateway</h1>"
+            f"<div class='host-badges'>"
+            f"<span id='tuner-badge' class='tuner-badge'></span>"
+            f"<span id='ffmpeg-badge' class='tuner-badge'></span>"
+            f"<span id='load-badge' class='tuner-badge'></span>"
+            f"<span id='mem-badge' class='tuner-badge'></span>"
+            f"<span id='temp-badge' class='tuner-badge'></span>"
+            f"<span id='disk-badge' class='tuner-badge'></span>"
+            f"</div>"
+            f"<div class='quick-links'>"
+            f"<a href='{HOST_URL}/epg'><span>📅</span>Programm<small>EPG-Guide + Chapter-Ticks</small></a>"
+            f"<a href='{HOST_URL}/recordings'><span>📼</span>Aufnahmen<small>DVR + Mediathek-Recordings</small></a>"
+            f"</div>"
+            f"<h2>Kanäle</h2>"
+            f"<ul class='channels'>{''.join(rows)}</ul>"
+            f"<h2 class='tools-head'>Tools</h2>"
+            f"<ul class='tools'>{tool_rows}</ul>"
             f"<script>{js}</script>"
             f"</body></html>")
     return body
@@ -1494,6 +1576,11 @@ def epg_grid():
             f"html,body{{height:100%;overflow:hidden}}"
             f"body{{max-width:none;margin:0;display:flex;flex-direction:column}}"
             f".epg-wrap{{flex:1 1 auto;min-height:0;max-height:none;margin-bottom:0}}"
+            f"@media (pointer:coarse){{"
+            f"html,body{{height:auto;overflow:visible}}"
+            f"body{{display:block}}"
+            f".epg-wrap{{flex:none;max-height:none}}"
+            f"}}"
             f".auto-refresh{{display:inline-flex;align-items:center;gap:.35em;"
             f"font-size:.85em;color:var(--muted);cursor:pointer;user-select:none}}"
             f".auto-refresh input{{accent-color:#1565c0;cursor:pointer}}"
@@ -3827,7 +3914,7 @@ def recordings_page():
                    f'<small>({len(eps)} Einträge)</small>{kill_btn}</summary>'
                    f'<table class="series-sub"><tbody>'
                    + "".join(_render_row(e) for e in sorted(
-                       eps, key=lambda x: x.get("start", 0), reverse=True))
+                       eps, key=lambda x: x.get("start", 0)))
                    + '</tbody></table></details></td></tr>')
         rows.append(summary)
 
@@ -5656,14 +5743,14 @@ _tuner_cache = {"used": None, "total": None, "expires": 0}
 
 
 def tuner_status():
-    """Return (used, total) for FRITZ!Box SAT>IP tuners. tvheadend's
-    /api/status/inputs lists every configured tuner; `subs > 0` marks
-    the ones currently tuned to a mux (channels on the same mux share
-    one tuner). Cached 5 s."""
+    """Return (used, total, epggrab) for FRITZ!Box SAT>IP tuners.
+    `used` counts tuners tuned to any mux, `epggrab` is the subset
+    that tvheadend is currently using for EIT collection. Cached 5 s."""
     now = time.time()
     if now < _tuner_cache["expires"]:
-        return _tuner_cache["used"], _tuner_cache["total"]
-    used, total = None, TUNER_TOTAL
+        return (_tuner_cache["used"], _tuner_cache["total"],
+                _tuner_cache.get("epggrab", 0))
+    used, total, epg = None, TUNER_TOTAL, 0
     try:
         data = json.loads(urllib.request.urlopen(
             f"{TVH_BASE}/api/status/inputs", timeout=2).read())
@@ -5672,10 +5759,18 @@ def tuner_status():
         used = sum(1 for e in entries if e.get("subs", 0) > 0)
     except Exception:
         pass
+    try:
+        subs = json.loads(urllib.request.urlopen(
+            f"{TVH_BASE}/api/status/subscriptions", timeout=2).read())
+        epg = sum(1 for e in subs.get("entries", [])
+                  if e.get("title", "").lower() == "epggrab")
+    except Exception:
+        pass
     _tuner_cache["used"] = used
     _tuner_cache["total"] = total
+    _tuner_cache["epggrab"] = epg
     _tuner_cache["expires"] = now + 5
-    return used, total
+    return used, total, epg
 
 
 _pinned_mux_cache = {"muxes": set(), "running": 0, "expires": 0}
@@ -5723,7 +5818,7 @@ def compute_pin_limit():
     ad-hoc viewing minus active DVR jobs. Bonus = pins that share muxes
     with other pins (they cost a fractional tuner each). Falls back to
     the static PIN_HARD_MAX if tvheadend status is unavailable."""
-    used, total = tuner_status()
+    used, total, _ = tuner_status()
     total = total or TUNER_TOTAL
     dvr = active_dvr_count()
     base = max(0, total - 1 - dvr)
@@ -5806,7 +5901,7 @@ def api_warm_status():
     pins_used = len(ALWAYS_WARM)
     pin_limit = compute_pin_limit()
     pin_budget = max(0, pin_limit - pins_used)
-    tuners_used, tuners_total = tuner_status()
+    tuners_used, tuners_total, tuners_epggrab = tuner_status()
     ffmpeg_count = 0
     try:
         for p in Path("/proc").iterdir():
@@ -5824,6 +5919,38 @@ def api_warm_status():
             ffmpeg_count += 1
     except Exception:
         pass
+    # Host metrics — /proc/loadavg, /proc/meminfo and the thermal zone
+    # reflect the Pi 5 host even inside the container.
+    load1 = None
+    try:
+        load1 = float(Path("/proc/loadavg").read_text().split()[0])
+    except Exception:
+        pass
+    cpu_count = os.cpu_count() or 4
+    mem_total_mb = mem_avail_mb = None
+    try:
+        meminfo = Path("/proc/meminfo").read_text()
+        for line in meminfo.splitlines():
+            if line.startswith("MemTotal:"):
+                mem_total_mb = int(line.split()[1]) // 1024
+            elif line.startswith("MemAvailable:"):
+                mem_avail_mb = int(line.split()[1]) // 1024
+    except Exception:
+        pass
+    cpu_temp_c = None
+    try:
+        cpu_temp_c = round(int(Path(
+            "/sys/class/thermal/thermal_zone0/temp").read_text()) / 1000, 1)
+    except Exception:
+        pass
+    disk_free_gb = disk_total_gb = None
+    try:
+        import shutil as _sh
+        du = _sh.disk_usage(HLS_DIR)
+        disk_free_gb = round(du.free / (1024**3), 1)
+        disk_total_gb = round(du.total / (1024**3), 1)
+    except Exception:
+        pass
     return _cors(Response(json.dumps({
         "channels": out,
         "max_warm": MAX_WARM_STREAMS,
@@ -5834,7 +5961,15 @@ def api_warm_status():
         "pin_budget": pin_budget,
         "tuners_used": tuners_used,
         "tuners_total": tuners_total,
+        "tuners_epggrab": tuners_epggrab,
         "ffmpeg_count": ffmpeg_count,
+        "load1": load1,
+        "cpu_count": cpu_count,
+        "mem_total_mb": mem_total_mb,
+        "mem_avail_mb": mem_avail_mb,
+        "cpu_temp_c": cpu_temp_c,
+        "disk_free_gb": disk_free_gb,
+        "disk_total_gb": disk_total_gb,
     }), mimetype="application/json"))
 
 
