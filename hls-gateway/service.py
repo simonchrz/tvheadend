@@ -820,6 +820,7 @@ def index():
         "opacity:.3;padding:0 4px;vertical-align:1px;transition:opacity .15s}"
         ".pin-btn:hover{opacity:.65}"
         ".pin-btn.active{opacity:1;filter:drop-shadow(0 0 1px #2980b9)}"
+        ".pin-btn.dormant{opacity:.55;filter:none}"
         ".tuner-badge{display:inline-block;font-size:.6em;font-weight:600;"
         "padding:3px 10px;border-radius:12px;vertical-align:6px;"
         "margin-left:10px;background:#34495e;color:#fff;letter-spacing:.03em}"
@@ -858,13 +859,17 @@ def index():
         "      const s=b.dataset.slug;"
         "      const e=d.channels[s];"
         "      const pinned=e&&e.always_warm;"
+        "      const dormant=pinned&&e&&e.dormant;"
         "      b.classList.toggle('active',!!pinned);"
+        "      b.classList.toggle('dormant',!!dormant);"
+        "      b.textContent=dormant?'💤':'📌';"
         "      if(!pinned&&budget<=0){"
         "        b.style.display='none';"
         "      } else {"
         "        b.style.display='';"
         "      }"
-        "      b.title=pinned?'Dauer-warm aktiv — klick zum Deaktivieren':"
+        "      b.title=dormant?'Pin ruht (6h ohne Zugriff) — Tap weckt':"
+        "              pinned?'Dauer-warm aktiv — klick zum Deaktivieren':"
         "                     'Kanal dauer-warm halten (max '+(d.pin_limit||0)+' bei '+(d.pin_dvr_reserve||0)+' DVR-Jobs)';"
         "    }"
         "    const tb=document.getElementById('tuner-badge');"
@@ -3000,6 +3005,101 @@ ARD_SEARCH_CHANNELS = {
 ZDF_SEARCH_CHANNELS = {"zdf-hd"}
 
 
+def _mediathek_match(title, ch_slug, start_ts):
+    """Core matcher used by both the lookup endpoint and the autorec
+    follow-up loop. Returns the best match dict (same shape as the
+    endpoint) or None. Title + channel slug + broadcast timestamp in,
+    match-with-HLS-capable-id out."""
+    if not title or not start_ts:
+        return None
+    if ch_slug in ARD_SEARCH_CHANNELS:
+        source = "ard"
+    elif ch_slug in ZDF_SEARCH_CHANNELS:
+        source = "zdf"
+    else:
+        return None
+    from datetime import datetime
+    MAX_DELTA = 48 * 3600
+    title_l = title.lower()
+    best = None
+    if source == "ard":
+        qs = urllib.parse.urlencode({
+            "searchString": title,
+            "searchResultsPageSize": "24",
+        })
+        search_url = (f"https://api.ardmediathek.de/page-gateway/pages/ard/"
+                      f"search?{qs}")
+        data = None
+        for attempt in range(2):
+            try:
+                data = json.loads(urllib.request.urlopen(
+                    search_url, timeout=15).read())
+                break
+            except Exception as e:
+                print(f"mediathek search (try {attempt+1}): {e}", flush=True)
+        if data is None:
+            return None
+        for v in data.get("vodResults", []):
+            svc = (v.get("publicationService") or {}).get("name", "")
+            vt = (v.get("longTitle") or v.get("mediumTitle") or "").strip()
+            vt_l = vt.lower()
+            if title_l not in vt_l and vt_l not in title_l:
+                continue
+            bt = 0
+            if v.get("broadcastedOn"):
+                try:
+                    bt = int(datetime.fromisoformat(
+                        v["broadcastedOn"].replace("Z", "+00:00")).timestamp())
+                except Exception:
+                    pass
+            if not bt or abs(bt - start_ts) > MAX_DELTA:
+                continue
+            delta = abs(bt - start_ts)
+            if best is None or delta < best["_delta"]:
+                avail_to = 0
+                if v.get("availableTo"):
+                    try:
+                        avail_to = int(datetime.fromisoformat(
+                            v["availableTo"].replace("Z", "+00:00")).timestamp())
+                    except Exception:
+                        pass
+                best = {
+                    "_delta": delta, "source": "ard",
+                    "title": vt, "channel": svc,
+                    "broadcast": bt, "available_to": avail_to,
+                    "duration": v.get("duration", 0),
+                    "id": v.get("id"),
+                    "player_url": f"https://www.ardmediathek.de/video/{v.get('id')}",
+                }
+    else:  # zdf
+        for r in _zdf_search(title):
+            rt = (r.get("title") or "").lower()
+            if title_l not in rt and rt not in title_l:
+                continue
+            if not r["broadcast_ts"]:
+                continue
+            delta = abs(r["broadcast_ts"] - start_ts)
+            if delta > MAX_DELTA:
+                continue
+            if best is None or delta < best["_delta"]:
+                best = {
+                    "_delta": delta, "source": "zdf",
+                    "title": r["title"], "channel": "ZDF",
+                    "broadcast": r["broadcast_ts"], "available_to": 0,
+                    "duration": r["duration"],
+                    "id": r["id"],
+                    "player_url": f"https://www.zdf.de/play/{r['id']}",
+                }
+    if not best:
+        return None
+    if best["source"] == "zdf" and not best["available_to"]:
+        _, vis_to = _zdf_resolve_hls(best["id"])
+        if vis_to:
+            best["available_to"] = vis_to
+    best.pop("_delta", None)
+    return best
+
+
 @app.route("/api/mediathek-lookup/<event_id>")
 def api_mediathek_lookup(event_id):
     """For an EPG event, try to find the same show in the ARD
@@ -3045,107 +3145,16 @@ def api_mediathek_lookup(event_id):
     if not title:
         return _cors(Response(json.dumps({"match": None}),
                                mimetype="application/json"))
-    # Pick the Mediathek API based on channel. ARD covers Das Erste +
-    # regional + arte/KiKA/3sat; ZDF covers ZDF. Branch early so we
-    # don't ping ARD for a ZDF show and vice versa.
     slug = slugify(ch_name)
-    if slug in ARD_SEARCH_CHANNELS:
-        source = "ard"
-    elif slug in ZDF_SEARCH_CHANNELS:
-        source = "zdf"
-    else:
+    if slug not in ARD_SEARCH_CHANNELS and slug not in ZDF_SEARCH_CHANNELS:
         return _cors(Response(json.dumps({
             "match": None, "reason": "channel not covered"}),
             mimetype="application/json"))
-    from datetime import datetime
-    MAX_DELTA = 48 * 3600
-    title_l = title.lower()
-    best = None
-    if source == "ard":
-        qs = urllib.parse.urlencode({
-            "searchString": title,
-            "searchResultsPageSize": "24",
-        })
-        search_url = (f"https://api.ardmediathek.de/page-gateway/pages/ard/"
-                      f"search?{qs}")
-        data = None
-        for attempt in range(2):
-            try:
-                data = json.loads(urllib.request.urlopen(
-                    search_url, timeout=15).read())
-                break
-            except Exception as e:
-                print(f"mediathek search (try {attempt+1}): {e}",
-                      flush=True)
-        if data is None:
-            return _cors(Response(json.dumps({
-                "match": None, "error": "mediathek search timeout"}),
-                mimetype="application/json"))
-        for v in data.get("vodResults", []):
-            svc = (v.get("publicationService") or {}).get("name", "")
-            vt = (v.get("longTitle") or v.get("mediumTitle") or "").strip()
-            vt_l = vt.lower()
-            if title_l not in vt_l and vt_l not in title_l:
-                continue
-            bt = 0
-            if v.get("broadcastedOn"):
-                try:
-                    bt = int(datetime.fromisoformat(
-                        v["broadcastedOn"].replace("Z", "+00:00")).timestamp())
-                except Exception:
-                    pass
-            if not bt or not start_ts or abs(bt - start_ts) > MAX_DELTA:
-                continue
-            delta = abs(bt - start_ts)
-            if best is None or delta < best["_delta"]:
-                avail_to = 0
-                if v.get("availableTo"):
-                    try:
-                        avail_to = int(datetime.fromisoformat(
-                            v["availableTo"].replace("Z", "+00:00")).timestamp())
-                    except Exception:
-                        pass
-                best = {
-                    "_delta": delta, "source": "ard",
-                    "title": vt, "channel": svc,
-                    "broadcast": bt, "available_to": avail_to,
-                    "duration": v.get("duration", 0),
-                    "id": v.get("id"),
-                    "player_url": f"https://www.ardmediathek.de/video/{v.get('id')}",
-                }
-    else:  # zdf
-        for r in _zdf_search(title):
-            rt = (r.get("title") or "").lower()
-            if title_l not in rt and rt not in title_l:
-                continue
-            if not r["broadcast_ts"] or not start_ts:
-                continue
-            delta = abs(r["broadcast_ts"] - start_ts)
-            if delta > MAX_DELTA:
-                continue
-            if best is None or delta < best["_delta"]:
-                # ZDF search doesn't return availableTo on its own — we
-                # fill it in from the item detail during HLS resolve.
-                best = {
-                    "_delta": delta, "source": "zdf",
-                    "title": r["title"], "channel": "ZDF",
-                    "broadcast": r["broadcast_ts"], "available_to": 0,
-                    "duration": r["duration"],
-                    "id": r["id"],
-                    "player_url": f"https://www.zdf.de/play/{r['id']}",
-                }
-    if not best:
-        return _cors(Response(json.dumps({"match": None}),
-                               mimetype="application/json"))
-    # For ZDF, backfill available_to via the item detail (cheap — one
-    # extra call, only when we actually have a match).
-    if best["source"] == "zdf" and not best["available_to"]:
-        _, vis_to = _zdf_resolve_hls(best["id"])
-        if vis_to:
-            best["available_to"] = vis_to
-    best.pop("_delta", None)
-    return _cors(Response(json.dumps({"match": best}),
+    match = _mediathek_match(title, slug, start_ts)
+    return _cors(Response(json.dumps({"match": match}),
                            mimetype="application/json"))
+
+
 
 
 @app.route("/api/mediathek-schedule/<event_id>", methods=["POST"])
@@ -3841,20 +3850,39 @@ def _rip_mediathek(vuuid):
     out_file = out_dir / "file.mp4"
     tmp_file = out_dir / "file.mp4.part"
     print(f"[mt-rip {vuuid[:10]}] starting → {out_file}", flush=True)
-    cmd = ["nice", "-n", "15", "ffmpeg", "-y",
-           "-hide_banner", "-loglevel", "warning",
-           "-i", hls_url,
-           "-c", "copy",
-           "-bsf:a", "aac_adtstoasc",
-           "-movflags", "+faststart",
-           "-f", "mp4", str(tmp_file)]
-    try:
-        r = subprocess.run(cmd, timeout=3600, check=False,
-                           stdout=subprocess.DEVNULL,
-                           stderr=subprocess.PIPE)
-    except Exception as e:
-        print(f"[mt-rip {vuuid[:10]}] exception: {e}", flush=True)
-        return False
+    base = ["nice", "-n", "15", "ffmpeg", "-y",
+             "-hide_banner", "-loglevel", "warning",
+             "-i", hls_url,
+             "-bsf:a", "aac_adtstoasc",
+             "-movflags", "+faststart",
+             "-f", "mp4", str(tmp_file)]
+    # First pass: pure -c copy (fastest, lossless). If that rejects the
+    # stream (sometimes MP4 muxer complains about ADTS headers or
+    # private-stream metadata), retry with audio re-encoded to AAC.
+    attempts = [
+        ["-c", "copy"],
+        ["-c:v", "copy", "-c:a", "aac", "-b:a", "192k"],
+    ]
+    r = None
+    for opts in attempts:
+        cmd = base[:8] + opts + base[8:]
+        # Drop any leftover .part from previous attempt
+        try: tmp_file.unlink()
+        except Exception: pass
+        try:
+            r = subprocess.run(cmd, timeout=3600, check=False,
+                               stdout=subprocess.DEVNULL,
+                               stderr=subprocess.PIPE)
+        except Exception as e:
+            print(f"[mt-rip {vuuid[:10]}] exception: {e}", flush=True)
+            return False
+        if (r.returncode == 0 and tmp_file.exists()
+            and tmp_file.stat().st_size >= 1_000_000):
+            break
+        err_short = (r.stderr or b"")[-200:].decode("utf-8", "replace").strip()
+        print(f"[mt-rip {vuuid[:10]}] copy attempt failed "
+              f"(rc={r.returncode}), retrying with audio re-encode: "
+              f"{err_short}", flush=True)
     if r.returncode != 0 or not tmp_file.exists() \
        or tmp_file.stat().st_size < 1_000_000:
         err = (r.stderr or b"")[-500:].decode("utf-8", "replace").strip()
@@ -3918,6 +3946,79 @@ def _mediathek_rip_loop():
                     _rip_mediathek(todo[0])
         except Exception as e:
             print(f"mt-rip loop: {e}", flush=True)
+        time.sleep(3600)
+
+
+def _mediathek_autorec_once():
+    """One pass: for every autorec-spawned DVR entry on a Mediathek-
+    covered channel that we don't yet have a virtual for, attempt the
+    match and schedule a virtual recording. The rip loop then picks
+    it up before expiry."""
+    try:
+        data = json.loads(urllib.request.urlopen(
+            f"{TVH_BASE}/api/dvr/entry/grid?limit=500",
+            timeout=10).read())
+    except Exception as e:
+        print(f"mt-autorec fetch: {e}", flush=True)
+        return
+    with _mediathek_rec_lock:
+        existing = {m.get("tvh_entry") for m in _mediathek_rec.values()
+                    if m.get("tvh_entry")}
+    import uuid as uuid_mod
+    created = 0
+    for e in data.get("entries", []):
+        if not e.get("autorec"):
+            continue
+        tvh_uuid = e.get("uuid")
+        if not tvh_uuid or tvh_uuid in existing:
+            continue
+        ch_name = e.get("channelname") or ""
+        slug = slugify(ch_name)
+        if (slug not in ARD_SEARCH_CHANNELS
+            and slug not in ZDF_SEARCH_CHANNELS):
+            continue
+        title = e.get("disp_title") or e.get("title") or ""
+        start = e.get("start", 0)
+        stop = e.get("stop", 0)
+        if not title or not start:
+            continue
+        match = _mediathek_match(title, slug, start)
+        if not match or not match.get("id"):
+            continue
+        hls_url = _resolve_mediathek_hls(
+            match["id"], source=match.get("source", "ard"))
+        if not hls_url:
+            continue
+        vuuid = "mt_" + uuid_mod.uuid4().hex[:16]
+        with _mediathek_rec_lock:
+            _mediathek_rec[vuuid] = {
+                "title": match.get("title") or title,
+                "channel": ch_name,
+                "start": start,
+                "stop": stop,
+                "hls_url": hls_url,
+                "available_to": match.get("available_to", 0),
+                "eid": f"autorec_{tvh_uuid}",
+                "tvh_entry": tvh_uuid,
+                "autorec": e.get("autorec"),
+                "created_at": int(time.time()),
+            }
+        save_mediathek_rec()
+        created += 1
+        print(f"[mt-autorec] scheduled virtual for "
+              f"'{title}' on {ch_name} → {vuuid}", flush=True)
+    if created:
+        print(f"[mt-autorec] pass complete: {created} virtual(s) added",
+              flush=True)
+
+
+def _mediathek_autorec_loop():
+    time.sleep(300)   # let tvheadend populate its upcoming list
+    while True:
+        try:
+            _mediathek_autorec_once()
+        except Exception as e:
+            print(f"mt-autorec loop: {e}", flush=True)
         time.sleep(3600)
 
 
@@ -5018,9 +5119,12 @@ def api_warm_status():
                                     WINDOW_SECONDS),
             "always_warm": s in ALWAYS_WARM,
         } for s, i in channels.items()}
+    with _dormant_pins_lock:
+        dormant_snapshot = set(_dormant_pins)
     for s in ALWAYS_WARM:
         out.setdefault(s, {"running": False, "always_warm": True,
                             "idle_seconds": 0, "buffer_seconds": 0})
+        out[s]["dormant"] = s in dormant_snapshot
     dvr_busy = active_dvr_count()
     pins_used = len(ALWAYS_WARM)
     pin_limit = compute_pin_limit()
@@ -5112,6 +5216,7 @@ if __name__ == "__main__":
     threading.Thread(target=always_warm_loop, daemon=True).start()
     threading.Thread(target=_live_adskip_loop, daemon=True).start()
     threading.Thread(target=_mediathek_rip_loop, daemon=True).start()
+    threading.Thread(target=_mediathek_autorec_loop, daemon=True).start()
     # waitress in production; fall back to Flask's built-in only if
     # waitress somehow isn't importable (e.g. an older image).
     try:

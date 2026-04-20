@@ -29,7 +29,35 @@ on an external USB-3 SSD at `/mnt/tv/`.
   the cap grows by 1. Tuner count is read live from tvheadend
   `/api/status/inputs` (entries with `subs > 0`). Header badge
   `📡 n/4 Tuner` on the startpage reflects this in real time; tap on a
-  green warm-badge stops the LRU channel to free its tuner.
+  green warm-badge stops the LRU channel to free its tuner. Mux
+  groupings are visualised with coloured dots next to each channel.
+- **Pin idle-timeout**: a pinned channel that hasn't had a viewer in
+  `PIN_IDLE_HOURS` (default 6 h) is stopped and marked dormant in
+  `_dormant_pins`. The always-warm loop won't respawn a dormant pin;
+  `ensure_running` (called on viewer tap) clears the flag. UI shows a
+  💤 icon on the pin button for dormant channels. Saves tuner +
+  electricity for the "always warm just in case" use case.
+- **Mediathek live as primary source for public broadcasters**:
+  watch player first tries the Mediathek live HLS (via hls.js + MSE)
+  for any channel in `MEDIATHEK_LIVE`. Falls back to our ffmpeg
+  pipeline only if Mediathek doesn't answer in 8 s or emits a fatal
+  hls.js error. Frees a DVB-C tuner per public channel someone's
+  watching.
+- **Virtual Mediathek recordings + pre-expiry rip**: long-press on
+  an EPG event on an ARD/ZDF channel offers "Aus Mediathek
+  speichern". The entry is saved in `.mediathek_recordings.json` as
+  `mt_<hash>` → played back via hls.js on click. A background worker
+  (`_mediathek_rip_loop`) ffmpeg-`-c copy`'s the stream to a local
+  MP4 48 h before the Mediathek expiry so the show survives past
+  Mediathek availability. Rate-limited by loadavg and free-disk.
+  `_mediathek_autorec_loop` automatically creates these virtuals
+  for every autorec-spawned DVR entry on a Mediathek channel, so
+  series recordings also get the Mediathek backup.
+- **Past-event Mediathek**: tapping a past EPG event routes through
+  the long-press modal instead of navigating to the live stream.
+  Old archive entries without an event_id get a synthetic
+  `arc_<slug>_<start>` id the lookup endpoint understands, so
+  yesterday's Tatort still finds its Mediathek match.
 - **Hot-reload without buffer loss**: editing `service.py` triggers an
   in-container file watcher (mtime poll) that does `os.execv` on the
   Python process. ffmpegs are spawned with `start_new_session=True`
@@ -67,28 +95,65 @@ on an external USB-3 SSD at `/mnt/tv/`.
 
 | Path | Role |
 |---|---|
-| `hls-gateway/service.py` | Flask app: HLS orchestration, EPG archive, watch player (live), recording player (VOD), Mediathek fallback with hls.js, Now-Next bridge |
-| `hls-gateway/Dockerfile` | two-stage: ARM64 native build of comskip from source, then runtime with ffmpeg + libargtable2 + libsdl2 |
-| `hls-gateway/docker-compose.yml` | Mounts, env, runs as uid 1000 so SSD writes don't end up root-owned |
+| `hls-gateway/service.py` | waitress-served Flask app (~5k LOC): HLS orchestration, EPG archive, live + recording + Mediathek players, autorec series, virtual Mediathek recordings, live ad-skip, Now-Next bridge, file-watcher hot-reload |
+| `hls-gateway/Dockerfile` | two-stage: ARM64 native build of comskip from source, then runtime with static ffmpeg 8.1 (BtbN) + libargtable2 + libsdl2, `pip install flask waitress` |
+| `hls-gateway/docker-compose.yml` | Mounts `/mnt/tv` + `service.py`, runs as uid 1000 (SSD writes non-root), json-file log rotation 50 MB × 3 |
 | `caddy/Caddyfile` | HTTPS on :8443 with local CA, static `seg_*.ts` served via sendfile, `.m3u8` and `/recording/*` reverse-proxied to Flask, `.ts` forced to `Content-Type: video/mp2t` (Caddy auto-detects as Qt-linguist without this override) |
 | `tvheadend/docker-compose.yml` | linuxserver image, `/mnt/tv` mounted for recordings |
+
+### State files (persisted on SSD, survive container restart)
+
+| Path | Purpose |
+|---|---|
+| `/mnt/tv/hls/.always_warm.json` | Pinned channels + last-viewer timestamps |
+| `/mnt/tv/hls/.mediathek_recordings.json` | Virtual Mediathek recordings (metadata, HLS URL, rip status, expiry) |
+| `/mnt/tv/hls/.live_ads.json` | Detected ad blocks per channel (PDT-keyed, survives hot-reload) |
+| `/mnt/tv/hls/.epg_archive.jsonl` | 14-day EPG archive with auto-compaction |
+| `/mnt/tv/hls/.usage_stats.json` | Start-count + watch-hours per channel |
+| `/mnt/tv/hls/.codec_cache.json` | ffprobe results (H.264 vs MPEG-2) |
+| `/mnt/tv/hls/<slug>/.ffmpeg.pid` | Child PID + start-time for re-adoption after hot-reload |
+| `/mnt/tv/hls/<slug>/.adskip/` | comskip artefacts for live ad detection |
+| `/mnt/tv/hls/_rec_<uuid>/` | Remuxed HLS-VOD of tvheadend recordings + comskip |
+| `/mnt/tv/hls/_<mt_uuid>/file.mp4` | Ripped Mediathek MP4s (pre-expiry backup) |
 
 ## User-facing endpoints on Caddy (`:8443`)
 
 ```
-/                            — channel grid
+/                            — channel grid (with mux-sharing dots + pin 📌/💤)
 /watch/<slug>                — live player (2 h DVR, Mediathek fallback)
-/epg                         — program grid with clickable chapter ticks
-/recordings                  — DVR list (with prewarm status badges)
+/epg                         — program grid with chapter ticks + long-press modal
+/stats                       — usage ranking
+/recordings                  — DVR list (series-grouped + prewarm status badges)
 /recording/<uuid>            — recording player (VOD + comskip ad markers)
-/record-event/<event_id>     — schedule DVR for an EPG event
-/cancel-recording/<uuid>     — abort/remove DVR entry
+/mediathek-play/<event_id>   — direct-play a Mediathek match (no DVR entry)
+/mediathek-rec/<uuid>/file.mp4
+                             — ripped Mediathek MP4 (post-rip playback)
+/record-event/<event_id>     — schedule DVR for an EPG event (OR virtual
+                               Mediathek recording if event_id starts mt_/arc_)
+/record-series/<event_id>    — create tvheadend autorec from event title
+/cancel-series/<autorec_uuid>
+                             — delete autorec + all future scheduled episodes
+/cancel-recording/<uuid>     — abort/remove DVR entry (real OR virtual mt_*)
 /api/channels                — favorite channels JSON
 /api/now/<slug>              — currently airing on channel
 /api/events/<slug>           — EPG events in a window
+/api/is-recording/<slug>     — is this channel being recorded right now
 /api/show-actual-start/<slug>?ts=<epg_start>
                              — real broadcast start from ARD/ZDF now-next APIs
 /api/mediathek-live/<slug>   — public CDN fallback URL + DVR window size
+/api/mediathek-lookup/<event_id>
+                             — search ARD/ZDF Mediathek for this EPG event;
+                               synthetic arc_<slug>_<start> ids supported
+/api/mediathek-schedule/<event_id>
+                             — create virtual Mediathek recording (mt_<hash>)
+/api/live-ads/<slug>         — current ad-block ranges for warm channel
+/api/live-ads/<slug>/scan    — trigger on-demand comskip rescan
+/api/warm-status             — warm/pinned/dormant state for all channels
+/api/always-warm/<slug>      — toggle pin for a channel (respects dynamic cap)
+/status                      — all running ffmpegs + tuner usage JSON
+/stop/<slug>                 — stop one stream
+/stop-all                    — stop all streams (frees all tuners)
+/prewarm/<slug>              — start a channel without a viewer
 /mediathek-clip/<slug>/master.m3u8
                              — (legacy VOD-ifying proxy; superseded by hls.js)
 ```
