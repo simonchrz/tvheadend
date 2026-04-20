@@ -99,22 +99,24 @@ ul.channels .meta code { display: inline-block; margin-top: 2px; }
 .ch-actions { font-size: .85em; color: var(--muted); }
 .ch-actions a { margin-right: 2px; }
 
-/* ===== EPG layout: two-column flex, only right column scrolls ===== */
+/* ===== EPG layout: wrap scrolls h+v, channels column sticky ===== */
 .epg-wrap {
     display: flex;
     border: 1px solid var(--border); border-radius: 6px;
     margin: 1em 0;
-    overflow: hidden;
+    max-height: calc(100vh - 170px);
+    overflow: auto;
+    overscroll-behavior: contain;
 }
 .epg-channels {
     flex: 0 0 64px;
     background: var(--bg);
     border-right: 1px solid var(--border);
+    position: sticky; left: 0; z-index: 2;
 }
 .epg-tl-scroll {
     flex: 1 1 auto;
-    overflow-x: auto;
-    overflow-y: hidden;
+    overflow: visible;
 }
 .epg-tl-inner {
     position: relative;
@@ -1299,9 +1301,9 @@ def epg_grid():
     now_line = (f'<div class="epg-now-line" '
                 f'style="left:{now_offset_px}px"></div>')
 
-    grid_html = (f'<div class="epg-wrap" id="epg">'
+    grid_html = (f'<div class="epg-wrap" id="tlscroll">'
                  f'<div class="epg-channels">{"".join(channel_col)}</div>'
-                 f'<div class="epg-tl-scroll" id="tlscroll">'
+                 f'<div class="epg-tl-scroll">'
                  f'<div class="epg-tl-inner" style="width:{total_px}px">'
                  f'{"".join(tl_rows)}{now_line}</div>'
                  f'</div></div>')
@@ -1310,6 +1312,9 @@ def epg_grid():
             f"content='width=device-width,initial-scale=1'>"
             f"<meta name='color-scheme' content='light dark'>"
             f"<style>{BASE_CSS}"
+            f"html,body{{height:100%;overflow:hidden}}"
+            f"body{{max-width:none;margin:0;display:flex;flex-direction:column}}"
+            f".epg-wrap{{flex:1 1 auto;min-height:0;max-height:none;margin-bottom:0}}"
             f".auto-refresh{{display:inline-flex;align-items:center;gap:.35em;"
             f"font-size:.85em;color:var(--muted);cursor:pointer;user-select:none}}"
             f".auto-refresh input{{accent-color:#1565c0;cursor:pointer}}"
@@ -1636,7 +1641,12 @@ html,body{height:100%;background:#000;color:#eee;
 .iconbtn{background:#fff2;color:#fff;border:0;width:34px;height:34px;
  border-radius:17px;font-size:1em;cursor:pointer;display:flex;
  align-items:center;justify-content:center;text-decoration:none;
- flex:0 0 auto;line-height:1}
+ flex:0 0 auto;line-height:1;font-variant-emoji:text;
+ transition:box-shadow .2s,background .2s}
+@media (hover:hover){
+ .iconbtn:hover{background:#fff4;
+  box-shadow:0 0 10px #7bdcff99,0 0 18px #7bdcff55}
+}
 .iconbtn:active{opacity:.6}
 .iconbtn:disabled{background:#555;color:#bbb;cursor:default}
 .pill{background:#fff2;color:#fff;border:0;padding:7px 12px;
@@ -1644,6 +1654,8 @@ html,body{height:100%;background:#000;color:#eee;
  display:inline-flex;align-items:center;gap:5px;flex:0 0 auto;line-height:1}
 .pill:active{opacity:.7}
 .pill:disabled{background:#555;color:#bbb;cursor:default}
+#skipad{display:none}
+#skipad.on{display:inline-flex}
 .time{font-variant-numeric:tabular-nums;font-size:.85em;color:#ddd;
  min-width:44px;text-align:center;flex:0 0 auto}
 #scrub{position:relative;width:100%;height:22px;
@@ -1671,7 +1683,7 @@ html,body{height:100%;background:#000;color:#eee;
 
 PLAYER_BASE_JS = """\
 const v=document.getElementById('v');
-const chrome=document.getElementById('chrome');
+const chromeBar=document.getElementById('chrome');
 const topbar=document.getElementById('topbar');
 const hint=document.getElementById('hint');
 const pp=document.getElementById('pp');
@@ -1682,11 +1694,11 @@ v.addEventListener('play',()=>pp.textContent='\u23F8');
 v.addEventListener('pause',()=>pp.textContent='\u25B6');
 let _chromeT=null;
 function show(){
-  chrome.classList.remove('hidden');
+  chromeBar.classList.remove('hidden');
   topbar.classList.remove('hidden');
   clearTimeout(_chromeT);
   _chromeT=setTimeout(()=>{
-    if(!v.paused){chrome.classList.add('hidden');topbar.classList.add('hidden');}
+    if(!v.paused){chromeBar.classList.add('hidden');topbar.classList.add('hidden');}
   },3500);
 }
 show();
@@ -2446,8 +2458,8 @@ document.addEventListener('keydown',e=>{{
   else if(e.key===' '){{e.preventDefault();togglePlay();show();}}
 }});
 v.addEventListener('click',()=>{{
-  if(chrome.classList.contains('hidden'))show();
-  else {{chrome.classList.add('hidden');topbar.classList.add('hidden');}}
+  if(chromeBar.classList.contains('hidden'))show();
+  else {{chromeBar.classList.add('hidden');topbar.classList.add('hidden');}}
 }});
 document.addEventListener('mousemove',show);
 
@@ -3565,6 +3577,7 @@ def recordings_page():
             f"content='width=device-width,initial-scale=1'>"
             f"<meta name='color-scheme' content='light dark'>"
             f"<style>{BASE_CSS}"
+            f"body{{max-width:none;margin:0}}"
             f".badge{{font-size:.75em;padding:2px 6px;border-radius:3px;"
             f"font-weight:600;display:inline-block}}"
             f".badge.live{{background:#e74c3c;color:#fff}}"
@@ -4609,8 +4622,8 @@ def _render_mediathek_player(uuid, entry):
             f"  else if(e.key===' '){{e.preventDefault();togglePlay();show();}}"
             f"}});"
             f"v.addEventListener('click',()=>{{"
-            f"  if(chrome.classList.contains('hidden'))show();"
-            f"  else {{chrome.classList.add('hidden');topbar.classList.add('hidden');}}"
+            f"  if(chromeBar.classList.contains('hidden'))show();"
+            f"  else {{chromeBar.classList.add('hidden');topbar.classList.add('hidden');}}"
             f"}});"
             f"document.addEventListener('mousemove',show);"
             f"const rawUrl='{hls_url}';"
@@ -4742,8 +4755,8 @@ def play_recording(uuid):
             f"<button class='iconbtn' onclick='seek(10)' aria-label='+10 s'>⏩</button>"
             f"<span id='cur' class='time'>0:00</span>"
             f"<span class='spacer'></span>"
-            f"<button id='skipad' class='pill rec' onclick='skipAd()' "
-            f"style='display:none'>Werbung ⏭</button>"
+            f"<button id='skipad' class='pill rec' onclick='skipAd()'"
+            f">Werbung ⏭</button>"
             f"<span id='dur' class='time'>0:00</span>"
             f"</div>"
             f"<div id='ttlrow'>{title_safe}</div>"
@@ -4799,7 +4812,7 @@ def play_recording(uuid):
             f"  const pct=D>0?(T/D)*100:0;"
             f"  played.style.width=pct+'%';"
             f"  thumb.style.left=pct+'%';"
-            f"  skipBtn.style.display=currentAd()!==null?'inline-flex':'none';"
+            f"  skipBtn.classList.toggle('on',currentAd()!==null);"
             f"}}"
             f"v.addEventListener('timeupdate',refresh);"
             f"v.addEventListener('loadedmetadata',()=>{{refresh();renderAds();}});"
@@ -4812,8 +4825,8 @@ def play_recording(uuid):
             f"  if(D>0)v.currentTime=p*D;"
             f"}}"
             f"v.addEventListener('click',()=>{{"
-            f"  if(chrome.classList.contains('hidden'))show();"
-            f"  else {{chrome.classList.add('hidden');"
+            f"  if(chromeBar.classList.contains('hidden'))show();"
+            f"  else {{chromeBar.classList.add('hidden');"
             f"    topbar.classList.add('hidden');}}"
             f"}});"
             f"document.addEventListener('mousemove',show);"
