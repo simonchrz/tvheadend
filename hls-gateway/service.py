@@ -1412,12 +1412,15 @@ def epg_grid():
             f"+String(avail.getMonth()+1).padStart(2,'0');"
             f"        const mtBtn={{label:'Aus ARD Mediathek (bis '+dStr+')',"
             f"value:'mediathek'}};"
-            # For past events the Mediathek button becomes the primary
-            # and only action (before "Abbrechen"). For future events
-            # it slots between "Einzelne Episode" and "Ganze Serie".
-            f"        if(isPast){{mtBtn.primary=true;"
-            f"          dialogBtns.splice(dialogBtns.length-1,0,mtBtn);}}"
-            f"        else{{dialogBtns.splice(1,0,mtBtn);}}"
+            # Past events: "Jetzt abspielen" (primary, direct playback,
+            # nothing persisted) plus "Aus Mediathek speichern" (save
+            # a virtual recording for later). Future events: Mediathek
+            # option slots between Episode and Serie as before.
+            f"        if(isPast){{"
+            f"          dialogBtns.splice(dialogBtns.length-1,0,"
+            f"            {{label:'Jetzt abspielen',value:'play',primary:true}},"
+            f"            mtBtn);"
+            f"        }} else {{dialogBtns.splice(1,0,mtBtn);}}"
             f"      }} else if(isPast){{"
             # Past event with no Mediathek match: there's nothing we
             # can do, show a brief note and bail.
@@ -1445,6 +1448,8 @@ def epg_grid():
             f"                buttons:[{{label:'OK',value:'',primary:true}}]}});"
             f"            }}"
             f"          }}).catch(()=>{{}});"
+            f"        else if(v==='play')"
+            f"          location.href='{HOST_URL}/mediathek-play/'+el.dataset.eid;"
             f"        else if(v==='mediathek')"
             f"          fetch('{HOST_URL}/api/mediathek-schedule/'+el.dataset.eid,"
             f"            {{method:'POST'}})"
@@ -2283,23 +2288,95 @@ document.addEventListener('click',onInteract);
 document.addEventListener('touchend',()=>setTimeout(onInteract,30),
                           {{passive:true}});
 
-function loadSrc(slug){{
-  current=slug;onMediathek=false;
+function loadDvbcSrc(slug){{
+  onMediathek=false;
   setSource('live');
   destroyHls();
   const url=HOST+'/hls/'+slug+'/dvr.m3u8';
   v.muted=false;v.src=url;v.load();
   v.addEventListener('loadedmetadata',tryPlay,{{once:true}});
+}}
+function tryMediathekLive(url){{
+  return new Promise(resolve=>{{
+    if(typeof Hls==='undefined'||!Hls.isSupported()){{
+      resolve(false);return;
+    }}
+    destroyHls();
+    const hls=new Hls({{forceMseHlsOnAppleDevices:true,
+      maxBufferLength:30,backBufferLength:10800,
+      renderTextTracksNatively:false,subtitleDisplay:false}});
+    hlsInst=hls;
+    hlsCurrentUrl=url;
+    /* Kill any caption/subtitle tracks the player auto-selected. */
+    const disableCaptions=()=>{{
+      for(const t of v.textTracks)t.mode='disabled';
+    }};
+    v.textTracks&&v.textTracks.addEventListener('addtrack',disableCaptions);
+    setTimeout(disableCaptions,200);
+    setTimeout(disableCaptions,1500);
+    let settled=false;
+    const finish=ok=>{{
+      if(settled)return;settled=true;
+      clearTimeout(to);
+      if(!ok){{
+        try{{hls.destroy();}}catch(e){{}}
+        hlsInst=null;hlsCurrentUrl=null;
+      }}
+      resolve(ok);
+    }};
+    const to=setTimeout(()=>{{
+      console.warn('mediathek live timeout');finish(false);
+    }},8000);
+    hls.on(Hls.Events.ERROR,(_,data)=>{{
+      if(data.fatal){{console.warn('mediathek live error',data);finish(false);}}
+    }});
+    const onReady=()=>{{
+      v.removeEventListener('canplay',onReady);
+      /* Muted autoplay to satisfy iOS gesture rules; unmute-button
+         overlay appears and the user taps it to hear audio — same
+         pattern as the DVB-C path. */
+      v.muted=true;
+      v.play().then(()=>{{
+        if(unmuteBtn){{
+          v.muted=true;
+          unmuteBtn.style.display='inline-flex';
+        }}
+      }}).catch(()=>{{}});
+      finish(true);
+    }};
+    v.addEventListener('canplay',onReady);
+    v.muted=true;
+    hls.loadSource(url);hls.attachMedia(v);
+  }});
+}}
+async function loadSrc(slug){{
+  current=slug;onMediathek=false;
   const ch=channels[idx];
-  if(ch){{
-    chname.textContent=ch.name;
-  }}
+  if(ch)chname.textContent=ch.name;
   history.replaceState(null,'','/watch/'+slug);
   loadEpg(slug);
   loadEvents(slug);
   loadMediathekAvail(slug);
   loadLiveAds(slug);
   showHint(slug);
+  /* Public-broadcaster channels have a Mediathek live stream — try
+     that first to save a DVB-C tuner + the Pi CPU. Only fall back to
+     our local ffmpeg pipeline if Mediathek doesn't answer in 8 s or
+     errors out fatally. Private channels never had Mediathek so they
+     skip the probe entirely. */
+  try{{
+    const mt=await fetch(HOST+'/api/mediathek-live/'+slug)
+      .then(r=>r.json()).catch(()=>null);
+    if(mt&&mt.url&&current===slug){{
+      if(await tryMediathekLive(mt.url)){{
+        if(current!==slug)return; /* user swiped away meanwhile */
+        onMediathek=true;setSource('mediathek');
+        return;
+      }}
+    }}
+  }}catch(e){{}}
+  if(current!==slug)return;
+  loadDvbcSrc(slug);
 }}
 
 function showHint(slug){{
@@ -2955,17 +3032,23 @@ def api_mediathek_lookup(event_id):
         return _cors(Response(json.dumps({
             "match": None, "reason": "channel not in ARD coverage"}),
             mimetype="application/json"))
-    try:
-        qs = urllib.parse.urlencode({
-            "searchString": title,
-            "searchResultsPageSize": "24",
-        })
-        data = json.loads(urllib.request.urlopen(
-            f"https://api.ardmediathek.de/page-gateway/pages/ard/"
-            f"search?{qs}", timeout=6).read())
-    except Exception as e:
+    qs = urllib.parse.urlencode({
+        "searchString": title,
+        "searchResultsPageSize": "24",
+    })
+    search_url = (f"https://api.ardmediathek.de/page-gateway/pages/ard/"
+                  f"search?{qs}")
+    data = None
+    for attempt in range(2):
+        try:
+            data = json.loads(urllib.request.urlopen(
+                search_url, timeout=15).read())
+            break
+        except Exception as e:
+            print(f"mediathek search (try {attempt+1}): {e}", flush=True)
+    if data is None:
         return _cors(Response(json.dumps({
-            "match": None, "error": f"mediathek: {e}"}),
+            "match": None, "error": "mediathek search timeout"}),
             mimetype="application/json"))
     best = None
     from datetime import datetime
@@ -3671,22 +3754,36 @@ def save_mediathek_rec():
 
 def _resolve_mediathek_hls(item_id):
     """Given an ARD Mediathek item id (from search), fetch the detail
-    page and pick out the adaptive HLS master playlist URL."""
-    try:
-        url = (f"https://api.ardmediathek.de/page-gateway/pages/ard/"
-               f"item/{item_id}?devicetype=pc&embedded=true")
-        data = json.loads(urllib.request.urlopen(url, timeout=6).read())
-        media = (data.get("widgets", [{}])[0]
-                     .get("mediaCollection", {})
-                     .get("embedded", {})
-                     .get("streams", [{}])[0]
-                     .get("media", []))
-        for m in media:
-            u = m.get("url", "")
-            if ".m3u8" in u or m.get("forcedLabel") == "Auto":
-                return u
-    except Exception as e:
-        print(f"mediathek hls resolve: {e}", flush=True)
+    page and pick out the adaptive HLS master playlist URL. The ARD
+    item endpoint is occasionally slow (>6s); retry once on timeout."""
+    url = (f"https://api.ardmediathek.de/page-gateway/pages/ard/"
+           f"item/{item_id}?devicetype=pc&embedded=true")
+    for attempt in range(2):
+        try:
+            data = json.loads(
+                urllib.request.urlopen(url, timeout=15).read())
+            # Scan every stream/media entry for a .m3u8 URL — the order
+            # isn't guaranteed across shows.
+            for stream in (data.get("widgets", [{}])[0]
+                               .get("mediaCollection", {})
+                               .get("embedded", {})
+                               .get("streams", [])):
+                for m in stream.get("media", []):
+                    u = m.get("url", "")
+                    if ".m3u8" in u:
+                        return u
+            # Fallback: any forcedLabel "Auto" entry even without .m3u8
+            for stream in (data.get("widgets", [{}])[0]
+                               .get("mediaCollection", {})
+                               .get("embedded", {})
+                               .get("streams", [])):
+                for m in stream.get("media", []):
+                    if m.get("forcedLabel") == "Auto":
+                        return m.get("url")
+            return None
+        except Exception as e:
+            print(f"mediathek hls resolve (try {attempt+1}): {e}",
+                  flush=True)
     return None
 
 
@@ -4053,8 +4150,14 @@ def _render_mediathek_player(uuid, entry):
             f".src-badge{{display:inline-block;background:#2980b9;"
             f"color:#fff;padding:2px 8px;border-radius:10px;"
             f"font-size:.75em;margin-left:8px;vertical-align:1px}}"
+            f"#unmute{{position:fixed;left:50%;top:50%;"
+            f"transform:translate(-50%,-50%);z-index:30;background:#fff;"
+            f"color:#000;padding:14px 22px;border-radius:30px;"
+            f"font-weight:600;font-size:1em;border:0;cursor:pointer;"
+            f"display:none}}"
             f"</style></head><body>"
-            f"<video id='v' autoplay playsinline webkit-playsinline></video>"
+            f"<video id='v' autoplay muted playsinline webkit-playsinline></video>"
+            f"<button id='unmute'>🔊 Ton an</button>"
             f"<div id='topbar'>"
             f"<button class='iconbtn' onclick='toggleFs()' aria-label='Vollbild'>⛶</button>"
             f"<a class='iconbtn' href='{HOST_URL}/recordings' "
@@ -4122,16 +4225,62 @@ def _render_mediathek_player(uuid, entry):
             f"}});"
             f"document.addEventListener('mousemove',show);"
             f"const rawUrl='{hls_url}';"
+            f"const unmuteBtn=document.getElementById('unmute');"
+            f"const disableCaptions=()=>{{"
+            f"  for(const t of v.textTracks)t.mode='disabled';"
+            f"}};"
+            f"v.textTracks&&v.textTracks.addEventListener('addtrack',disableCaptions);"
+            f"setTimeout(disableCaptions,200);"
+            f"setTimeout(disableCaptions,1500);"
+            f"function doUnmute(){{"
+            f"  v.muted=false;unmuteBtn.style.display='none';"
+            f"  v.play().catch(()=>{{}});"
+            f"}}"
+            f"unmuteBtn.onclick=doUnmute;"
+            f"v.addEventListener('click',()=>{{if(v.muted)doUnmute();}});"
+            f"function startPlayback(){{"
+            f"  v.muted=true;"
+            f"  v.play().then(()=>{{unmuteBtn.style.display='inline-flex';}})"
+            f"    .catch(()=>{{unmuteBtn.style.display='inline-flex';}});"
+            f"}}"
             f"if(window.Hls&&Hls.isSupported()){{"
-            f"  const hls=new Hls({{forceMseHlsOnAppleDevices:true}});"
+            f"  const hls=new Hls({{forceMseHlsOnAppleDevices:true,"
+            f"    renderTextTracksNatively:false,subtitleDisplay:false}});"
             f"  hls.loadSource(rawUrl);hls.attachMedia(v);"
+            f"  v.addEventListener('canplay',startPlayback,{{once:true}});"
             f"}} else if(v.canPlayType('application/vnd.apple.mpegurl')){{"
             f"  v.src=rawUrl;"
+            f"  v.addEventListener('loadedmetadata',startPlayback,{{once:true}});"
             f"}} else {{"
             f"  document.body.innerHTML='<p style=color:#fff;padding:20px>"
             f"HLS wird von diesem Browser nicht unterstützt.</p>';"
             f"}}"
             f"</script></body></html>")
+
+
+@app.route("/mediathek-play/<event_id>")
+def mediathek_play(event_id):
+    """Play a Mediathek match of an EPG event directly, without
+    persisting a virtual recording. Used by the long-press modal's
+    "Jetzt abspielen" shortcut for past shows you just want to watch."""
+    try:
+        res = urllib.request.urlopen(
+            f"http://localhost:8080/api/mediathek-lookup/{event_id}",
+            timeout=35).read()
+        match = json.loads(res).get("match")
+    except Exception as e:
+        abort(502, f"lookup: {e}")
+    if not match or not match.get("id"):
+        abort(404, "no mediathek match")
+    hls_url = _resolve_mediathek_hls(match["id"])
+    if not hls_url:
+        abort(502, "no hls url")
+    entry = {
+        "title": match.get("title", "Mediathek"),
+        "hls_url": hls_url,
+        "available_to": match.get("available_to", 0),
+    }
+    return _render_mediathek_player("preview", entry)
 
 
 @app.route("/recording/<uuid>")
