@@ -8,6 +8,16 @@ from pathlib import Path
 from flask import Flask, send_from_directory, abort, Response, request
 
 HLS_DIR        = Path("/data/hls")
+COMSKIP_INI    = HLS_DIR / ".comskip.ini"
+COMSKIP_INI_TEXT = """\
+; Overrides for comskip defaults, written at service startup.
+; Only bump the max-length thresholds so longer DE-private Werbepausen
+; (often 10-15 min with station-promos inside) don't get split into
+; two blocks by comskip's default 10-min ceiling. Everything else
+; stays at comskip default to avoid fragmenting detection.
+max_commercialbreak=900
+max_commercial_size=150
+"""
 TVH_BASE       = os.environ.get("TVH_BASE", "http://localhost:9981")
 HOST_URL       = os.environ.get("HOST_URL", "http://raspberrypi5lan:8080")
 IDLE_TIMEOUT   = int(os.environ.get("IDLE_TIMEOUT", "120"))
@@ -32,6 +42,26 @@ PIN_HARD_MAX = 3   # tuner-driven upper bound; minus active/scheduled DVR jobs
 TUNER_TOTAL = int(os.environ.get("TUNER_TOTAL", "4"))   # FRITZ!Box DVB-C tuners
 EPG_SNAPSHOT_INTERVAL = 600   # 10 min
 EPG_ARCHIVE_KEEP_DAYS = 14
+
+# How long the sponsor/"Präsentiert von ..."-Einblendung typically is
+# per channel. The blackframe-extender adds this to the detected
+# transition blackframe after each comskip ad block. Channels not
+# listed here use SPONSOR_DURATION_DEFAULT; set to 0 to disable the
+# extension entirely for a channel.
+SPONSOR_DURATION_DEFAULT = 20.0
+SPONSOR_DURATION_BY_CHANNEL = {
+    "vox":        25.0,
+    "rtl":        20.0,
+    "rtlzwei":    20.0,
+    "prosieben":  20.0,
+    "sat-1":      20.0,
+    "kabel-eins": 20.0,
+    "sixx":       20.0,
+    "super-rtl":  20.0,
+    "nitro":      20.0,
+    "ntv":        20.0,
+    "sport1":     20.0,
+}
 
 app = Flask(__name__)
 channels     = {}    # slug -> {"process","last_seen","started_at"}
@@ -2254,6 +2284,9 @@ function togglePlay(){{
     const ps=pauseState;pauseState=null;
     if(ps.pausedMediathekUrl){{
       switchToMediathek(ps.pausedMediathekUrl,ps.pausedWall);
+    }} else if(ps.pausedHlsLive){{
+      /* hls.js keeps playlist position across pause — just resume. */
+      v.play().catch(()=>{{}});
     }} else {{
       v.src=ps.pausedSrc;v.load();
       v.addEventListener('loadedmetadata',()=>{{
@@ -2273,11 +2306,16 @@ function togglePlay(){{
     pp.textContent='\u23F8';
     return;
   }}
-  /* iOS live-HLS ignores pause(). Unconditionally strip the src to
-     stop playback; remember wall-time so resume can seek back. */
+  /* Three pause flavours:
+     - Mediathek (hls.js, non-live): destroy hls.js, resume rebuilds it.
+     - DVB-C via hls.js (Chrome/Firefox): regular v.pause() keeps position.
+     - DVB-C via native HLS (iOS Safari): pause() is ignored on live HLS,
+       so we strip v.src and seek back via wall-time on resume. */
+  const usingHlsLive=!!(hlsInst&&!onMediathek);
   pauseState={{
-    pausedSrc:onMediathek?null:v.src,
+    pausedSrc:(onMediathek||usingHlsLive)?null:v.src,
     pausedMediathekUrl:onMediathek?hlsCurrentUrl:null,
+    pausedHlsLive:usingHlsLive,
     pausedWall:wallAt(v.currentTime),
     pausedCurrent:v.currentTime
   }};
@@ -2285,12 +2323,13 @@ function togglePlay(){{
   if(onMediathek&&hlsInst){{
     try{{hlsInst.destroy();}}catch(e){{}}
     hlsInst=null;hlsCurrentUrl=null;
+    v.removeAttribute('src');
+    v.load();
+  }} else if(!usingHlsLive){{
+    v.removeAttribute('src');
+    v.load();
   }}
-  v.removeAttribute('src');
-  v.load();
   pp.textContent='\u25B6';
-  /* Defensive: some events (autoplay attempt after load-empty) may
-     flip the icon back — re-set after the next event loop tick. */
   setTimeout(()=>{{if(pauseState)pp.textContent='\u25B6';}},80);
   setTimeout(()=>{{if(pauseState)pp.textContent='\u25B6';}},500);
 }}
@@ -2318,6 +2357,8 @@ function onInteract(){{
   if(!unmutedByUser){{
     v.muted=false;unmutedByUser=true;unmuteBtn.style.display='none';
   }}
+  /* Don't auto-resume if the user just hit pause. */
+  if(pauseState)return;
   tryPlay();
 }}
 document.addEventListener('click',onInteract);
@@ -2329,7 +2370,22 @@ function loadDvbcSrc(slug){{
   setSource('live');
   destroyHls();
   const url=HOST+'/hls/'+slug+'/dvr.m3u8';
-  v.muted=false;v.src=url;v.load();
+  v.muted=false;
+  const isIos=/iPad|iPhone|iPod/.test(navigator.userAgent);
+  if(!isIos && typeof Hls!=='undefined' && Hls.isSupported()){{
+    const hls=new Hls({{
+      maxBufferLength:30,
+      backBufferLength:7200,
+      renderTextTracksNatively:false,
+      subtitleDisplay:false,
+    }});
+    hlsInst=hls;
+    hlsCurrentUrl=url;
+    hls.loadSource(url);
+    hls.attachMedia(v);
+  }} else {{
+    v.src=url;v.load();
+  }}
   v.addEventListener('loadedmetadata',tryPlay,{{once:true}});
 }}
 function tryMediathekLive(url){{
@@ -3649,6 +3705,20 @@ def _rec_source_path(uuid):
     return None
 
 
+def _rec_channel_slug(uuid):
+    """Look up which channel a DVR entry was recorded from, as a slug."""
+    try:
+        data = json.loads(urllib.request.urlopen(
+            f"{TVH_BASE}/api/dvr/entry/grid?limit=400",
+            timeout=6).read())
+        for e in data.get("entries", []):
+            if e.get("uuid") == uuid:
+                return slugify(e.get("channelname") or "")
+    except Exception:
+        pass
+    return ""
+
+
 def _rec_cskip_spawn(uuid):
     """Run comskip on the original TS so we can mark commercial blocks
     on the scrub bar. Fire-and-forget; result is polled via files."""
@@ -3676,7 +3746,10 @@ def _rec_cskip_spawn(uuid):
 
 
 def _rec_parse_comskip(out_dir):
-    """Parse comskip's default .txt output → list of [start_s, stop_s]."""
+    """Parse comskip's default .txt output → list of [start_s, stop_s].
+    Adjacent blocks separated by a short sponsor card (≤25 s of "show")
+    are merged — typical pattern on VOX/RTL/Pro7: Werbung · 15 s
+    Präsentation-Einblendung · Werbung · Sendungsstart."""
     txts = list(out_dir.glob("*.txt"))
     if not txts:
         return []
@@ -3708,7 +3781,119 @@ def _rec_parse_comskip(out_dir):
                 ads.append([round(a, 2), round(b, 2)])
         except Exception:
             continue
-    return ads
+    # Comskip's .txt sometimes contains duplicate frame pairs — dedup
+    # and sort before we touch them.
+    seen = set()
+    dedup = []
+    for a, b in ads:
+        key = (round(a, 1), round(b, 1))
+        if key not in seen:
+            seen.add(key)
+            dedup.append([a, b])
+    dedup.sort(key=lambda x: x[0])
+    # Merge blocks with short gaps (sponsor card / Praesentation-Einblendung).
+    MERGE_GAP = 25.0
+    merged = []
+    for a, b in dedup:
+        if merged and a - merged[-1][1] <= MERGE_GAP:
+            merged[-1][1] = max(merged[-1][1], b)
+        else:
+            merged.append([a, b])
+    return merged
+
+
+def _blackframe_extend_ads(video_path, ads,
+                            channel_slug=None,
+                            sponsor_duration=None,
+                            max_extend=None):
+    """Look for blackframes after each comskip ad-end. Three cases:
+       (1) two blacks found after end → pattern is
+           [ad] · (black) · [sponsor] · (black) · [show] — extend to
+           the latest black (sponsor end).
+       (2) one black close to end → pattern is [ad] · (black) ·
+           [sponsor] · hardcut → extend by sponsor_duration from the
+           black (the sponsor's end isn't marked by a black).
+       (3) no blackframe → no extension.
+       Per-channel sponsor_duration via SPONSOR_DURATION_BY_CHANNEL."""
+    if sponsor_duration is None:
+        sponsor_duration = SPONSOR_DURATION_BY_CHANNEL.get(
+            channel_slug or "", SPONSOR_DURATION_DEFAULT)
+    if max_extend is None:
+        max_extend = sponsor_duration + 10.0
+    if not ads or not video_path or sponsor_duration <= 0:
+        return ads
+    scan_window = max(sponsor_duration + 8.0, 20.0)
+    START_SCAN = 25.0    # how far back to look for a start blackframe
+    START_MAX_EXTEND = 20.0
+    out = []
+    for start, end in ads:
+        # --- forward extension (ad-end → sponsor-end) ---
+        ss = max(0, end - 1.0)
+        new_end = end
+        blacks_after = []
+        try:
+            proc = subprocess.run(
+                ["ffmpeg", "-hide_banner", "-nostats",
+                 "-ss", str(ss), "-i", str(video_path),
+                 "-t", str(scan_window + 2),
+                 "-vf", "blackdetect=d=0.04:pix_th=0.20:pic_th=0.90",
+                 "-an", "-f", "null", "-"],
+                capture_output=True, text=True, timeout=25)
+            for line in proc.stderr.splitlines():
+                if "blackdetect" in line and "black_end:" in line:
+                    try:
+                        rel = float(line.split("black_end:")[1].split()[0])
+                        abs_t = ss + rel
+                        if end < abs_t <= end + scan_window:
+                            blacks_after.append(abs_t)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+        extend_to = end
+        if len(blacks_after) >= 2 and (blacks_after[-1] - blacks_after[0]) >= 5.0:
+            extend_to = blacks_after[-1] + 0.5
+        elif blacks_after and blacks_after[0] <= end + 5.0:
+            extend_to = blacks_after[0] + sponsor_duration
+        elif blacks_after:
+            extend_to = blacks_after[-1] + 0.5
+        new_end = max(new_end, min(end + max_extend, extend_to))
+        # --- backward extension (ad-start → earlier blackframe) ---
+        ss2 = max(0, start - START_SCAN - 1.0)
+        new_start = start
+        blacks_before = []
+        try:
+            proc = subprocess.run(
+                ["ffmpeg", "-hide_banner", "-nostats",
+                 "-ss", str(ss2), "-i", str(video_path),
+                 "-t", str(START_SCAN + 2),
+                 "-vf", "blackdetect=d=0.04:pix_th=0.20:pic_th=0.90",
+                 "-an", "-f", "null", "-"],
+                capture_output=True, text=True, timeout=20)
+            for line in proc.stderr.splitlines():
+                if "blackdetect" in line and "black_start:" in line:
+                    try:
+                        rel = float(line.split("black_start:")[1].split()[0])
+                        abs_t = ss2 + rel
+                        if start - START_SCAN <= abs_t < start - 1.0:
+                            blacks_before.append(abs_t)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+        if blacks_before:
+            # Earliest black within the scan window = true ad start.
+            earliest = min(blacks_before)
+            if start - earliest <= START_MAX_EXTEND:
+                new_start = earliest
+        out.append([round(new_start, 2), round(new_end, 2)])
+    merged = []
+    for a, b in out:
+        if merged and a - merged[-1][1] <= 1.0:
+            merged[-1][1] = max(merged[-1][1], b)
+        else:
+            merged.append([a, b])
+    return merged
 
 
 def _rec_probe_total_segments(src_url):
@@ -4198,17 +4383,18 @@ def save_live_ads():
         print(f"save live-ads: {e}", flush=True)
 
 
-def _live_ads_analyze(slug):
-    """Concatenate the current HLS segments of a live channel, run
-    comskip to detect commercial blocks, and store the result keyed
-    by wall-clock seconds (so results stay valid as segments roll)."""
+def _live_ads_analyze(slug, window_end_seg=None, window_size=1800):
+    """Concatenate HLS segments of a live channel in a sliding window,
+    run comskip to detect commercial blocks, and store the result
+    keyed by wall-clock seconds. `window_end_seg` names the rightmost
+    segment to include (default: live edge). `window_size` is in
+    segments (each ~1 s). Keeps results from previous scans that
+    covered a different window (via the caller merging)."""
     ch_dir = HLS_DIR / slug
     playlist = ch_dir / "index.m3u8"
     if not playlist.exists():
         return False
-    # Anchor wall time: parse the first #EXT-X-PROGRAM-DATE-TIME. ffmpeg
-    # writes one per segment, between the EXTINF line and the .ts name,
-    # so we just scan until we find the first occurrence.
+    # Anchor wall time: parse the first #EXT-X-PROGRAM-DATE-TIME.
     first_pdt = None
     try:
         from datetime import datetime
@@ -4226,20 +4412,23 @@ def _live_ads_analyze(slug):
     all_segs = sorted(ch_dir.glob("seg_*.ts"))
     if len(all_segs) < 120:      # at least ~2 min of segments
         return False
-    # Skip if no new segments since last run — the result would be
-    # identical and comskip on the same bytes produces the same ads.
-    latest_name = all_segs[-1].name
-    with _live_ads_lock:
-        prev = _live_ads.get(slug) or {}
-    if prev.get("latest_seg") == latest_name:
-        return False
-    # Concatenating the full 1-2 h buffer blows past the 180 s ffmpeg
-    # timeout (thousands of file-open syscalls even with -c copy). 30
-    # min is plenty to spot a commercial pattern; we shift the PDT
-    # anchor to the first retained segment (segments are 1 s each).
-    WINDOW_SEGS = 1800
-    segs = all_segs[-WINDOW_SEGS:] if len(all_segs) > WINDOW_SEGS else all_segs
-    first_pdt += (len(all_segs) - len(segs)) * SEGMENT_TIME
+    # Determine scan window.
+    if window_end_seg is not None:
+        end_idx = next((i for i, p in enumerate(all_segs)
+                        if p.name == window_end_seg), len(all_segs))
+        end_idx = min(end_idx + 1, len(all_segs))
+    else:
+        end_idx = len(all_segs)
+    start_idx = max(0, end_idx - window_size)
+    segs = all_segs[start_idx:end_idx]
+    latest_name = segs[-1].name if segs else all_segs[-1].name
+    # For live-edge scans, short-circuit if nothing new.
+    if window_end_seg is None:
+        with _live_ads_lock:
+            prev = _live_ads.get(slug) or {}
+        if prev.get("latest_seg") == latest_name:
+            return False
+    first_pdt += start_idx * SEGMENT_TIME
     work = ch_dir / ".adskip"
     work.mkdir(exist_ok=True)
     for f in work.glob("*.txt"):
@@ -4274,15 +4463,31 @@ def _live_ads_analyze(slug):
     except Exception as e:
         print(f"[{slug}] adskip comskip: {e}", flush=True)
     ads_sec = _rec_parse_comskip(work)
+    ads_sec = _blackframe_extend_ads(str(merged), ads_sec,
+                                       channel_slug=slug)
     merged.unlink(missing_ok=True)
     # Convert frame-based seconds (relative to concat start) to wall
     ads_wall = [[round(first_pdt + a, 1), round(first_pdt + b, 1)]
                 for a, b in ads_sec]
+    # Keep ads from previous scans that lie OUTSIDE the current scan
+    # window (either before it starts or after it ends). Drop anything
+    # older than the 2 h DVR buffer.
+    buffer_cutoff = time.time() - WINDOW_SECONDS
+    scan_start = first_pdt
+    scan_end = first_pdt + len(segs) * SEGMENT_TIME
     with _live_ads_lock:
-        _live_ads[slug] = {"generated": time.time(), "ads": ads_wall,
+        prev = _live_ads.get(slug, {}).get("ads", [])
+    retained = [a for a in prev
+                if (a[1] <= scan_start or a[0] >= scan_end)
+                and a[1] > buffer_cutoff]
+    merged_ads = sorted(retained + ads_wall)
+    with _live_ads_lock:
+        _live_ads[slug] = {"generated": time.time(), "ads": merged_ads,
                             "latest_seg": latest_name}
     save_live_ads()
-    print(f"[{slug}] adskip: {len(ads_wall)} blocks found", flush=True)
+    print(f"[{slug}] adskip: {len(ads_wall)} new, "
+          f"{len(retained)} retained, {len(merged_ads)} total",
+          flush=True)
     return True
 
 
@@ -4339,15 +4544,27 @@ def _live_adskip_loop():
 
 @app.route("/api/live-ads/<slug>/scan", methods=["POST"])
 def api_live_ads_scan(slug):
-    """Force an ad-detection pass on this channel's current live
-    buffer (bypasses the 12-min cache). Useful for testing."""
+    """Force an ad-detection pass across the whole current live buffer
+    in 25-min chunks. Each chunk's result is merged into the cache so
+    older ad blocks aren't lost when the next chunk runs."""
     if slug not in LIVE_ADSKIP_SLUGS:
         return _cors(Response(json.dumps({"skipped": True,
                                            "reason": "not in commercial list"}),
                                mimetype="application/json"))
     def run():
         try:
-            _live_ads_analyze(slug)
+            ch_dir = HLS_DIR / slug
+            all_segs = sorted(ch_dir.glob("seg_*.ts"))
+            CHUNK = 1800
+            STEP = 1500  # overlap by 5 min so blocks at chunk edges aren't missed
+            end_idx = len(all_segs)
+            while end_idx > 120:
+                anchor = all_segs[end_idx - 1].name
+                _live_ads_analyze(slug, window_end_seg=anchor,
+                                   window_size=CHUNK)
+                end_idx -= STEP
+                if end_idx <= 0:
+                    break
         except Exception as e:
             print(f"[{slug}] manual adskip: {e}", flush=True)
     threading.Thread(target=run, daemon=True).start()
@@ -4488,9 +4705,34 @@ def recording_ads(uuid):
     out_dir = HLS_DIR / f"_rec_{uuid}"
     cskip_info = _rec_cskip_procs.get(uuid)
     running = cskip_info is not None and cskip_info["proc"].poll() is None
-    ads = _rec_parse_comskip(out_dir) if out_dir.exists() else []
-    return _cors(Response(json.dumps({"ads": ads, "running": running}),
-                           mimetype="application/json"))
+    if not out_dir.exists():
+        ads = []
+    else:
+        ads_cache = out_dir / "ads.json"
+        txts = list(out_dir.glob("*.txt"))
+        txt_mtime = max((t.stat().st_mtime for t in txts), default=0)
+        if (not running and txts
+                and ads_cache.exists()
+                and ads_cache.stat().st_mtime >= txt_mtime):
+            try:
+                ads = json.loads(ads_cache.read_text())
+            except Exception:
+                ads = _rec_parse_comskip(out_dir)
+        else:
+            ads = _rec_parse_comskip(out_dir)
+            if not running and ads:
+                src = _rec_source_path(uuid)
+                if src and Path(src).exists():
+                    ads = _blackframe_extend_ads(
+                        src, ads, channel_slug=_rec_channel_slug(uuid))
+                try:
+                    ads_cache.write_text(json.dumps(ads))
+                except Exception:
+                    pass
+    resp = _cors(Response(json.dumps({"ads": ads, "running": running}),
+                            mimetype="application/json"))
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
 
 
 @app.route("/recording/<uuid>/progress")
@@ -5212,6 +5454,10 @@ def _file_watcher_loop():
 
 if __name__ == "__main__":
     HLS_DIR.mkdir(parents=True, exist_ok=True)
+    try:
+        COMSKIP_INI.write_text(COMSKIP_INI_TEXT)
+    except Exception as e:
+        print(f"comskip.ini write: {e}", flush=True)
     load_codec_cache()
     load_stats()
     load_epg_archive()
