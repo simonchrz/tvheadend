@@ -1410,7 +1410,8 @@ def epg_grid():
             f"        const avail=new Date(m.match.available_to*1000);"
             f"        const dStr=String(avail.getDate()).padStart(2,'0')+'.'"
             f"+String(avail.getMonth()+1).padStart(2,'0');"
-            f"        const mtBtn={{label:'Aus ARD Mediathek (bis '+dStr+')',"
+            f"        const srcLabel=m.match.source==='zdf'?'ZDF':'ARD';"
+            f"        const mtBtn={{label:'Aus '+srcLabel+' Mediathek (bis '+dStr+')',"
             f"value:'mediathek'}};"
             # Past events: "Jetzt abspielen" (primary, direct playback,
             # nothing persisted) plus "Aus Mediathek speichern" (save
@@ -1426,7 +1427,7 @@ def epg_grid():
             # can do, show a brief note and bail.
             f"        release();"
             f"        lpDialog({{msg:'Sendung ist bereits ausgestrahlt "
-            f"und in der ARD Mediathek nicht (mehr) verfügbar.',"
+            f"und in der Mediathek nicht (mehr) verfügbar.',"
             f"          buttons:[{{label:'OK',value:'',primary:true}}]}});"
             f"        return;"
             f"      }}"
@@ -2978,6 +2979,7 @@ ARD_SEARCH_CHANNELS = {
     "das-erste-hd", "tagesschau24-hd", "rbb-berlin-hd",
     "arte-hd", "kika-hd", "3sat-hd",
 }
+ZDF_SEARCH_CHANNELS = {"zdf-hd"}
 
 
 @app.route("/api/mediathek-lookup/<event_id>")
@@ -3025,79 +3027,104 @@ def api_mediathek_lookup(event_id):
     if not title:
         return _cors(Response(json.dumps({"match": None}),
                                mimetype="application/json"))
-    # Only query Mediathek for channels we know it covers — keeps the
-    # match rate honest and avoids pestering the ARD API for RTL shows.
+    # Pick the Mediathek API based on channel. ARD covers Das Erste +
+    # regional + arte/KiKA/3sat; ZDF covers ZDF. Branch early so we
+    # don't ping ARD for a ZDF show and vice versa.
     slug = slugify(ch_name)
-    if slug not in ARD_SEARCH_CHANNELS:
+    if slug in ARD_SEARCH_CHANNELS:
+        source = "ard"
+    elif slug in ZDF_SEARCH_CHANNELS:
+        source = "zdf"
+    else:
         return _cors(Response(json.dumps({
-            "match": None, "reason": "channel not in ARD coverage"}),
+            "match": None, "reason": "channel not covered"}),
             mimetype="application/json"))
-    qs = urllib.parse.urlencode({
-        "searchString": title,
-        "searchResultsPageSize": "24",
-    })
-    search_url = (f"https://api.ardmediathek.de/page-gateway/pages/ard/"
-                  f"search?{qs}")
-    data = None
-    for attempt in range(2):
-        try:
-            data = json.loads(urllib.request.urlopen(
-                search_url, timeout=15).read())
-            break
-        except Exception as e:
-            print(f"mediathek search (try {attempt+1}): {e}", flush=True)
-    if data is None:
-        return _cors(Response(json.dumps({
-            "match": None, "error": "mediathek search timeout"}),
-            mimetype="application/json"))
-    best = None
     from datetime import datetime
-    title_l = title.lower()
-    # Broadcast date must land within ±48h of the DVB event. Mediathek
-    # returns every clip/archive result matching the title otherwise,
-    # which drowns the true pre-/post-release episode in noise.
     MAX_DELTA = 48 * 3600
-    for v in data.get("vodResults", []):
-        svc = (v.get("publicationService") or {}).get("name", "")
-        # Title match: the mediathek title often appends episode info
-        # ("Tatort - Der dunkle Ort"); accept substring either way.
-        vt = (v.get("longTitle") or v.get("mediumTitle") or "").strip()
-        vt_l = vt.lower()
-        if title_l not in vt_l and vt_l not in title_l:
-            continue
-        bt = 0
-        if v.get("broadcastedOn"):
+    title_l = title.lower()
+    best = None
+    if source == "ard":
+        qs = urllib.parse.urlencode({
+            "searchString": title,
+            "searchResultsPageSize": "24",
+        })
+        search_url = (f"https://api.ardmediathek.de/page-gateway/pages/ard/"
+                      f"search?{qs}")
+        data = None
+        for attempt in range(2):
             try:
-                bt = int(datetime.fromisoformat(
-                    v["broadcastedOn"].replace("Z", "+00:00")).timestamp())
-            except Exception:
-                pass
-        if not bt or not start_ts:
-            continue
-        delta = abs(bt - start_ts)
-        if delta > MAX_DELTA:
-            continue
-        if best is None or delta < best["_delta"]:
-            avail_to = 0
-            if v.get("availableTo"):
+                data = json.loads(urllib.request.urlopen(
+                    search_url, timeout=15).read())
+                break
+            except Exception as e:
+                print(f"mediathek search (try {attempt+1}): {e}",
+                      flush=True)
+        if data is None:
+            return _cors(Response(json.dumps({
+                "match": None, "error": "mediathek search timeout"}),
+                mimetype="application/json"))
+        for v in data.get("vodResults", []):
+            svc = (v.get("publicationService") or {}).get("name", "")
+            vt = (v.get("longTitle") or v.get("mediumTitle") or "").strip()
+            vt_l = vt.lower()
+            if title_l not in vt_l and vt_l not in title_l:
+                continue
+            bt = 0
+            if v.get("broadcastedOn"):
                 try:
-                    avail_to = int(datetime.fromisoformat(
-                        v["availableTo"].replace("Z", "+00:00")).timestamp())
+                    bt = int(datetime.fromisoformat(
+                        v["broadcastedOn"].replace("Z", "+00:00")).timestamp())
                 except Exception:
                     pass
-            best = {
-                "_delta": delta,
-                "title": vt,
-                "channel": svc,
-                "broadcast": bt,
-                "available_to": avail_to,
-                "duration": v.get("duration", 0),
-                "id": v.get("id"),
-                "player_url": f"https://www.ardmediathek.de/video/{v.get('id')}",
-            }
+            if not bt or not start_ts or abs(bt - start_ts) > MAX_DELTA:
+                continue
+            delta = abs(bt - start_ts)
+            if best is None or delta < best["_delta"]:
+                avail_to = 0
+                if v.get("availableTo"):
+                    try:
+                        avail_to = int(datetime.fromisoformat(
+                            v["availableTo"].replace("Z", "+00:00")).timestamp())
+                    except Exception:
+                        pass
+                best = {
+                    "_delta": delta, "source": "ard",
+                    "title": vt, "channel": svc,
+                    "broadcast": bt, "available_to": avail_to,
+                    "duration": v.get("duration", 0),
+                    "id": v.get("id"),
+                    "player_url": f"https://www.ardmediathek.de/video/{v.get('id')}",
+                }
+    else:  # zdf
+        for r in _zdf_search(title):
+            rt = (r.get("title") or "").lower()
+            if title_l not in rt and rt not in title_l:
+                continue
+            if not r["broadcast_ts"] or not start_ts:
+                continue
+            delta = abs(r["broadcast_ts"] - start_ts)
+            if delta > MAX_DELTA:
+                continue
+            if best is None or delta < best["_delta"]:
+                # ZDF search doesn't return availableTo on its own — we
+                # fill it in from the item detail during HLS resolve.
+                best = {
+                    "_delta": delta, "source": "zdf",
+                    "title": r["title"], "channel": "ZDF",
+                    "broadcast": r["broadcast_ts"], "available_to": 0,
+                    "duration": r["duration"],
+                    "id": r["id"],
+                    "player_url": f"https://www.zdf.de/play/{r['id']}",
+                }
     if not best:
         return _cors(Response(json.dumps({"match": None}),
                                mimetype="application/json"))
+    # For ZDF, backfill available_to via the item detail (cheap — one
+    # extra call, only when we actually have a match).
+    if best["source"] == "zdf" and not best["available_to"]:
+        _, vis_to = _zdf_resolve_hls(best["id"])
+        if vis_to:
+            best["available_to"] = vis_to
     best.pop("_delta", None)
     return _cors(Response(json.dumps({"match": best}),
                            mimetype="application/json"))
@@ -3163,7 +3190,8 @@ def api_mediathek_schedule(event_id):
         return Response(json.dumps({"ok": False,
                                      "error": "no mediathek match"}),
                         status=404, mimetype="application/json")
-    hls_url = _resolve_mediathek_hls(match["id"])
+    hls_url = _resolve_mediathek_hls(match["id"],
+                                       source=match.get("source", "ard"))
     if not hls_url:
         return Response(json.dumps({"ok": False,
                                      "error": "no hls url"}),
@@ -3752,10 +3780,111 @@ def save_mediathek_rec():
         print(f"save mediathek recordings: {e}", flush=True)
 
 
-def _resolve_mediathek_hls(item_id):
-    """Given an ARD Mediathek item id (from search), fetch the detail
-    page and pick out the adaptive HLS master playlist URL. The ARD
-    item endpoint is occasionally slow (>6s); retry once on timeout."""
+def _zdf_search(title):
+    """Search ZDF Mediathek for episodes matching `title`. Returns a
+    list of dicts {id, title, broadcast_ts, available_to, duration}."""
+    qs = urllib.parse.urlencode({
+        "q": title, "contentTypes": "episode", "limit": "24",
+    })
+    url = f"https://api.zdf.de/search/documents?{qs}"
+    req = urllib.request.Request(url, headers={
+        "api-auth": f"Bearer {ZDF_API_TOKEN}",
+    })
+    from datetime import datetime
+    out = []
+    for attempt in range(2):
+        try:
+            data = json.loads(urllib.request.urlopen(req, timeout=15).read())
+            for r in data.get("http://zdf.de/rels/search/results", []):
+                t = r.get("http://zdf.de/rels/target", {})
+                ed = t.get("editorialDate") or ""
+                bt = 0
+                if ed:
+                    try:
+                        bt = int(datetime.fromisoformat(
+                            ed.replace("Z", "+00:00")).timestamp())
+                    except Exception:
+                        pass
+                out.append({
+                    "id": t.get("id"),
+                    "title": t.get("teaserHeadline") or t.get("title") or "",
+                    "broadcast_ts": bt,
+                    "available_to": 0,   # filled in from item details on demand
+                    "duration": t.get("duration", 0),
+                })
+            return out
+        except Exception as e:
+            print(f"zdf search (try {attempt+1}): {e}", flush=True)
+    return out
+
+
+def _zdf_resolve_hls(canonical_id):
+    """Given a ZDF search id (e.g. 'heute-journal-vom-19-april-2026-100'),
+    walk content doc → ptmd template → manifest → HLS URL. Also
+    returns the `visibleTo` expiry so the caller can use it as
+    available_to if the search result didn't have it."""
+    req = urllib.request.Request(
+        f"https://api.zdf.de/content/documents/{canonical_id}.json",
+        headers={"api-auth": f"Bearer {ZDF_API_TOKEN}"})
+    try:
+        item = json.loads(urllib.request.urlopen(req, timeout=15).read())
+    except Exception as e:
+        print(f"zdf item: {e}", flush=True)
+        return None, 0
+    mvc = (item.get("mainVideoContent") or {}).get(
+        "http://zdf.de/rels/target") or {}
+    tmpl = mvc.get("http://zdf.de/rels/streams/ptmd-template", "")
+    vis_to = 0
+    from datetime import datetime
+    if mvc.get("visibleTo"):
+        try:
+            vis_to = int(datetime.fromisoformat(
+                mvc["visibleTo"].replace("Z", "+00:00")).timestamp())
+        except Exception:
+            pass
+    if not tmpl:
+        return None, vis_to
+    ptmd_url = ("https://api.zdf.de"
+                + tmpl.replace("{playerId}", "ngplayer_2_4"))
+    req = urllib.request.Request(ptmd_url, headers={
+        "api-auth": f"Bearer {ZDF_API_TOKEN}"})
+    try:
+        ptmd = json.loads(urllib.request.urlopen(req, timeout=15).read())
+    except Exception as e:
+        print(f"zdf ptmd: {e}", flush=True)
+        return None, vis_to
+    # Walk priorityList → formitaeten → qualities → audio/tracks → uri
+    import re
+    hls_url = None
+    for pri in ptmd.get("priorityList", []):
+        for f in pri.get("formitaeten", []):
+            if f.get("type") != "hls":
+                continue
+            for q in f.get("qualities", []):
+                for a in q.get("audio", {}).get("tracks", []):
+                    u = a.get("uri") or ""
+                    if ".m3u8" in u:
+                        hls_url = u
+                        break
+                if hls_url: break
+            if hls_url: break
+        if hls_url: break
+    if not hls_url:
+        # Fallback: scan the whole response for any m3u8
+        m = re.search(r'https?://[^"\s]+\.m3u8[^"\s]*', json.dumps(ptmd))
+        if m:
+            hls_url = m.group(0)
+    return hls_url, vis_to
+
+
+def _resolve_mediathek_hls(item_id, source="ard"):
+    """Resolve an HLS master URL for a Mediathek match. Dispatches on
+    `source`: ARD uses the page-gateway item endpoint, ZDF uses the
+    PTMD manifest chain. ARD's item endpoint is occasionally slow
+    (>6 s); retry once on timeout."""
+    if source == "zdf":
+        hls, _ = _zdf_resolve_hls(item_id)
+        return hls
     url = (f"https://api.ardmediathek.de/page-gateway/pages/ard/"
            f"item/{item_id}?devicetype=pc&embedded=true")
     for attempt in range(2):
@@ -4272,7 +4401,8 @@ def mediathek_play(event_id):
         abort(502, f"lookup: {e}")
     if not match or not match.get("id"):
         abort(404, "no mediathek match")
-    hls_url = _resolve_mediathek_hls(match["id"])
+    hls_url = _resolve_mediathek_hls(match["id"],
+                                       source=match.get("source", "ard"))
     if not hls_url:
         abort(502, "no hls url")
     entry = {
