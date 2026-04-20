@@ -112,19 +112,35 @@ code {
 ul.tools { line-height: 1.8; padding-left: 1.2em; }
 ul.channels {
     list-style: none; padding: 0; margin: 0;
-    display: grid; grid-template-columns: repeat(auto-fill, minmax(110px, 1fr));
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(var(--tile-min, 110px), 1fr));
     gap: 10px;
 }
+ul.channels .logo {
+    width: var(--logo-w, 80px); height: var(--logo-h, 60px);
+}
+body.tile-sm { --tile-min: 80px; --logo-w: 60px; --logo-h: 45px; }
+body.tile-lg { --tile-min: 150px; --logo-w: 110px; --logo-h: 82px; }
 ul.channels li {
     position: relative;
-    display: flex; align-items: center; justify-content: center;
-    padding: 12px 6px;
+    display: flex; flex-direction: column; align-items: center;
+    justify-content: flex-start; gap: 6px;
+    padding: 12px 6px 8px;
     border: 1px solid var(--border); border-left-width: 4px;
     border-radius: 8px;
     background: var(--stripe);
 }
+.now-title {
+    font-size: .72em; line-height: 1.2; color: var(--muted);
+    text-align: center;
+    display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical;
+    overflow: hidden;
+    word-break: break-word;
+    max-width: 100%;
+    min-height: 0;
+}
+.now-title:empty { display: none; }
 ul.channels .logo {
-    width: 80px; height: 60px;
     display: flex; align-items: center; justify-content: center;
     background: #9a9a9a; border-radius: 6px; overflow: hidden;
     transition: background .2s;
@@ -801,6 +817,40 @@ def ffmpeg_watchdog_loop():
         time.sleep(30)
 
 
+def state_backup_loop():
+    """Copy the important JSON state files from /mnt/tv (SSD) to a
+    tiny backup dir inside the container image's writeable mount
+    every 10 min. Protects against SSD failure: if the disk drops
+    out, .always_warm.json, .mediathek_recordings.json etc. still
+    survive and can be restored manually."""
+    import shutil as _sh
+    targets = [
+        ".always_warm.json",
+        ".mediathek_recordings.json",
+        ".usage_stats.json",
+        ".live_ads.json",
+        ".codec_cache.json",
+    ]
+    backup_dir = Path("/state-backup")
+    if not backup_dir.exists():
+        # Mount not configured — silently no-op instead of crashing.
+        return
+    time.sleep(60)
+    while True:
+        try:
+            for name in targets:
+                src = HLS_DIR / name
+                if not src.exists():
+                    continue
+                try:
+                    _sh.copy2(src, backup_dir / name)
+                except Exception as e:
+                    print(f"[state-backup] {name}: {e}", flush=True)
+        except Exception as e:
+            print(f"state-backup loop: {e}", flush=True)
+        time.sleep(600)
+
+
 def disk_cleanup_loop():
     """When /mnt/tv falls below DISK_MIN_FREE_GB, delete the oldest
     `_rec_<uuid>/` HLS-VOD remux directories (LRU by mtime) until
@@ -916,6 +966,7 @@ def index():
             f'<button class="pin-btn" data-slug="{s}" title="Dauer-warm">📌</button>'
             f'<a class="logo" href="{watch_url}">{logo}</a>'
             f'<span class="buffer-bar" data-slug="{s}"></span>'
+            f'<span class="now-title" data-slug="{s}"></span>'
             f'</li>')
     tools = [
         ("Alle Kanäle als M3U (für IPTV-Apps)", f"{HOST_URL}/playlist.m3u"),
@@ -963,6 +1014,11 @@ def index():
         ".tuner-badge.tight{background:#e67e22}"
         ".tuner-badge.full{background:#c0392b}"
         ".host-badges{display:flex;flex-wrap:wrap;gap:6px;margin:-4px 0 12px}"
+        ".channels-head{display:flex;align-items:center;gap:10px}"
+        ".tile-size-btn{background:transparent;border:1px solid var(--border);"
+        "border-radius:6px;padding:2px 9px;cursor:pointer;font-size:.9em;"
+        "color:var(--muted);line-height:1}"
+        ".tile-size-btn:hover{background:var(--stripe)}"
         ".quick-links{display:flex;gap:10px;margin:16px 0 24px}"
         ".quick-links a{flex:1;background:var(--stripe);border:1px solid var(--border);"
         "border-radius:10px;padding:14px 16px;display:flex;flex-direction:column;"
@@ -997,6 +1053,11 @@ def index():
         "    const scanSlug=d.adskip_slug||null;"
         "    for(const li of document.querySelectorAll('ul.channels li')){"
         "      li.classList.toggle('scanning',li.dataset.slug===scanSlug);"
+        "    }"
+        "    for(const nt of document.querySelectorAll('.now-title')){"
+        "      const s=nt.dataset.slug;"
+        "      const e=d.channels[s];"
+        "      nt.textContent=e&&e.now?e.now:'';"
         "    }"
         "    for(const bar of document.querySelectorAll('.buffer-bar')){"
         "      const s=bar.dataset.slug;"
@@ -1171,6 +1232,23 @@ def index():
         "document.addEventListener('click',ev=>{"
         "  if(lpFired){ev.preventDefault();ev.stopPropagation();lpFired=false;}"
         "},true);"
+        # Tile-size toggle: cycles through sm/md/lg, persisted.
+        "(function(){"
+        "  const sizes=['md','sm','lg'];"
+        "  const icons={sm:'⊡',md:'⊟',lg:'⊞'};"
+        "  let cur=localStorage.getItem('tile-size')||'md';"
+        "  const apply=()=>{"
+        "    document.body.classList.remove('tile-sm','tile-lg');"
+        "    if(cur!=='md')document.body.classList.add('tile-'+cur);"
+        "    const btn=document.getElementById('tile-size');"
+        "    if(btn)btn.textContent=icons[cur]||'⊟';"
+        "  };"
+        "  apply();"
+        "  document.getElementById('tile-size').addEventListener('click',()=>{"
+        "    cur=sizes[(sizes.indexOf(cur)+1)%sizes.length];"
+        "    localStorage.setItem('tile-size',cur);apply();"
+        "  });"
+        "})();"
         "refreshWarm();setInterval(refreshWarm,5000);"
     )
     body = (f"<html><head><meta name='viewport' "
@@ -1190,7 +1268,9 @@ def index():
             f"<a href='{HOST_URL}/epg'><span>📅</span>Programm<small>EPG-Guide + Chapter-Ticks</small></a>"
             f"<a href='{HOST_URL}/recordings'><span>📼</span>Aufnahmen<small>DVR + Mediathek-Recordings</small></a>"
             f"</div>"
-            f"<h2>Kanäle</h2>"
+            f"<h2 class='channels-head'>Kanäle"
+            f" <button id='tile-size' class='tile-size-btn' "
+            f"title='Kachelgröße umschalten'>⊟</button></h2>"
             f"<ul class='channels'>{''.join(rows)}</ul>"
             f"<h2 class='tools-head'>Tools</h2>"
             f"<ul class='tools'>{tool_rows}</ul>"
@@ -1592,6 +1672,12 @@ def epg_grid():
             f".auto-refresh{{display:inline-flex;align-items:center;gap:.35em;"
             f"font-size:.85em;color:var(--muted);cursor:pointer;user-select:none}}"
             f".auto-refresh input{{accent-color:#1565c0;cursor:pointer}}"
+            f".epg-search{{padding:4px 10px;border-radius:6px;"
+            f"border:1px solid var(--border);background:var(--stripe);"
+            f"color:var(--fg);font-size:16px;min-width:180px}}"
+            f".epg-event.filter-hidden{{opacity:.15;pointer-events:none}}"
+            f".epg-event.filter-match{{outline:2px solid #f1c40f;"
+            f"outline-offset:-2px;z-index:5}}"
             f"</style></head><body>"
             f"<h1>Programm</h1>"
             f"<p><a href='{HOST_URL}/'>← Kanäle</a> · "
@@ -1601,6 +1687,8 @@ def epg_grid():
             f"▶︎ Jetzt</a>"
             f"<a class='btn-now' href='#' onclick='jumpPrime();return false'>"
             f"🕗 20:15</a>"
+            f"<input type='search' id='epg-search' placeholder='🔍 Titel filtern…' "
+            f"class='epg-search'>"
             f"<label class='auto-refresh' title='Seite alle 60 s neu laden'>"
             f"<input type='checkbox' id='auto-refresh'>"
             f"<span>🔄 Auto 60s</span></label>"
@@ -1620,6 +1708,25 @@ def epg_grid():
             f"function jumpPrime(){{"
             f"  const w=document.getElementById('tlscroll');"
             f"  if(w)w.scrollTo({{left:Math.max(0,PRIME_PX-100),behavior:'smooth'}});"
+            f"}}"
+            # Title filter: dim non-matching events, highlight matches.
+            f"function filterEpg(q){{"
+            f"  q=(q||'').trim().toLowerCase();"
+            f"  const evs=document.querySelectorAll('.epg-event');"
+            f"  for(const el of evs){{"
+            f"    el.classList.remove('filter-hidden','filter-match');"
+            f"    if(!q)continue;"
+            f"    const t=(el.textContent||'').toLowerCase();"
+            f"    if(t.includes(q)){{el.classList.add('filter-match');}}"
+            f"    else{{el.classList.add('filter-hidden');}}"
+            f"  }}"
+            f"}}"
+            f"const searchBox=document.getElementById('epg-search');"
+            f"if(searchBox){{"
+            f"  searchBox.addEventListener('input',ev=>filterEpg(ev.target.value));"
+            f"  const url=new URL(location.href);"
+            f"  const initial=url.searchParams.get('q');"
+            f"  if(initial){{searchBox.value=initial;filterEpg(initial);}}"
             f"}}"
             f"const LP_MS=500, LP_MOVE=10;"
             f"let lpTimer=null,lpX=0,lpY=0,lpEl=null,lpFired=false;"
@@ -2119,6 +2226,7 @@ body{{touch-action:pan-y}}
   padding:2px 8px;border-radius:10px;background:#7a7a7a;color:#fff;
   vertical-align:1px}}
 #srcbadge.mediathek{{background:#2980b9}}
+#srcbadge.rec{{background:#c0392b}}
 #srcbadge.at-live{{background:#27ae60}}
 #unmute{{position:fixed;left:50%;top:50%;transform:translate(-50%,-50%);
   z-index:30;background:#fff;color:#000;padding:14px 22px;
@@ -2181,6 +2289,7 @@ const unmuteBtn=document.getElementById('unmute');
 const liveBtn=document.getElementById('liveBtn');
 const srcBadge=document.getElementById('srcbadge');
 function setSource(which){{
+  srcBadge.classList.remove('mediathek','at-live','rec');
   if(which==='mediathek'){{
     const ch=channels[idx];
     const slug=(ch&&ch.slug)||current||'';
@@ -2190,10 +2299,11 @@ function setSource(which){{
     else if(slug==='kika-hd')label='KiKA';
     srcBadge.textContent=label;
     srcBadge.classList.add('mediathek');
-    srcBadge.classList.remove('at-live');
+  }} else if(which==='rec'){{
+    srcBadge.textContent='● Aufnahme';
+    srcBadge.classList.add('rec');
   }} else {{
     srcBadge.textContent='Live';
-    srcBadge.classList.remove('mediathek');
   }}
 }}
 function updateLiveBadge(){{
@@ -2222,7 +2332,11 @@ function isAtLive(){{
 }}
 /* Scrub bar coordinate system: fixed 2h window ending at "now".
    Both seekable content and chapter markers are mapped into it. */
+let recWindow=null;   /* [start_ts, stop_ts] when onRecording */
 function scrubWindow(){{
+  if(onRecording&&recWindow){{
+    return [recWindow[0],recWindow[1]];
+  }}
   const now=Date.now()/1000;
   return [now-WINDOW,now];
 }}
@@ -2263,17 +2377,15 @@ v.addEventListener('progress',()=>{{refresh();renderChapters();}});
 v.addEventListener('loadeddata',()=>{{refresh();renderChapters();}});
 v.addEventListener('canplay',()=>{{refresh();renderChapters();}});
 v.addEventListener('loadedmetadata',()=>{{
-  if(!onMediathek)goLive();
+  if(!onMediathek&&!onRecording)goLive();
   refresh();renderChapters();
 }});
 setInterval(()=>{{if(!v.paused)renderChapters();}},5000);
 setInterval(()=>{{if(current)loadLiveAds(current);}},300000);
 function goLive(){{
-  if(onMediathek){{
-    onMediathek=false;
-    setSource('live');
-    destroyHls();
-    v.src=localSrc();v.load();
+  if(onMediathek||onRecording){{
+    onMediathek=false;onRecording=false;recWindow=null;
+    loadDvbcSrc(current);
     v.addEventListener('loadedmetadata',()=>{{
       const[,e]=seekableRange();
       if(e>0)v.currentTime=e-2;
@@ -2284,13 +2396,29 @@ function goLive(){{
   const[,e]=seekableRange();
   if(e>0)v.currentTime=e-2;
 }}
+let onRecording=false;
+/* When the recording-VOD ends (player reached its final segment),
+   switch back to the live stream. Guard against spurious events
+   during source swaps by requiring currentTime near duration. */
+v.addEventListener('ended',()=>{{
+  if(!onRecording)return;
+  const dur=v.duration;
+  if(!isFinite(dur)||dur<=0)return;
+  if(Math.abs(v.currentTime-dur)>2)return;
+  goLive();
+}});
 /* Safari HLS exposes getStartDate() = wall-clock time of currentTime=0
    (from #EXT-X-PROGRAM-DATE-TIME). That gives reliable mapping between
    video time and real-world time. Fallback: Date.now() - (end-ct). */
 function wallAt(t){{
+  if(onRecording&&recWindow){{
+    return recWindow[0]+(t||0);
+  }}
   if(typeof v.getStartDate==='function'){{
     const d=v.getStartDate();
-    if(d&&!isNaN(d.getTime()))return d.getTime()/1000+t;
+    /* Safari returns epoch-0 before the playlist is loaded — filter
+       out anything before 2020 as "not yet available". */
+    if(d&&d.getTime()>1577836800000)return d.getTime()/1000+t;
   }}
   const[,e]=seekableRange();
   return Date.now()/1000-(e-t);
@@ -2300,7 +2428,17 @@ function posForWall(ts){{
   if(ts<ws||ts>we)return null;
   return ((ts-ws)/(we-ws))*100;
 }}
-function wallForCurrent(){{return wallAt(v.currentTime||0);}}
+function wallForCurrent(){{
+  /* iOS Safari on a live HLS stream initially reports currentTime as
+     Number.MAX_VALUE until the player actually settles to a position
+     — clamp to the seekable live edge so wallAt doesn't overflow. */
+  let t=v.currentTime;
+  if(!isFinite(t)||t>1e10){{
+    const[,e]=seekableRange();
+    t=e>0?e-1:0;
+  }}
+  return wallAt(t||0);
+}}
 let epgEvents=[];
 let mediathekAvailable=false;
 let mediathekWindow=0;
@@ -2406,27 +2544,107 @@ function currentEvent(){{
 }}
 let onMediathek=false;
 function localSrc(){{return HOST+'/hls/'+current+'/dvr.m3u8';}}
-function goShowStart(){{
-  const ev=currentEvent();
-  if(!ev)return;
+function showHintMsg(msg,ms){{
+  hint.textContent=msg;hint.classList.add('show');
+  setTimeout(()=>hint.classList.remove('show'),ms||2500);
+}}
+async function goShowStart(){{
+  let ev=currentEvent();
+  if(!ev){{
+    /* EPG not loaded yet — fetch synchronously and retry. */
+    showHintMsg('EPG wird geladen…',4000);
+    try{{
+      const r=await fetch(HOST+'/api/events/'+current+'?back=7200&fwd=1800');
+      const d=await r.json();
+      epgEvents=d.events||[];renderChapters();
+    }}catch(e){{}}
+    ev=currentEvent();
+    if(!ev){{showHintMsg('Kein EPG-Event gefunden');return;}}
+  }}
   const[s,e]=seekableRange();
   const wallS=wallAt(s);
   const offset=ev.start-wallS;
   if(offset>=0&&e>s){{
     v.currentTime=Math.max(s+0.5,Math.min(e-1,offset));show();return;
   }}
-  /* Local buffer doesn't reach back that far — try public
-     Mediathek HLS as a fallback. */
-  fetch(HOST+'/api/mediathek-live/'+current)
-   .then(r=>r.json()).then(d=>{{
-     if(!d.url){{
-       hint.textContent='Sendungsanfang außerhalb Puffer';
-       hint.classList.add('show');
-       setTimeout(()=>hint.classList.remove('show'),2000);
+  /* Local buffer doesn't reach back that far. Try:
+     1) tvheadend recording currently running on this channel (has
+        whatever was broadcast since recording start)
+     2) public Mediathek HLS (public broadcasters only) */
+  showHintMsg('Suche Aufnahme…',4000);
+  fetch(HOST+'/api/recording-window/'+current)
+   .then(r=>r.json()).then(rec=>{{
+     if(rec&&rec.hls_url&&rec.start<=ev.start){{
+       switchToRecording(rec,ev.start);
        return;
      }}
-     switchToMediathek(d.url,ev.start);
-   }}).catch(()=>{{}});
+     fetch(HOST+'/api/mediathek-live/'+current)
+      .then(r=>r.json()).then(d=>{{
+        if(!d.url){{
+          showHintMsg('Sendungsanfang außerhalb Puffer');
+          return;
+        }}
+        switchToMediathek(d.url,ev.start);
+      }}).catch(()=>{{showHintMsg('Mediathek-Fehler');}});
+   }}).catch(err=>{{showHintMsg('Recording-Fehler: '+err);}});
+}}
+function switchToRecording(rec,wallStartTs){{
+  /* Load the tvheadend recording as the active HLS source.
+     Poll /progress first — the playlist is 202-pending until
+     ffmpeg has remuxed ~10 segments. Seek offset = wall-time of
+     target minus recording-start wall time. */
+  destroyHls();
+  onMediathek=false;
+  onRecording=true;
+  recWindow=[rec.start,rec.stop];
+  setSource('rec');
+  const offset=Math.max(0,wallStartTs-rec.start);
+  hint.textContent='Aufnahme wird vorbereitet…';
+  hint.classList.add('show');
+  const progUrl=HOST+'/recording/'+rec.uuid+'/progress';
+  let tries=0;
+  const waitReady=()=>{{
+    if(current!==rec.slug_at_switch&&tries>0){{
+      /* user swiped away, abort */
+      hint.classList.remove('show');return;
+    }}
+    fetch(progUrl).then(r=>r.json()).then(d=>{{
+      if(d.done||d.segments>=10){{
+        hint.classList.remove('show');
+        doRecordingLoad(rec.hls_url,offset);
+        return;
+      }}
+      if(tries++>120){{
+        hint.textContent='Aufnahme-Remux dauert zu lange';
+        setTimeout(()=>hint.classList.remove('show'),2500);
+        return;
+      }}
+      setTimeout(waitReady,1500);
+    }}).catch(()=>setTimeout(waitReady,2500));
+  }};
+  rec.slug_at_switch=current;
+  waitReady();
+  show();
+}}
+function doRecordingLoad(url,offset){{
+  const isIos=/iPad|iPhone|iPod/.test(navigator.userAgent);
+  if(!isIos&&typeof Hls!=='undefined'&&Hls.isSupported()){{
+    const hls=new Hls({{maxBufferLength:30,backBufferLength:7200,
+      renderTextTracksNatively:false,subtitleDisplay:false}});
+    hlsInst=hls;hlsCurrentUrl=url;
+    hls.loadSource(url);
+    hls.attachMedia(v);
+    hls.once(Hls.Events.LEVEL_LOADED,()=>{{
+      v.currentTime=offset;v.play().catch(()=>{{}});
+    }});
+  }} else {{
+    v.src=url;v.load();
+    const start=()=>{{
+      v.currentTime=offset;v.play().catch(()=>{{}});
+    }};
+    v.addEventListener('loadedmetadata',start,{{once:true}});
+    v.addEventListener('canplay',start,{{once:true}});
+  }}
 }}
 let hlsInst=null;
 let hlsCurrentUrl=null;
@@ -3332,6 +3550,42 @@ def api_now(slug):
     return {"title": None, "time": ""}
 
 
+@app.route("/api/recording-window/<slug>")
+def api_recording_window(slug):
+    """If tvheadend is currently recording something on this channel,
+    return the DVR uuid + wall-clock window so the live player can
+    use the recording as an extended back-buffer (before the 2 h live
+    DVR window). Returns {} if nothing is being recorded right now."""
+    with cmap_lock:
+        info = channel_map.get(slug)
+    if not info:
+        return _cors(Response(json.dumps({}), mimetype="application/json"))
+    ch_uuid = info.get("uuid")
+    try:
+        data = json.loads(urllib.request.urlopen(
+            f"{TVH_BASE}/api/dvr/entry/grid?limit=100&sort=start&dir=DESC",
+            timeout=5).read())
+    except Exception:
+        return _cors(Response(json.dumps({}), mimetype="application/json"))
+    now_ts = int(time.time())
+    for e in data.get("entries", []):
+        if e.get("channel") != ch_uuid:
+            continue
+        if not (e.get("start", 0) <= now_ts < e.get("stop", 0)):
+            continue
+        if e.get("sched_status") != "recording":
+            continue
+        uuid = e.get("uuid")
+        return _cors(Response(json.dumps({
+            "uuid": uuid,
+            "title": e.get("disp_title") or "",
+            "start": e.get("start"),
+            "stop": e.get("stop"),
+            "hls_url": f"{HOST_URL}/recording/{uuid}/index.m3u8",
+        }), mimetype="application/json"))
+    return _cors(Response(json.dumps({}), mimetype="application/json"))
+
+
 @app.route("/api/channels")
 def api_channels():
     """Ordered channel list as JSON for the Watch-player (swipe navigation)."""
@@ -3899,8 +4153,9 @@ def recordings_page():
                 f'<td>{dur_min} min</td>'
                 f'<td>{size_str}</td>'
                 f'<td>{prewarm}</td>'
-                f'<td><a href="{HOST_URL}/recording/{uuid}/delete" '
-                f'onclick="return confirm(\'Löschen?\')">🗑</a></td></tr>')
+                f'<td><a class="del-btn" href="{HOST_URL}/recording/{uuid}/delete" '
+                f'data-title="{title.replace(chr(34),"&quot;")}" '
+                f'data-when="{when}">🗑</a></td></tr>')
 
     rows = []
     # Solo recordings (no autorec) — render flat.
@@ -3995,8 +4250,9 @@ def recordings_page():
             f'<td>{dur_min} min</td>'
             f'<td>—</td>'
             f'<td>{avail_cell}</td>'
-            f'<td><a href="{HOST_URL}/mediathek-rec/{vuuid}/delete" '
-            f'onclick="return confirm(\'Aus Liste entfernen?\')">🗑</a></td></tr>')
+            f'<td><a class="del-btn" href="{HOST_URL}/mediathek-rec/{vuuid}/delete" '
+            f'data-title="{mt_title.replace(chr(34),"&quot;")}" '
+            f'data-mt="1">🗑</a></td></tr>')
 
     body = (f"<html><head><meta name='viewport' "
             f"content='width=device-width,initial-scale=1'>"
@@ -4018,6 +4274,22 @@ def recordings_page():
             f"@keyframes livepulse{{0%,100%{{opacity:1}}50%{{opacity:.6}}}}"
             f".live-count{{color:#ffeb3b;"
             f"animation:livepulse 1.5s ease-in-out infinite}}"
+            f".del-modal{{position:fixed;inset:0;background:#000a;"
+            f"display:flex;align-items:center;justify-content:center;z-index:100}}"
+            f".del-dialog{{background:var(--bg);color:var(--fg);"
+            f"padding:20px 22px;border-radius:12px;max-width:420px;"
+            f"width:calc(100% - 40px);border:1px solid var(--border);"
+            f"box-shadow:0 6px 20px #0008}}"
+            f".del-head{{font-weight:700;font-size:1.05em;margin-bottom:10px}}"
+            f".del-title{{font-weight:600;margin-bottom:6px;word-break:break-word}}"
+            f".del-sub{{font-size:.85em;color:var(--muted);margin-bottom:16px}}"
+            f".del-btns{{display:flex;gap:10px;justify-content:flex-end}}"
+            f".del-btns button{{padding:8px 14px;border-radius:6px;"
+            f"border:1px solid var(--border);font-weight:600;cursor:pointer;"
+            f"font-size:.95em;background:var(--stripe);color:var(--fg)}}"
+            f".del-confirm{{background:#c0392b !important;color:#fff !important;"
+            f"border-color:#c0392b !important}}"
+            f".del-cancel{{background:transparent !important;font-weight:400 !important}}"
             f".badge.series{{background:#8e44ad;color:#fff}}"
             f".badge.mediathek{{background:#2980b9;color:#fff}}"
             f".badge.mediathek.local{{background:#27ae60}}"
@@ -4042,6 +4314,31 @@ def recordings_page():
             f"<script>"
             f"if(document.querySelector('.badge.scanning,.badge.warming,.badge.live'))"
             f"  setTimeout(()=>location.reload(),15000);"
+            f"function showDeleteModal(title,subtitle,onConfirm){{"
+            f"  const m=document.createElement('div');"
+            f"  m.className='del-modal';"
+            f"  m.innerHTML='<div class=\"del-dialog\">'+"
+            f"    '<div class=\"del-head\">Aufnahme löschen?</div>'+"
+            f"    '<div class=\"del-title\">'+title+'</div>'+"
+            f"    (subtitle?'<div class=\"del-sub\">'+subtitle+'</div>':'')+"
+            f"    '<div class=\"del-btns\">'+"
+            f"    '<button class=\"del-cancel\">Abbrechen</button>'+"
+            f"    '<button class=\"del-confirm\">🗑 Löschen</button>'+"
+            f"    '</div></div>';"
+            f"  document.body.appendChild(m);"
+            f"  m.addEventListener('click',ev=>{{"
+            f"    if(ev.target===m||ev.target.classList.contains('del-cancel')){{m.remove();return;}}"
+            f"    if(ev.target.classList.contains('del-confirm')){{m.remove();onConfirm();}}"
+            f"  }});"
+            f"}}"
+            f"document.addEventListener('click',ev=>{{"
+            f"  const a=ev.target.closest('.del-btn');if(!a)return;"
+            f"  ev.preventDefault();"
+            f"  const title=a.dataset.title||'?';"
+            f"  const sub=a.dataset.mt?'Aus Liste entfernen (falls lokale Datei existiert, wird sie gelöscht).':"
+            f"    (a.dataset.when?'Geplant/aufgenommen am '+a.dataset.when:'');"
+            f"  showDeleteModal(title,sub,()=>{{location.href=a.href;}});"
+            f"}});"
             f"function cancelSeries(ev,uuid,title,upcoming){{"
             f"  ev.preventDefault();ev.stopPropagation();"
             f"  const msg='Serie abbrechen?\\n\\n'+title+"
@@ -5926,6 +6223,22 @@ def api_warm_status():
                                     WINDOW_SECONDS),
             "always_warm": s in ALWAYS_WARM,
         } for s, i in channels.items()}
+    # Add a single now-playing string per channel — ONE EPG fetch for
+    # the whole grid is much cheaper than N /api/now calls from the JS.
+    try:
+        now_ts = int(now)
+        epg = fetch_epg(window_before=0, window_after=0)
+        with cmap_lock:
+            slugs = list(channel_map.keys())
+        for slug in slugs:
+            title = None
+            for ev in epg["events"].get(slug, []):
+                if ev["start"] <= now_ts < ev["stop"]:
+                    title = ev.get("title")
+                    break
+            out.setdefault(slug, {"running": False})["now"] = title
+    except Exception:
+        pass
     with _dormant_pins_lock:
         dormant_snapshot = set(_dormant_pins)
     for s in ALWAYS_WARM:
@@ -6089,6 +6402,7 @@ if __name__ == "__main__":
     threading.Thread(target=_mediathek_autorec_loop, daemon=True).start()
     threading.Thread(target=ffmpeg_watchdog_loop, daemon=True).start()
     threading.Thread(target=disk_cleanup_loop, daemon=True).start()
+    threading.Thread(target=state_backup_loop, daemon=True).start()
     # waitress in production; fall back to Flask's built-in only if
     # waitress somehow isn't importable (e.g. an older image).
     try:

@@ -14,6 +14,7 @@ services:
     volumes:
       - /mnt/tv/hls:/data/hls
       - ./service.py:/app/service.py:ro
+      - ./state-backup:/state-backup
       - /mnt/tv:/recordings:ro
     environment:
       - TVH_BASE=http://raspberrypi5lan:9981
