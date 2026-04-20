@@ -1397,8 +1397,13 @@ def epg_grid():
             f"        }}).catch(()=>{{}});"
             f"      else if(v==='series')fetch('{HOST_URL}/record-series/'+el.dataset.eid)"
             f"        .then(r=>r.json()).then(d=>{{"
-            f"          if(d.ok)lpDialog({{msg:'Serie geplant: '+d.title+"
-            f"' auf '+d.channel,buttons:[{{label:'OK',value:'',primary:true}}]}});"
+            f"          if(d.ok){{"
+            f"            const n=d.scheduled||0;"
+            f"            const ep=n===1?'Folge':'Folgen';"
+            f"            lpDialog({{msg:'<b>'+d.title+'</b> auf '+d.channel+"
+            f"'<br><br>'+n+' '+ep+' aktuell geplant',"
+            f"              buttons:[{{label:'OK',value:'',primary:true}}]}});"
+            f"          }}"
             f"        }}).catch(()=>{{}});"
             f"    }});"
             f"  }} else {{"
@@ -2861,14 +2866,75 @@ def record_series(event_id):
             data=body, method="POST")
         res = urllib.request.urlopen(req, timeout=10).read().decode()
         data = json.loads(res) if res else {}
-        uuid = data.get("uuid")
-        return _cors(Response(json.dumps({"ok": True, "uuid": uuid,
+        autorec_uuid = data.get("uuid")
+        # tvheadend schedules matching EPG events asynchronously. Give
+        # it ~2 s then count how many upcoming DVR entries the rule has
+        # spawned so the client can show "N Folgen geplant".
+        scheduled = 0
+        try:
+            time.sleep(2)
+            up = json.loads(urllib.request.urlopen(
+                f"{TVH_BASE}/api/dvr/entry/grid_upcoming?limit=500",
+                timeout=10).read())
+            scheduled = sum(1 for e in up.get("entries", [])
+                            if e.get("autorec") == autorec_uuid)
+        except Exception:
+            pass
+        return _cors(Response(json.dumps({"ok": True,
+                                           "uuid": autorec_uuid,
                                            "title": title,
-                                           "channel": ch_name}),
+                                           "channel": ch_name,
+                                           "scheduled": scheduled}),
                                mimetype="application/json"))
     except Exception as e:
         return Response(json.dumps({"ok": False, "error": str(e)}),
                         status=500, mimetype="application/json")
+
+
+@app.route("/cancel-series/<autorec_uuid>")
+def cancel_series(autorec_uuid):
+    """Delete an autorec rule and cancel every upcoming DVR entry it
+    has spawned. Already-recorded episodes on disk are left alone —
+    the user is explicitly only tearing down the "record future
+    episodes" automation, not their archive."""
+    cancelled = 0
+    try:
+        up = json.loads(urllib.request.urlopen(
+            f"{TVH_BASE}/api/dvr/entry/grid_upcoming?limit=500",
+            timeout=10).read())
+        for e in up.get("entries", []):
+            if e.get("autorec") != autorec_uuid:
+                continue
+            ep_uuid = e.get("uuid")
+            if not ep_uuid:
+                continue
+            body = urllib.parse.urlencode({"uuid": ep_uuid}).encode()
+            for ep in ("/api/dvr/entry/cancel",
+                       "/api/dvr/entry/remove"):
+                try:
+                    urllib.request.urlopen(
+                        urllib.request.Request(
+                            f"{TVH_BASE}{ep}",
+                            data=body, method="POST"),
+                        timeout=5).read()
+                    cancelled += 1
+                    break
+                except Exception:
+                    continue
+    except Exception:
+        pass
+    try:
+        body = urllib.parse.urlencode({"uuid": autorec_uuid}).encode()
+        urllib.request.urlopen(
+            urllib.request.Request(f"{TVH_BASE}/api/idnode/delete",
+                                    data=body, method="POST"),
+            timeout=10).read()
+    except Exception as e:
+        return Response(json.dumps({"ok": False, "error": str(e)}),
+                        status=500, mimetype="application/json")
+    return _cors(Response(json.dumps({"ok": True,
+                                        "cancelled": cancelled}),
+                           mimetype="application/json"))
 
 
 @app.route("/cancel-recording/<uuid>")
@@ -2925,7 +2991,9 @@ def api_is_recording(slug):
 
 @app.route("/recordings")
 def recordings_page():
-    """List of recordings (ongoing + finished) with links."""
+    """List of recordings (ongoing + finished) with links. Entries
+    spawned by the same autorec rule are collapsed into a series
+    group with an episode count."""
     try:
         data = json.loads(urllib.request.urlopen(
             f"{TVH_BASE}/api/dvr/entry/grid?limit=200&sort=start&dir=DESC",
@@ -2934,8 +3002,15 @@ def recordings_page():
         abort(502, f"tvheadend: {e}")
 
     now_ts = int(time.time())
-    rows = []
+    # Bucket entries by autorec UUID so we can render a collapsible
+    # "series" group row + its children. Solo entries (no autorec)
+    # stay on their own.
+    by_autorec = {}
     for e in data.get("entries", []):
+        ar = e.get("autorec") or ""
+        by_autorec.setdefault(ar, []).append(e)
+
+    def _render_row(e):
         uuid = e.get("uuid", "")
         title = e.get("disp_title", "?")
         start = e.get("start", 0)
@@ -2949,18 +3024,16 @@ def recordings_page():
         elif is_done:
             badge = '<span class="badge done">✓ fertig</span>'
         else:
-            badge = f'<span class="badge scheduled">⏱ geplant</span>'
+            badge = '<span class="badge scheduled">⏱ geplant</span>'
         when = time.strftime("%d.%m %H:%M", time.localtime(start))
         dur_min = max(0, (stop - start) // 60)
         size_mb = size / (1024 * 1024) if size else 0
         size_str = f"{size_mb:.0f} MB" if size_mb > 0 else "—"
-        # Only link playable entries — scheduled future recordings aren't yet.
         if is_live or is_done:
             play_url = f"{HOST_URL}/recording/{uuid}"
             title_cell = f'<a href="{play_url}">{title}</a>'
         else:
             title_cell = f'<span>{title}</span>'
-        # Prewarm state: ready / in progress / not started
         if is_done:
             playlist = HLS_DIR / f"_rec_{uuid}" / "index.m3u8"
             proc_info = _rec_hls_procs.get(uuid)
@@ -2973,23 +3046,50 @@ def recordings_page():
                 if playlist.exists():
                     try: segs = playlist.read_text().count(".ts")
                     except Exception: pass
-                pct = (int(segs * 100 / total)
-                       if total > 0 else 0)
+                pct = (int(segs * 100 / total) if total > 0 else 0)
                 prewarm = (f'<span class="badge warming" '
                            f'title="Remux läuft">⏳ {pct}%</span>')
             else:
                 prewarm = '<span class="badge pending" title="noch nicht remuxt">◌ ausstehend</span>'
         else:
             prewarm = ""
-        rows.append(
-            f'<tr><td>{badge}</td>'
-            f'<td>{title_cell}</td>'
-            f'<td>{when}</td>'
-            f'<td>{dur_min} min</td>'
-            f'<td>{size_str}</td>'
-            f'<td>{prewarm}</td>'
-            f'<td><a href="{HOST_URL}/recording/{uuid}/delete" '
-            f'onclick="return confirm(\'Löschen?\')">🗑</a></td></tr>')
+        return (f'<tr><td>{badge}</td>'
+                f'<td>{title_cell}</td>'
+                f'<td>{when}</td>'
+                f'<td>{dur_min} min</td>'
+                f'<td>{size_str}</td>'
+                f'<td>{prewarm}</td>'
+                f'<td><a href="{HOST_URL}/recording/{uuid}/delete" '
+                f'onclick="return confirm(\'Löschen?\')">🗑</a></td></tr>')
+
+    rows = []
+    # Solo recordings (no autorec) — render flat.
+    for e in by_autorec.get("", []):
+        rows.append(_render_row(e))
+    # Series groups — render as <details> with a summary row and the
+    # episodes inside. Sorted by the most recent episode in the group.
+    series_groups = [(ar, eps) for ar, eps in by_autorec.items() if ar]
+    series_groups.sort(
+        key=lambda kv: max((e.get("start", 0) for e in kv[1]), default=0),
+        reverse=True)
+    for ar_uuid, eps in series_groups:
+        group_title = eps[0].get("disp_title", "?")
+        upcoming = sum(1 for e in eps
+                       if e.get("start", 0) > now_ts and "Completed" not in e.get("status", ""))
+        done = sum(1 for e in eps if now_ts >= e.get("stop", 0) or "Completed" in e.get("status", ""))
+        badge = (f'<span class="badge series">📺 Serie · '
+                 f'{done} aufgen., {upcoming} geplant</span>')
+        kill_btn = (f'<button class="series-kill" '
+                    f'onclick="cancelSeries(event,\'{ar_uuid}\',\'{group_title}\',{upcoming})">'
+                    f'🗑 Serie</button>')
+        summary = (f'<tr class="series-head"><td colspan="7">'
+                   f'<details><summary>{badge} {group_title} '
+                   f'<small>({len(eps)} Einträge)</small>{kill_btn}</summary>'
+                   f'<table class="series-sub"><tbody>'
+                   + "".join(_render_row(e) for e in sorted(
+                       eps, key=lambda x: x.get("start", 0), reverse=True))
+                   + '</tbody></table></details></td></tr>')
+        rows.append(summary)
 
     body = (f"<html><head><meta name='viewport' "
             f"content='width=device-width,initial-scale=1'>"
@@ -3003,13 +3103,40 @@ def recordings_page():
             f".badge.ready{{background:#2980b9;color:#fff}}"
             f".badge.warming{{background:#f39c12;color:#fff}}"
             f".badge.pending{{background:var(--stripe);color:var(--muted)}}"
+            f".badge.series{{background:#8e44ad;color:#fff}}"
+            f"tr.series-head td{{padding:0}}"
+            f"tr.series-head summary{{cursor:pointer;padding:6px 8px;"
+            f"background:var(--stripe);display:flex;align-items:center;"
+            f"gap:8px;flex-wrap:wrap}}"
+            f"tr.series-head .series-kill{{margin-left:auto;background:none;"
+            f"border:0;color:var(--muted);cursor:pointer;font-size:.9em;"
+            f"padding:2px 6px}}"
+            f"tr.series-head .series-kill:hover{{color:#e74c3c}}"
+            f"table.series-sub{{width:100%;border-collapse:collapse}}"
+            f"table.series-sub td{{padding:4px 8px}}"
             f"</style></head><body>"
             f"<h1>Aufnahmen</h1>"
             f"<p><a href='{HOST_URL}/'>← Kanäle</a></p>"
             f"<table><tr><th></th><th>Titel</th><th>Start</th>"
             f"<th>Dauer</th><th>Größe</th><th>Cache</th><th></th></tr>"
             f"{''.join(rows) if rows else '<tr><td colspan=7>Keine Aufnahmen</td></tr>'}"
-            f"</table></body></html>")
+            f"</table>"
+            f"<script>"
+            f"function cancelSeries(ev,uuid,title,upcoming){{"
+            f"  ev.preventDefault();ev.stopPropagation();"
+            f"  const msg='Serie abbrechen?\\n\\n'+title+"
+            f"'\\n\\nRegel wird gelöscht und '+upcoming+"
+            f"' geplante Folge(n) verworfen. Bereits aufgenommene "
+            f"Episoden bleiben erhalten.';"
+            f"  if(!confirm(msg))return;"
+            f"  fetch('{HOST_URL}/cancel-series/'+uuid)"
+            f"    .then(r=>r.json()).then(d=>{{"
+            f"      if(d.ok)location.reload();"
+            f"      else alert('Fehler: '+(d.error||'?'));"
+            f"    }}).catch(e=>alert('Fehler: '+e));"
+            f"}}"
+            f"</script>"
+            f"</body></html>")
     return body
 
 
