@@ -930,6 +930,10 @@ def index():
     extra_css = (
         ".buffer-bar{position:absolute;left:4px;right:4px;bottom:3px;"
         "height:4px;border-radius:3px;background:transparent;z-index:3}"
+        "ul.channels li.scanning::before{content:'🔍';position:absolute;"
+        "top:4px;left:6px;font-size:.8em;z-index:2;"
+        "animation:scanpulse 1.2s ease-in-out infinite}"
+        "@keyframes scanpulse{0%,100%{opacity:.4}50%{opacity:1}}"
         ".buffer-bar.running{background:#00000022;cursor:pointer;"
         "box-shadow:inset 0 0 0 1px #0001}"
         "@media (prefers-color-scheme:dark){"
@@ -990,6 +994,10 @@ def index():
         "    const r=await fetch('/api/warm-status');"
         "    const d=await r.json();"
         "    const W=d.window_seconds||7200;"
+        "    const scanSlug=d.adskip_slug||null;"
+        "    for(const li of document.querySelectorAll('ul.channels li')){"
+        "      li.classList.toggle('scanning',li.dataset.slug===scanSlug);"
+        "    }"
         "    for(const bar of document.querySelectorAll('.buffer-bar')){"
         "      const s=bar.dataset.slug;"
         "      const e=d.channels[s];"
@@ -3843,11 +3851,12 @@ def recordings_page():
         start = e.get("start", 0)
         stop  = e.get("stop", 0)
         status = e.get("status", "")
+        sched = e.get("sched_status", "")
         size = e.get("filesize", 0) or 0
-        is_live = start <= now_ts < stop and "Recording" in status
+        is_live = start <= now_ts < stop and sched == "recording"
         is_done = now_ts >= stop or "Completed" in status
         if is_live:
-            badge = '<span class="badge live">● LIVE</span>'
+            badge = '<span class="badge live">● REC</span>'
         elif is_done:
             badge = '<span class="badge done">✓ fertig</span>'
         else:
@@ -3878,6 +3887,10 @@ def recordings_page():
                            f'title="Remux läuft">⏳ {pct}%</span>')
             else:
                 prewarm = '<span class="badge pending" title="noch nicht remuxt">◌ ausstehend</span>'
+            cskip_info = _rec_cskip_procs.get(uuid)
+            if cskip_info and cskip_info["proc"].poll() is None:
+                prewarm += (' <span class="badge scanning" '
+                            'title="comskip analysiert Werbeblöcke">🔍 scan</span>')
         else:
             prewarm = ""
         return (f'<tr><td>{badge}</td>'
@@ -3901,16 +3914,29 @@ def recordings_page():
         reverse=True)
     for ar_uuid, eps in series_groups:
         group_title = eps[0].get("disp_title", "?")
+        live = sum(1 for e in eps
+                   if e.get("start", 0) <= now_ts < e.get("stop", 0)
+                   and e.get("sched_status") == "recording")
         upcoming = sum(1 for e in eps
                        if e.get("start", 0) > now_ts and "Completed" not in e.get("status", ""))
         done = sum(1 for e in eps if now_ts >= e.get("stop", 0) or "Completed" in e.get("status", ""))
+        parts = [f"{done} aufgen."]
+        if live:
+            parts.append(f'<span class="live-count">● {live} läuft</span>')
+        parts.append(f"{upcoming} geplant")
         badge = (f'<span class="badge series">📺 Serie · '
-                 f'{done} aufgen., {upcoming} geplant</span>')
+                 f'{" · ".join(parts)}</span>')
         kill_btn = (f'<button class="series-kill" '
                     f'onclick="cancelSeries(event,\'{ar_uuid}\',\'{group_title}\',{upcoming})">'
                     f'🗑 Serie</button>')
+        # Keep group expanded if any episode needs attention (recording
+        # right now, being remuxed, or comskip is running on it).
+        any_active = bool(live) or any(
+            e.get("uuid") in _rec_hls_procs or e.get("uuid") in _rec_cskip_procs
+            for e in eps)
+        open_attr = " open" if any_active else ""
         summary = (f'<tr class="series-head"><td colspan="7">'
-                   f'<details><summary>{badge} {group_title} '
+                   f'<details{open_attr}><summary>{badge} {group_title} '
                    f'<small>({len(eps)} Einträge)</small>{kill_btn}</summary>'
                    f'<table class="series-sub"><tbody>'
                    + "".join(_render_row(e) for e in sorted(
@@ -3985,6 +4011,13 @@ def recordings_page():
             f".badge.ready{{background:#2980b9;color:#fff}}"
             f".badge.warming{{background:#f39c12;color:#fff}}"
             f".badge.pending{{background:var(--stripe);color:var(--muted)}}"
+            f".badge.scanning{{background:#8e44ad;color:#fff;"
+            f"animation:scanpulse 1.2s ease-in-out infinite}}"
+            f"@keyframes scanpulse{{0%,100%{{opacity:.5}}50%{{opacity:1}}}}"
+            f".badge.live{{animation:livepulse 1.5s ease-in-out infinite}}"
+            f"@keyframes livepulse{{0%,100%{{opacity:1}}50%{{opacity:.6}}}}"
+            f".live-count{{color:#ffeb3b;"
+            f"animation:livepulse 1.5s ease-in-out infinite}}"
             f".badge.series{{background:#8e44ad;color:#fff}}"
             f".badge.mediathek{{background:#2980b9;color:#fff}}"
             f".badge.mediathek.local{{background:#27ae60}}"
@@ -4007,6 +4040,8 @@ def recordings_page():
             f"{''.join(rows) if rows else '<tr><td colspan=7>Keine Aufnahmen</td></tr>'}"
             f"</table>"
             f"<script>"
+            f"if(document.querySelector('.badge.scanning,.badge.warming,.badge.live'))"
+            f"  setTimeout(()=>location.reload(),15000);"
             f"function cancelSeries(ev,uuid,title,upcoming){{"
             f"  ev.preventDefault();ev.stopPropagation();"
             f"  const msg='Serie abbrechen?\\n\\n'+title+"
@@ -5962,6 +5997,7 @@ def api_warm_status():
         "tuners_used": tuners_used,
         "tuners_total": tuners_total,
         "tuners_epggrab": tuners_epggrab,
+        "adskip_slug": _live_ads_proc.get("slug"),
         "ffmpeg_count": ffmpeg_count,
         "load1": load1,
         "cpu_count": cpu_count,
