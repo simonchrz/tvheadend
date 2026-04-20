@@ -1004,6 +1004,16 @@ def index():
         "        tb.title='DVB-C Tuner in Nutzung (FRITZ!Box SAT>IP). Kanäle auf demselben Mux teilen sich einen Tuner.';"
         "      }"
         "    }"
+        "    const fb=document.getElementById('ffmpeg-badge');"
+        "    if(fb){"
+        "      const n=d.ffmpeg_count;"
+        "      if(n===null||n===undefined){fb.textContent='';fb.className='tuner-badge';}"
+        "      else{"
+        "        fb.textContent='⚙ '+n+' ffmpeg';"
+        "        fb.className='tuner-badge'+(n>=8?' full':n>=5?' tight':'');"
+        "        fb.title='Laufende ffmpeg-Prozesse: Live-Streams, Recording-Remuxe, Thumbnails, Ad-Detection.';"
+        "      }"
+        "    }"
         "  }catch(e){}"
         "}"
         "function reorderPinned(){"
@@ -1089,7 +1099,9 @@ def index():
             f"content='width=device-width,initial-scale=1'>"
             f"<meta name='color-scheme' content='light dark'>"
             f"<style>{BASE_CSS}{extra_css}</style></head>"
-            f"<body><h1>HLS Gateway <span id='tuner-badge' class='tuner-badge'></span></h1>"
+            f"<body><h1>HLS Gateway "
+            f"<span id='tuner-badge' class='tuner-badge'></span> "
+            f"<span id='ffmpeg-badge' class='tuner-badge'></span></h1>"
             f"<h2>Tools</h2><ul class='tools'>{tool_rows}</ul>"
             f"<h2>Kanäle</h2><ul class='channels'>{''.join(rows)}</ul>"
             f"<script>{js}</script>"
@@ -1816,6 +1828,21 @@ html,body{height:100%;background:#000;color:#eee;
 }
 .iconbtn:active{opacity:.6}
 .iconbtn:disabled{background:#555;color:#bbb;cursor:default}
+#volume-wrap{display:inline-flex;align-items:center;gap:0;
+ flex:0 0 auto;position:relative}
+#volume-wrap #vol-slider{width:0;height:4px;cursor:pointer;
+ background:#fff4;border-radius:2px;appearance:none;
+ -webkit-appearance:none;outline:none;transition:width .2s,
+ margin-left .2s,opacity .2s;opacity:0;margin-left:0;
+ accent-color:#fff}
+@media (hover:hover){
+ #volume-wrap:hover #vol-slider{width:80px;margin-left:6px;opacity:1}
+}
+#volume-wrap.open #vol-slider{width:80px;margin-left:6px;opacity:1}
+#vol-slider::-webkit-slider-thumb{appearance:none;-webkit-appearance:none;
+ width:12px;height:12px;border-radius:50%;background:#fff;cursor:pointer}
+#vol-slider::-moz-range-thumb{width:12px;height:12px;border-radius:50%;
+ background:#fff;border:0;cursor:pointer}
 .pill{background:#fff2;color:#fff;border:0;padding:7px 12px;
  border-radius:16px;font-weight:600;font-size:.85em;cursor:pointer;
  display:inline-flex;align-items:center;gap:5px;flex:0 0 auto;line-height:1}
@@ -1913,6 +1940,47 @@ v.addEventListener('touchend',e=>{
     _lastTapT=0;
   }else{_lastTapT=now;_lastTapX=x;}
 },{passive:true});
+/* --- Volume + mute control (persisted to localStorage) --------- */
+const volWrap=document.getElementById('volume-wrap');
+if(volWrap){
+  const volIcon=document.getElementById('vol-icon');
+  const volSlider=document.getElementById('vol-slider');
+  const VOL_KEY='playerVolume';
+  let storedVol=1,storedMuted=false;
+  try{
+    const raw=JSON.parse(localStorage.getItem(VOL_KEY)||'null');
+    if(raw){
+      if(typeof raw.volume==='number')storedVol=Math.max(0,Math.min(1,raw.volume));
+      storedMuted=!!raw.muted;
+    }
+  }catch(e){}
+  function updateVolIcon(){
+    if(v.muted||v.volume===0)volIcon.textContent='\U0001F507';
+    else if(v.volume<0.5)volIcon.textContent='\U0001F509';
+    else volIcon.textContent='\U0001F50A';
+    volSlider.value=Math.round((v.muted?0:v.volume)*100);
+  }
+  function saveVol(){
+    try{localStorage.setItem(VOL_KEY,
+      JSON.stringify({volume:v.volume,muted:v.muted}));}catch(e){}
+  }
+  v.volume=storedVol;
+  v.muted=storedMuted;
+  volIcon.addEventListener('click',e=>{
+    e.stopPropagation();
+    v.muted=!v.muted;
+    if(!v.muted&&v.volume===0)v.volume=0.5;
+    updateVolIcon();saveVol();show();
+  });
+  volSlider.addEventListener('input',e=>{
+    const pct=parseInt(volSlider.value,10)/100;
+    v.volume=pct;
+    v.muted=(pct===0);
+    updateVolIcon();saveVol();show();
+  });
+  v.addEventListener('volumechange',updateVolIcon);
+  updateVolIcon();
+}
 """
 
 
@@ -1989,6 +2057,10 @@ body{{touch-action:pan-y}}
   <button id='skipad' onclick='skipCurrentAd()'>Werbung ⏭</button>
   <button class='iconbtn' onclick='prevCh()' aria-label='voriger Kanal'>◀︎</button>
   <button class='iconbtn' onclick='nextCh()' aria-label='nächster Kanal'>▶︎</button>
+  <span id='volume-wrap'>
+   <button id='vol-icon' class='iconbtn' aria-label='Lautstärke'>🔊</button>
+   <input type='range' id='vol-slider' min='0' max='100' value='100'>
+  </span>
   <span id='cur' class='time'>0:00</span>
  </div>
  <div id='ttlrow'>
@@ -3930,16 +4002,25 @@ def _rec_cskip_spawn(uuid):
 
 
 THUMB_INTERVAL = 30   # seconds between thumbnails
+_rec_thumbs_lock = threading.Lock()
+_rec_thumbs_running = set()   # uuids currently being processed
 
 def _rec_thumbs_spawn(uuid):
     """Generate scrub-bar thumbnails (1 per THUMB_INTERVAL s, scaled to
     160 px wide) once per recording. Writes to _rec_<uuid>/thumbs/
-    and a sentinel `.done` file when finished. Idempotent."""
+    and a sentinel `.done` file when finished. Idempotent — safe to
+    call on every /progress poll without spawning duplicates."""
     out_dir = HLS_DIR / f"_rec_{uuid}" / "thumbs"
     if (out_dir / ".done").exists():
         return
+    with _rec_thumbs_lock:
+        if uuid in _rec_thumbs_running:
+            return
+        _rec_thumbs_running.add(uuid)
     src = _rec_source_path(uuid)
     if not src or not Path(src).exists():
+        with _rec_thumbs_lock:
+            _rec_thumbs_running.discard(uuid)
         return
     out_dir.mkdir(parents=True, exist_ok=True)
     def run():
@@ -3956,6 +4037,9 @@ def _rec_thumbs_spawn(uuid):
             print(f"[rec-thumbs {uuid[:8]}] done", flush=True)
         except Exception as e:
             print(f"[rec-thumbs {uuid[:8]}] {e}", flush=True)
+        finally:
+            with _rec_thumbs_lock:
+                _rec_thumbs_running.discard(uuid)
     threading.Thread(target=run, daemon=True).start()
     print(f"[rec-thumbs {uuid[:8]}] spawned", flush=True)
 
@@ -5057,6 +5141,10 @@ def _render_mediathek_player(uuid, entry):
             f"<button class='iconbtn' onclick='seek(-10)'>⏪</button>"
             f"<button id='pp' class='iconbtn' onclick='togglePlay()'>▶</button>"
             f"<button class='iconbtn' onclick='seek(10)'>⏩</button>"
+            f"<span id='volume-wrap'>"
+            f"<button id='vol-icon' class='iconbtn' aria-label='Lautstärke'>🔊</button>"
+            f"<input type='range' id='vol-slider' min='0' max='100' value='100'>"
+            f"</span>"
             f"<span id='cur' class='time'>0:00</span>"
             f"<span class='spacer'></span>"
             f"<span id='dur' class='time'>0:00</span>"
@@ -5247,6 +5335,10 @@ def play_recording(uuid):
             f"<button id='speedbtn' class='iconbtn' "
             f"onclick='cycleSpeed()' aria-label='Geschwindigkeit' "
             f"style='font-size:.75em;font-weight:600'>1×</button>"
+            f"<span id='volume-wrap'>"
+            f"<button id='vol-icon' class='iconbtn' aria-label='Lautstärke'>🔊</button>"
+            f"<input type='range' id='vol-slider' min='0' max='100' value='100'>"
+            f"</span>"
             f"<span id='cur' class='time'>0:00</span>"
             f"<span class='spacer'></span>"
             f"<button id='skipad' class='pill rec' onclick='skipAd()'"
@@ -5715,6 +5807,23 @@ def api_warm_status():
     pin_limit = compute_pin_limit()
     pin_budget = max(0, pin_limit - pins_used)
     tuners_used, tuners_total = tuner_status()
+    ffmpeg_count = 0
+    try:
+        for p in Path("/proc").iterdir():
+            if not p.name.isdigit():
+                continue
+            try:
+                comm = (p / "comm").read_text().strip()
+                status = (p / "status").read_text()
+            except Exception:
+                continue
+            if comm != "ffmpeg":
+                continue
+            if "\nState:\tZ" in status:   # ignore zombies
+                continue
+            ffmpeg_count += 1
+    except Exception:
+        pass
     return _cors(Response(json.dumps({
         "channels": out,
         "max_warm": MAX_WARM_STREAMS,
@@ -5725,6 +5834,7 @@ def api_warm_status():
         "pin_budget": pin_budget,
         "tuners_used": tuners_used,
         "tuners_total": tuners_total,
+        "ffmpeg_count": ffmpeg_count,
     }), mimetype="application/json"))
 
 
