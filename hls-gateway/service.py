@@ -1335,33 +1335,72 @@ def epg_grid():
             f"  if(Math.abs(p.clientX-lpX)>LP_MOVE||Math.abs(p.clientY-lpY)>LP_MOVE)"
             f"    lpCancel();"
             f"}}"
+            # Minimal 3-button modal for long-press. confirm() is binary
+            # and can't offer "episode vs series", so we roll our own.
+            # pointer-events:none on the host anchor during the dialog
+            # absorbs iOS' queued synthesized click, which otherwise
+            # navigates the page behind the modal.
+            f"function lpDialog(opts){{"
+            f"  return new Promise(resolve=>{{"
+            f"    const bg=document.createElement('div');"
+            f"    bg.style.cssText='position:fixed;inset:0;background:#000a;"
+            f"z-index:1000;display:flex;align-items:center;justify-content:center;"
+            f"padding:20px';"
+            f"    const box=document.createElement('div');"
+            f"    box.style.cssText='background:var(--bg,#fff);color:var(--fg,#000);"
+            f"padding:18px;border-radius:10px;max-width:320px;width:100%;"
+            f"font-size:.95em;box-shadow:0 8px 32px #0008';"
+            f"    box.innerHTML='<div style=\"font-weight:600;margin-bottom:14px;"
+            f"line-height:1.35\">'+opts.msg+'</div>';"
+            f"    const row=document.createElement('div');"
+            f"    row.style.cssText='display:flex;flex-direction:column;gap:8px';"
+            f"    for(const b of opts.buttons){{"
+            f"      const btn=document.createElement('button');"
+            f"      btn.textContent=b.label;"
+            f"      btn.style.cssText='padding:10px;border-radius:8px;border:0;"
+            f"font-size:1em;cursor:pointer;'+(b.primary?'background:#e74c3c;color:#fff;"
+            f"font-weight:600':'background:#ccc;color:#000');"
+            f"      btn.onclick=()=>{{bg.remove();resolve(b.value);}};"
+            f"      row.appendChild(btn);"
+            f"    }}"
+            f"    box.appendChild(row);bg.appendChild(box);"
+            f"    document.body.appendChild(bg);"
+            f"  }});"
+            f"}}"
             f"function handleLP(el){{"
             f"  const ttl=(el.querySelector('.t')||{{}}).textContent||'diese Sendung';"
-            # Disable the anchor while the confirm sits. iOS queues the
-            # synthesized click behind the modal; by the time Cancel
-            # dismisses, our document-level preventDefault is too late
-            # and Safari navigates via href. pointer-events:none stops
-            # the click entirely.
             f"  el.style.pointerEvents='none';"
             f"  const release=()=>setTimeout(()=>{{"
             f"    el.style.pointerEvents='';"
             f"  }},400);"
             f"  if(el.dataset.uuid){{"
-            f"    const ok=confirm('Geplante Aufnahme entfernen?\\n\\n'+ttl);"
-            f"    release();"
-            f"    if(ok)fetch('{HOST_URL}/cancel-recording/'+el.dataset.uuid)"
+            f"    lpDialog({{msg:'Geplante Aufnahme entfernen?<br><br>'+ttl,"
+            f"      buttons:[{{label:'Entfernen',value:'yes',primary:true}},"
+            f"               {{label:'Abbrechen',value:''}}]}}).then(v=>{{"
+            f"      release();"
+            f"      if(v==='yes')fetch('{HOST_URL}/cancel-recording/'+el.dataset.uuid)"
             f"        .then(r=>r.json()).then(d=>{{"
             f"          if(d.ok){{el.classList.remove('scheduled');"
             f"            delete el.dataset.uuid;}}"
             f"        }}).catch(()=>{{}});"
+            f"    }});"
             f"  }} else if(el.dataset.eid){{"
-            f"    const ok=confirm('Aufnahme planen?\\n\\n'+ttl);"
-            f"    release();"
-            f"    if(ok)fetch('{HOST_URL}/record-event/'+el.dataset.eid)"
+            f"    lpDialog({{msg:'Aufnahme planen?<br><br>'+ttl,"
+            f"      buttons:[{{label:'Einzelne Episode',value:'ep',primary:true}},"
+            f"               {{label:'Ganze Serie',value:'series'}},"
+            f"               {{label:'Abbrechen',value:''}}]}}).then(v=>{{"
+            f"      release();"
+            f"      if(v==='ep')fetch('{HOST_URL}/record-event/'+el.dataset.eid)"
             f"        .then(r=>r.json()).then(d=>{{"
             f"          if(d.ok&&d.uuid){{el.classList.add('scheduled');"
             f"            el.dataset.uuid=d.uuid;}}"
             f"        }}).catch(()=>{{}});"
+            f"      else if(v==='series')fetch('{HOST_URL}/record-series/'+el.dataset.eid)"
+            f"        .then(r=>r.json()).then(d=>{{"
+            f"          if(d.ok)lpDialog({{msg:'Serie geplant: '+d.title+"
+            f"' auf '+d.channel,buttons:[{{label:'OK',value:'',primary:true}}]}});"
+            f"        }}).catch(()=>{{}});"
+            f"    }});"
             f"  }} else {{"
             f"    release();"
             f"  }}"
@@ -2778,6 +2817,54 @@ def record_event(event_id):
         uuid = (data.get("uuid") or [None])[0] \
             if isinstance(data.get("uuid"), list) else data.get("uuid")
         return _cors(Response(json.dumps({"ok": True, "uuid": uuid}),
+                               mimetype="application/json"))
+    except Exception as e:
+        return Response(json.dumps({"ok": False, "error": str(e)}),
+                        status=500, mimetype="application/json")
+
+
+@app.route("/record-series/<event_id>")
+def record_series(event_id):
+    """Create a tvheadend autorec rule to capture every future airing of
+    this programme on the same channel. Title-regex based because
+    German DVB-C doesn't ship series-link CRIDs."""
+    # Resolve event → title + channel
+    try:
+        ev = json.loads(urllib.request.urlopen(
+            f"{TVH_BASE}/api/epg/events/load?eventId={event_id}",
+            timeout=6).read())
+        entry = (ev.get("entries") or [{}])[0]
+        title = entry.get("title")
+        ch_uuid = entry.get("channelUuid")
+        ch_name = entry.get("channelName") or ""
+    except Exception as e:
+        return Response(json.dumps({"ok": False, "error": f"lookup: {e}"}),
+                        status=500, mimetype="application/json")
+    if not title or not ch_uuid:
+        return Response(json.dumps({"ok": False,
+                                     "error": "event not found"}),
+                        status=404, mimetype="application/json")
+    # Anchor the regex so "Tagesschau" doesn't grab "Tagesschau um 5".
+    title_regex = "^" + re.escape(title) + "$"
+    conf = {
+        "enabled": True,
+        "name": f"{title} ({ch_name})",
+        "title": title_regex,
+        "fulltext": False,
+        "channel": ch_uuid,
+        "comment": f"auto via /record-series for eid={event_id}",
+    }
+    body = urllib.parse.urlencode({"conf": json.dumps(conf)}).encode()
+    try:
+        req = urllib.request.Request(
+            f"{TVH_BASE}/api/dvr/autorec/create",
+            data=body, method="POST")
+        res = urllib.request.urlopen(req, timeout=10).read().decode()
+        data = json.loads(res) if res else {}
+        uuid = data.get("uuid")
+        return _cors(Response(json.dumps({"ok": True, "uuid": uuid,
+                                           "title": title,
+                                           "channel": ch_name}),
                                mimetype="application/json"))
     except Exception as e:
         return Response(json.dumps({"ok": False, "error": str(e)}),
