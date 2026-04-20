@@ -748,6 +748,86 @@ def always_warm_loop():
         time.sleep(30)
 
 
+def ffmpeg_watchdog_loop():
+    """Check every 30 s that each running ffmpeg is still writing
+    segments. If the latest seg file hasn't changed in 90 s, the
+    ffmpeg is stuck (tuner lost / SAT>IP timeout / decode freeze):
+    kill it and let ensure_running respawn it. Preserves the 2 h
+    DVR buffer because old segments stay on disk."""
+    time.sleep(45)
+    STUCK_TIMEOUT = 90.0
+    last_seen = {}   # slug -> (latest_seg_mtime, observed_at)
+    while True:
+        try:
+            now = time.time()
+            with active_lock:
+                running = [(s, i) for s, i in channels.items()
+                           if i["process"].poll() is None]
+            for slug, info in running:
+                ch_dir = HLS_DIR / slug
+                try:
+                    segs = sorted(ch_dir.glob("seg_*.ts"))
+                    mtime = segs[-1].stat().st_mtime if segs else 0
+                except Exception:
+                    continue
+                prev = last_seen.get(slug)
+                if prev is None or prev[0] != mtime:
+                    last_seen[slug] = (mtime, now)
+                    continue
+                if now - prev[1] > STUCK_TIMEOUT:
+                    # Only kill if ffmpeg has actually had time to settle.
+                    if (now - info.get("started_at", now)) < 60:
+                        continue
+                    print(f"[{slug}] watchdog: no new segment in "
+                          f"{int(now-prev[1])}s — killing + respawning",
+                          flush=True)
+                    stop_channel(slug)
+                    last_seen.pop(slug, None)
+                    ensure_running(slug)
+        except Exception as e:
+            print(f"watchdog loop: {e}", flush=True)
+        time.sleep(30)
+
+
+def disk_cleanup_loop():
+    """When /mnt/tv falls below DISK_MIN_FREE_GB, delete the oldest
+    `_rec_<uuid>/` HLS-VOD remux directories (LRU by mtime) until
+    there's again at least DISK_TARGET_FREE_GB free. The original .ts
+    recordings in /recordings stay — only the remuxed copies go, and
+    they're lazy-rebuilt on next playback."""
+    import shutil as _sh
+    DISK_MIN_FREE_GB = 8.0
+    DISK_TARGET_FREE_GB = 15.0
+    time.sleep(90)
+    while True:
+        try:
+            usage = _sh.disk_usage(HLS_DIR)
+            free_gb = usage.free / (1024 ** 3)
+            if free_gb < DISK_MIN_FREE_GB:
+                rec_dirs = []
+                for p in HLS_DIR.glob("_rec_*"):
+                    if p.is_dir():
+                        try: rec_dirs.append((p.stat().st_mtime, p))
+                        except Exception: pass
+                rec_dirs.sort()   # oldest first
+                for mtime, p in rec_dirs:
+                    usage = _sh.disk_usage(HLS_DIR)
+                    if usage.free / (1024 ** 3) >= DISK_TARGET_FREE_GB:
+                        break
+                    try:
+                        size_mb = sum(f.stat().st_size
+                                      for f in p.rglob("*")
+                                      if f.is_file()) / (1024 ** 2)
+                        _sh.rmtree(p, ignore_errors=True)
+                        print(f"[disk-cleanup] removed {p.name} "
+                              f"({size_mb:.0f} MB)", flush=True)
+                    except Exception as e:
+                        print(f"[disk-cleanup] rm {p}: {e}", flush=True)
+        except Exception as e:
+            print(f"disk-cleanup loop: {e}", flush=True)
+        time.sleep(300)
+
+
 def _cors(resp):
     resp.headers["Access-Control-Allow-Origin"] = "*"
     return resp
@@ -861,6 +941,16 @@ def index():
         ".mux-dot{display:inline-block;width:8px;height:8px;"
         "border-radius:50%;margin-right:6px;vertical-align:1px;"
         "cursor:help}"
+        ".rec-modal{position:fixed;inset:0;background:#000a;"
+        "display:flex;align-items:center;justify-content:center;"
+        "z-index:100}"
+        ".rec-dialog{background:var(--bg);color:var(--fg);"
+        "padding:18px;border-radius:10px;max-width:320px;width:100%;"
+        "border:1px solid var(--border)}"
+        ".rec-dialog button{padding:8px 14px;border-radius:6px;"
+        "border:1px solid var(--border);background:var(--stripe);"
+        "color:var(--fg);font-weight:600;cursor:pointer;font-size:1em}"
+        ".rec-dialog button.cancel{background:transparent;font-weight:400}"
     )
     js = (
         "async function refreshWarm(){"
@@ -946,6 +1036,53 @@ def index():
         "    fetch('/stop/'+slug).then(()=>refreshWarm()).catch(()=>{});"
         "  }"
         "});"
+        # Long-press on a channel tile opens the quick-record modal.
+        "let lpTimer=null,lpSlug=null,lpName=null,lpFired=false;"
+        "function lpCancel(){if(lpTimer){clearTimeout(lpTimer);lpTimer=null;}}"
+        "function lpStart(ev){"
+        "  const a=ev.target.closest('li .logo,li .meta a');if(!a)return;"
+        "  const li=a.closest('li');if(!li)return;"
+        "  const pinBtn=li.querySelector('.pin-btn');"
+        "  lpSlug=pinBtn?pinBtn.dataset.slug:null;"
+        "  lpName=li.querySelector('.meta a')?"
+        "         li.querySelector('.meta a').textContent.trim():lpSlug;"
+        "  if(!lpSlug)return;"
+        "  lpFired=false;"
+        "  lpTimer=setTimeout(()=>{lpFired=true;lpTimer=null;showRecModal();},550);"
+        "}"
+        "function showRecModal(){"
+        "  const m=document.createElement('div');"
+        "  m.className='rec-modal';"
+        "  m.innerHTML="
+        "    '<div class=\"rec-dialog\">'+"
+        "    '<b>Aufnahme starten:</b><br>'+lpName+"
+        "    '<div style=\"margin-top:12px;display:flex;gap:8px;flex-wrap:wrap\">'+"
+        "    '<button data-d=\"3600\">1 h</button>'+"
+        "    '<button data-d=\"7200\">2 h</button>'+"
+        "    '<button data-d=\"10800\">3 h</button>'+"
+        "    '<button data-d=\"0\" class=\"cancel\">Abbrechen</button>'+"
+        "    '</div></div>';"
+        "  m.addEventListener('click',async ev=>{"
+        "    if(ev.target===m){m.remove();return;}"
+        "    const btn=ev.target.closest('button');if(!btn)return;"
+        "    const d=parseInt(btn.dataset.d||'0',10);"
+        "    m.remove();"
+        "    if(d>0){"
+        "      try{await fetch('/record/'+lpSlug+'?duration='+d);"
+        "          alert('Aufnahme gestartet ('+Math.round(d/3600)+' h)');"
+        "      }catch(e){alert('Fehler: '+e);}"
+        "    }"
+        "  });"
+        "  document.body.appendChild(m);"
+        "}"
+        "document.addEventListener('pointerdown',lpStart);"
+        "document.addEventListener('pointerup',()=>{"
+        "  lpCancel();"
+        "},true);"
+        "document.addEventListener('pointermove',()=>lpCancel(),true);"
+        "document.addEventListener('click',ev=>{"
+        "  if(lpFired){ev.preventDefault();ev.stopPropagation();lpFired=false;}"
+        "},true);"
         "refreshWarm();setInterval(refreshWarm,5000);"
     )
     body = (f"<html><head><meta name='viewport' "
@@ -2225,16 +2362,20 @@ let liveAds=[];
 const skipBtn=document.getElementById('skipad');
 function renderLiveAds(){{
   document.querySelectorAll('.ad-block').forEach(el=>el.remove());
+  /* Only render blocks that overlap the currently-seekable range —
+     otherwise stale ads from an earlier long buffer stay scattered
+     across the scrub bar even though the user can't seek to them. */
+  const[sr,er]=seekableRange();
+  if(er<=sr)return;
+  const wallS=wallAt(sr),wallE=wallAt(er);
   for(const[wStart,wStop]of liveAds){{
-    const left=posForWall(wStart);
-    const right=posForWall(wStop);
-    if(left===null&&right===null)continue;
-    const L=(left===null?0:left);
-    const R=(right===null?100:right);
-    if(R<=L)continue;
+    if(wStop<=wallS||wStart>=wallE)continue;
+    const left=posForWall(Math.max(wStart,wallS));
+    const right=posForWall(Math.min(wStop,wallE));
+    if(left===null||right===null||right<=left)continue;
     const el=document.createElement('div');
     el.className='ad-block';
-    el.style.left=L+'%';el.style.width=(R-L)+'%';
+    el.style.left=left+'%';el.style.width=(right-left)+'%';
     scrub.appendChild(el);
   }}
 }}
@@ -2386,7 +2527,9 @@ function loadDvbcSrc(slug){{
   }} else {{
     v.src=url;v.load();
   }}
-  v.addEventListener('loadedmetadata',tryPlay,{{once:true}});
+  v.addEventListener('loadedmetadata',()=>{{
+    tryPlay();restoreLastPos(slug);
+  }},{{once:true}});
 }}
 function tryMediathekLive(url){{
   return new Promise(resolve=>{{
@@ -2441,7 +2584,48 @@ function tryMediathekLive(url){{
     hls.loadSource(url);hls.attachMedia(v);
   }});
 }}
+/* Last-position per channel — persisted so "re-open live stream"
+   resumes where the user left off, not at the live edge.
+   Stored as wall-clock seconds + timestamp; ignored if older than 4 h
+   or outside the current seekable range. */
+const LASTPOS_TTL_MS=4*3600*1000;
+function saveLastPos(slug){{
+  if(!slug||onMediathek)return;
+  const t=v.currentTime||0;
+  if(t<=0)return;
+  const w=wallAt(t);
+  if(!w||!isFinite(w))return;
+  try{{
+    localStorage.setItem('lastpos_'+slug,
+      JSON.stringify({{wall:w,ts:Date.now()}}));
+  }}catch(e){{}}
+}}
+function restoreLastPos(slug){{
+  let entry=null;
+  try{{
+    entry=JSON.parse(localStorage.getItem('lastpos_'+slug)||'null');
+  }}catch(e){{}}
+  if(!entry||Date.now()-entry.ts>LASTPOS_TTL_MS)return;
+  let tries=20;
+  const tick=()=>{{
+    if(tries--<=0||current!==slug||onMediathek)return;
+    const[s,e]=seekableRange();
+    if(e<=s+2){{setTimeout(tick,300);return;}}
+    const wallS=wallAt(s);
+    if(!wallS){{setTimeout(tick,300);return;}}
+    const target=s+(entry.wall-wallS);
+    if(target<s+0.5||target>e-1)return;   /* out of buffer */
+    v.currentTime=target;
+  }};
+  setTimeout(tick,900);
+}}
+setInterval(()=>{{if(current&&!v.paused)saveLastPos(current);}},20000);
+window.addEventListener('beforeunload',()=>saveLastPos(current));
+document.addEventListener('visibilitychange',()=>{{
+  if(document.visibilityState==='hidden')saveLastPos(current);
+}});
 async function loadSrc(slug){{
+  saveLastPos(current);   /* preserve previous channel position */
   current=slug;onMediathek=false;
   const ch=channels[idx];
   if(ch)chname.textContent=ch.name;
@@ -3745,6 +3929,37 @@ def _rec_cskip_spawn(uuid):
         print(f"[rec-cskip {uuid[:8]}] spawned", flush=True)
 
 
+THUMB_INTERVAL = 30   # seconds between thumbnails
+
+def _rec_thumbs_spawn(uuid):
+    """Generate scrub-bar thumbnails (1 per THUMB_INTERVAL s, scaled to
+    160 px wide) once per recording. Writes to _rec_<uuid>/thumbs/
+    and a sentinel `.done` file when finished. Idempotent."""
+    out_dir = HLS_DIR / f"_rec_{uuid}" / "thumbs"
+    if (out_dir / ".done").exists():
+        return
+    src = _rec_source_path(uuid)
+    if not src or not Path(src).exists():
+        return
+    out_dir.mkdir(parents=True, exist_ok=True)
+    def run():
+        try:
+            subprocess.run(
+                ["nice", "-n", "18", "ionice", "-c", "3",
+                 "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+                 "-i", src,
+                 "-vf", f"fps=1/{THUMB_INTERVAL},scale=160:-2",
+                 "-q:v", "6",
+                 str(out_dir / "t%05d.jpg")],
+                timeout=900, check=False)
+            (out_dir / ".done").write_text("")
+            print(f"[rec-thumbs {uuid[:8]}] done", flush=True)
+        except Exception as e:
+            print(f"[rec-thumbs {uuid[:8]}] {e}", flush=True)
+    threading.Thread(target=run, daemon=True).start()
+    print(f"[rec-thumbs {uuid[:8]}] spawned", flush=True)
+
+
 def _rec_parse_comskip(out_dir):
     """Parse comskip's default .txt output → list of [start_s, stop_s].
     Adjacent blocks separated by a short sponsor card (≤25 s of "show")
@@ -4735,6 +4950,31 @@ def recording_ads(uuid):
     return resp
 
 
+@app.route("/recording/<uuid>/thumbs.json")
+def recording_thumbs_manifest(uuid):
+    """How many thumbs are ready and what interval they cover."""
+    thumbs_dir = HLS_DIR / f"_rec_{uuid}" / "thumbs"
+    done = (thumbs_dir / ".done").exists()
+    count = len(list(thumbs_dir.glob("t*.jpg"))) if thumbs_dir.exists() else 0
+    return _cors(Response(json.dumps({
+        "interval": THUMB_INTERVAL,
+        "count": count,
+        "done": done,
+    }), mimetype="application/json"))
+
+
+@app.route("/recording/<uuid>/thumbs/<fname>")
+def recording_thumb(uuid, fname):
+    if not re.fullmatch(r"t\d{5}\.jpg", fname):
+        abort(404)
+    fp = HLS_DIR / f"_rec_{uuid}" / "thumbs" / fname
+    if not fp.exists():
+        abort(404)
+    resp = Response(fp.read_bytes(), mimetype="image/jpeg")
+    resp.headers["Cache-Control"] = "public, max-age=3600"
+    return _cors(resp)
+
+
 @app.route("/recording/<uuid>/progress")
 def recording_hls_progress(uuid):
     """Lightweight progress poll for the player loader. Also kicks off
@@ -4753,6 +4993,8 @@ def recording_hls_progress(uuid):
                   if t.stat().st_size > 0]
         if not usable:
             _rec_cskip_spawn(uuid)
+        if not (out_dir / "thumbs" / ".done").exists():
+            _rec_thumbs_spawn(uuid)
     return _cors(Response(json.dumps({"done": st["done"],
                                         "segments": st["segments"],
                                         "total": st["total"]}),
@@ -4964,6 +5206,13 @@ def play_recording(uuid):
             f"<title>{title_safe}</title>"
             f"<style>{PLAYER_BASE_CSS}"
             f".pill.rec{{background:#e74c3c}}"
+            f"#thumb-preview{{position:fixed;width:160px;height:90px;"
+            f"border:2px solid #fff;border-radius:4px;overflow:hidden;"
+            f"box-shadow:0 2px 8px #000a;z-index:20;background:#000;"
+            f"opacity:0;pointer-events:none;transition:opacity .1s}}"
+            f"#thumb-preview img{{width:100%;height:100%;object-fit:cover;"
+            f"display:block}}"
+            f"#thumb-preview.visible{{opacity:1}}"
             f"#loader{{position:fixed;inset:0;display:flex;flex-direction:column;"
             f"align-items:center;justify-content:center;background:#000c;"
             f"z-index:30;font-size:1.05em;gap:8px;transition:opacity .3s}}"
@@ -4995,6 +5244,9 @@ def play_recording(uuid):
             f"<button id='pp' class='iconbtn' onclick='togglePlay()' "
             f"aria-label='Play/Pause'>▶</button>"
             f"<button class='iconbtn' onclick='seek(10)' aria-label='+10 s'>⏩</button>"
+            f"<button id='speedbtn' class='iconbtn' "
+            f"onclick='cycleSpeed()' aria-label='Geschwindigkeit' "
+            f"style='font-size:.75em;font-weight:600'>1×</button>"
             f"<span id='cur' class='time'>0:00</span>"
             f"<span class='spacer'></span>"
             f"<button id='skipad' class='pill rec' onclick='skipAd()'"
@@ -5011,6 +5263,15 @@ def play_recording(uuid):
             f"const loader=document.getElementById('loader');"
             f"const lmsg=document.getElementById('lmsg');"
             f"const skipBtn=document.getElementById('skipad');"
+            f"const speedBtn=document.getElementById('speedbtn');"
+            f"const SPEEDS=[1,1.25,1.5,2,0.75];"
+            f"let speedIdx=0;"
+            f"function cycleSpeed(){{"
+            f"  speedIdx=(speedIdx+1)%SPEEDS.length;"
+            f"  v.playbackRate=SPEEDS[speedIdx];"
+            f"  speedBtn.textContent=SPEEDS[speedIdx]+'×';"
+            f"  show();"
+            f"}}"
             f"let ads=[];"
             f"function fmt(s){{"
             f"  if(!isFinite(s)||s<0)s=0;"
@@ -5076,6 +5337,34 @@ def play_recording(uuid):
             f"v.addEventListener('playing',hideLoader);"
             f"v.addEventListener('loadedmetadata',hideLoader);"
             f"v.addEventListener('canplay',hideLoader);"
+            f"const LASTPOS_KEY='recpos_{uuid}';"
+            f"const LASTPOS_TTL_MS=30*24*3600*1000;"
+            f"function saveRecPos(){{"
+            f"  const t=v.currentTime||0;"
+            f"  if(!isFinite(v.duration)||v.duration<=0||t<=0)return;"
+            f"  if(t>v.duration-10){{"
+            f"    try{{localStorage.removeItem(LASTPOS_KEY);}}catch(e){{}}"
+            f"    return;"
+            f"  }}"
+            f"  try{{localStorage.setItem(LASTPOS_KEY,"
+            f"    JSON.stringify({{t:t,ts:Date.now()}}));}}catch(e){{}}"
+            f"}}"
+            f"function restoreRecPos(){{"
+            f"  let entry=null;"
+            f"  try{{entry=JSON.parse(localStorage.getItem(LASTPOS_KEY)||'null');}}"
+            f"  catch(e){{}}"
+            f"  if(!entry||Date.now()-entry.ts>LASTPOS_TTL_MS)return;"
+            f"  const D=isFinite(v.duration)?v.duration:0;"
+            f"  if(entry.t>0&&entry.t<D-2)v.currentTime=entry.t;"
+            f"}}"
+            f"setInterval(()=>{{if(!v.paused)saveRecPos();}},15000);"
+            f"window.addEventListener('beforeunload',saveRecPos);"
+            f"document.addEventListener('visibilitychange',()=>{{"
+            f"  if(document.visibilityState==='hidden')saveRecPos();"
+            f"}});"
+            f"v.addEventListener('pause',saveRecPos);"
+            f"v.addEventListener('loadedmetadata',"
+            f"  ()=>setTimeout(restoreRecPos,400),{{once:true}});"
             f"let srcSet=false;"
             f"function tick(){{"
             f"  fetch('{HOST_URL}/recording/{uuid}/progress').then(r=>r.json())"
@@ -5105,6 +5394,47 @@ def play_recording(uuid):
             f"   }}).catch(()=>{{}});"
             f"}}"
             f"fetchAds();"
+            f"let thumbMeta={{count:0,interval:30,done:false}};"
+            f"const thumbPrev=document.createElement('div');"
+            f"thumbPrev.id='thumb-preview';"
+            f"const thumbImg=document.createElement('img');"
+            f"thumbImg.alt='';thumbImg.decoding='async';"
+            f"thumbPrev.appendChild(thumbImg);"
+            f"document.body.appendChild(thumbPrev);"
+            f"function fetchThumbs(){{"
+            f"  fetch('{HOST_URL}/recording/{uuid}/thumbs.json').then(r=>r.json())"
+            f"   .then(d=>{{thumbMeta=d;if(!d.done)setTimeout(fetchThumbs,8000);}})"
+            f"   .catch(()=>setTimeout(fetchThumbs,8000));"
+            f"}}"
+            f"fetchThumbs();"
+            f"let lastThumbIdx=0;"
+            f"function showThumb(ev){{"
+            f"  if(!thumbMeta.count)return;"
+            f"  const r=scrub.getBoundingClientRect();"
+            f"  const x=(ev.touches?ev.touches[0]:ev).clientX-r.left;"
+            f"  const p=Math.max(0,Math.min(1,x/r.width));"
+            f"  const D=isFinite(v.duration)?v.duration:0;"
+            f"  if(D<=0)return;"
+            f"  const t=p*D;"
+            f"  const idx=Math.min(thumbMeta.count,"
+            f"    Math.max(1,Math.floor(t/thumbMeta.interval)+1));"
+            f"  if(idx!==lastThumbIdx){{"
+            f"    lastThumbIdx=idx;"
+            f"    thumbImg.src='{HOST_URL}/recording/{uuid}/thumbs/t'+"
+            f"      String(idx).padStart(5,'0')+'.jpg';"
+            f"  }}"
+            f"  const thumbW=160;"
+            f"  let left=ev.clientX-thumbW/2;"
+            f"  left=Math.max(8,Math.min(window.innerWidth-thumbW-8,left));"
+            f"  thumbPrev.style.left=left+'px';"
+            f"  thumbPrev.style.bottom=(window.innerHeight-r.top+10)+'px';"
+            f"  thumbPrev.classList.add('visible');"
+            f"}}"
+            f"function hideThumb(){{thumbPrev.classList.remove('visible');}}"
+            f"scrub.addEventListener('mousemove',showThumb);"
+            f"scrub.addEventListener('touchmove',showThumb,{{passive:true}});"
+            f"scrub.addEventListener('mouseleave',hideThumb);"
+            f"scrub.addEventListener('touchend',hideThumb);"
             f"document.addEventListener('keydown',e=>{{"
             f"  if(e.key==='Escape')closePlayer();"
             f"  else if(e.key==='ArrowRight')seek(10);"
@@ -5476,6 +5806,8 @@ if __name__ == "__main__":
     threading.Thread(target=_live_adskip_loop, daemon=True).start()
     threading.Thread(target=_mediathek_rip_loop, daemon=True).start()
     threading.Thread(target=_mediathek_autorec_loop, daemon=True).start()
+    threading.Thread(target=ffmpeg_watchdog_loop, daemon=True).start()
+    threading.Thread(target=disk_cleanup_loop, daemon=True).start()
     # waitress in production; fall back to Flask's built-in only if
     # waitress somehow isn't importable (e.g. an older image).
     try:
