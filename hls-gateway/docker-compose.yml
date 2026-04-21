@@ -23,3 +23,8 @@ services:
       - FAV_TAG_UUID=ed43d130b6d7f8e56b063db6de8d2b06
       - ALWAYS_WARM=
       - TZ=Europe/Berlin
+      # Live-buffer comskip runs on the Mac (tv-live-comskip.py) and
+      # writes /mnt/tv/hls/.live_ads.json directly. Setting this env
+      # var disables our internal _live_adskip_loop + /scan endpoint
+      # and makes /api/live-ads/<slug> re-read the JSON each call.
+      - LIVE_ADS_OFFLOAD=mac

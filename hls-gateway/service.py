@@ -5518,6 +5518,14 @@ LIVE_ADSKIP_SLUGS = {
 
 
 def _live_adskip_loop():
+    # When LIVE_ADS_OFFLOAD is set (e.g. "mac"), the live-buffer scan
+    # runs on another host that writes .live_ads.json directly. We read
+    # that file on every /api/live-ads/<slug> call instead.
+    if os.environ.get("LIVE_ADS_OFFLOAD"):
+        print("adskip loop: disabled (LIVE_ADS_OFFLOAD set — "
+              f"{os.environ.get('LIVE_ADS_OFFLOAD')} handles scanning)",
+              flush=True)
+        return
     # Short warm-up: threads and adopted ffmpegs settle in a few seconds.
     # The per-channel `started_at > 120s` check below is what actually
     # guarantees the buffer is long enough to bother analysing.
@@ -5564,6 +5572,10 @@ def api_live_ads_scan(slug):
     """Force an ad-detection pass across the whole current live buffer
     in 25-min chunks. Each chunk's result is merged into the cache so
     older ad blocks aren't lost when the next chunk runs."""
+    if os.environ.get("LIVE_ADS_OFFLOAD"):
+        return _cors(Response(json.dumps({"skipped": True,
+                                           "reason": "offloaded — external scanner owns live-ad detection"}),
+                               mimetype="application/json"))
     if slug not in LIVE_ADSKIP_SLUGS:
         return _cors(Response(json.dumps({"skipped": True,
                                            "reason": "not in commercial list"}),
@@ -5591,8 +5603,18 @@ def api_live_ads_scan(slug):
 
 @app.route("/api/live-ads/<slug>")
 def api_live_ads(slug):
-    with _live_ads_lock:
-        v = _live_ads.get(slug)
+    # Under LIVE_ADS_OFFLOAD, the authoritative state is the JSON on
+    # disk (another host writes it) — our in-memory cache is stale.
+    # Re-read each call; the file is only a few kB.
+    if os.environ.get("LIVE_ADS_OFFLOAD") and LIVE_ADS_FILE.exists():
+        try:
+            data = json.loads(LIVE_ADS_FILE.read_text())
+            v = data.get(slug)
+        except Exception:
+            v = None
+    else:
+        with _live_ads_lock:
+            v = _live_ads.get(slug)
     if not v:
         return _cors(Response(json.dumps({"ads": [], "generated": 0}),
                                mimetype="application/json"))
