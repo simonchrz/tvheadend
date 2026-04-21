@@ -126,9 +126,14 @@ ul.channels li {
     display: flex; flex-direction: column; align-items: center;
     justify-content: flex-start; gap: 6px;
     padding: 12px 6px 8px;
-    border: 1px solid var(--border); border-left-width: 4px;
+    border: 2px solid var(--mux-color, var(--border));
     border-radius: 8px;
     background: var(--stripe);
+    transition: border-left-width .12s, padding-left .12s;
+}
+ul.channels li:has(.buffer-bar.running) {
+    border-left-width: 5px;
+    padding-left: 3px;   /* compensate so inner content doesn't shift */
 }
 .now-title {
     font-size: .72em; line-height: 1.2; color: var(--muted);
@@ -142,20 +147,9 @@ ul.channels li {
 .now-title:empty { display: none; }
 ul.channels .logo {
     display: flex; align-items: center; justify-content: center;
-    background: #9a9a9a; border-radius: 6px; overflow: hidden;
-    transition: background .2s;
+    background: var(--logo-bg); border-radius: 6px; overflow: hidden;
 }
-ul.channels .logo img {
-    max-width: 100%; max-height: 100%;
-    filter: saturate(0.5) opacity(0.85);
-    transition: filter .2s;
-}
-ul.channels li:has(.pin-btn.active) .logo {
-    background: var(--logo-bg);
-}
-ul.channels li:has(.pin-btn.active) .logo img {
-    filter: none;
-}
+ul.channels .logo img { max-width: 100%; max-height: 100%; }
 
 /* ===== EPG layout: wrap scrolls h+v, channels column sticky ===== */
 .epg-wrap {
@@ -929,11 +923,22 @@ def index():
     # Six hues chosen so every pair stays distinguishable at an 8 px
     # dot: black, green, blue, pink, yellow, brown. No orange (reads
     # as red), no cyan/purple (collapse into green/blue at that size).
-    MUX_PALETTE = ["#2c3e50", "#27ae60", "#2980b9",
-                   "#e91e63", "#f1c40f", "#795548"]
+    MUX_PALETTE = [
+        "#1976d2",   # blue
+        "#27ae60",   # green
+        "#ff9800",   # orange
+        "#8e44ad",   # purple
+        "#f1c40f",   # yellow
+        "#00bcd4",   # cyan
+        "#c0392b",   # red
+        "#8bc34a",   # lime
+        "#2c3e50",   # slate
+        "#795548",   # brown
+        "#009688",   # teal
+        "#673ab7",   # deep-purple
+    ]
     mux_colour = {}
-    for i, mu in enumerate(sorted(
-            [m for m, ch in mux_members.items() if len(ch) > 1])):
+    for i, mu in enumerate(sorted(mux_members.keys())):
         mux_colour[mu] = MUX_PALETTE[i % len(MUX_PALETTE)]
 
     rows = []
@@ -959,10 +964,11 @@ def index():
             mux_dot = (f'<span class="mux-dot" '
                        f'style="background:{mux_colour[mu]}" '
                        f'title="{title}"></span>')
-        mux_style = (f' style="border-color:{mux_colour[mu]}"'
+        mux_style = (f' style="--mux-color:{mux_colour[mu]}"'
                      if mu in mux_colour else "")
+        mux_attr = f' data-mux="{mu}"' if mu else ""
         rows.append(
-            f'<li data-slug="{s}" title="{info["name"]}"{mux_style}>'
+            f'<li data-slug="{s}"{mux_attr} title="{info["name"]}"{mux_style}>'
             f'<button class="pin-btn" data-slug="{s}" title="Dauer-warm">📌</button>'
             f'<a class="logo" href="{watch_url}">{logo}</a>'
             f'<span class="buffer-bar" data-slug="{s}"></span>'
@@ -1249,6 +1255,38 @@ def index():
         "    localStorage.setItem('tile-size',cur);apply();"
         "  });"
         "})();"
+        # Sort toggle: 'usage' (server default) or 'mux' (group by mux).
+        "(function(){"
+        "  const ul=document.querySelector('ul.channels');"
+        "  const btn=document.getElementById('sort-toggle');"
+        "  if(!ul||!btn)return;"
+        "  const origOrder=Array.from(ul.children).map(li=>li.dataset.slug);"
+        "  let mode=localStorage.getItem('sort-mode')||'usage';"
+        "  const icons={usage:'📊',mux:'📡'};"
+        "  const labels={usage:'Nutzung',mux:'Nach Mux'};"
+        "  const apply=()=>{"
+        "    btn.textContent=icons[mode];"
+        "    btn.title='Sortierung: '+labels[mode]+' (Klick zum Umschalten)';"
+        "    const items=Array.from(ul.children);"
+        "    if(mode==='mux'){"
+        "      items.sort((a,b)=>{"
+        "        const ma=a.dataset.mux||'zzz';const mb=b.dataset.mux||'zzz';"
+        "        if(ma!==mb)return ma<mb?-1:1;"
+        "        return origOrder.indexOf(a.dataset.slug)-origOrder.indexOf(b.dataset.slug);"
+        "      });"
+        "    } else {"
+        "      items.sort((a,b)=>"
+        "        origOrder.indexOf(a.dataset.slug)-origOrder.indexOf(b.dataset.slug));"
+        "    }"
+        "    for(const li of items)ul.appendChild(li);"
+        "    reorderPinned();"
+        "  };"
+        "  apply();"
+        "  btn.addEventListener('click',()=>{"
+        "    mode=mode==='usage'?'mux':'usage';"
+        "    localStorage.setItem('sort-mode',mode);apply();"
+        "  });"
+        "})();"
         "refreshWarm();setInterval(refreshWarm,5000);"
     )
     body = (f"<html><head><meta name='viewport' "
@@ -1270,7 +1308,9 @@ def index():
             f"</div>"
             f"<h2 class='channels-head'>Kanäle"
             f" <button id='tile-size' class='tile-size-btn' "
-            f"title='Kachelgröße umschalten'>⊟</button></h2>"
+            f"title='Kachelgröße umschalten'>⊟</button>"
+            f" <button id='sort-toggle' class='tile-size-btn' "
+            f"title='Sortierung umschalten'>📊</button></h2>"
             f"<ul class='channels'>{''.join(rows)}</ul>"
             f"<h2 class='tools-head'>Tools</h2>"
             f"<ul class='tools'>{tool_rows}</ul>"
