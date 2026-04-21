@@ -2351,7 +2351,7 @@ function scrubWindow(){{
 }}
 let recChainAds=[];   /* array of [wallStart,wallStop] from chain's comskip */
 function loadRecordingChain(slug){{
-  fetch(HOST+'/api/recording-window/'+slug).then(r=>r.json()).then(d=>{{
+  return fetch(HOST+'/api/recording-window/'+slug).then(r=>r.json()).then(d=>{{
     if(slug!==current)return;
     const ch=(d&&d.chain)||[];
     recChain=ch.length?ch:null;
@@ -2420,6 +2420,32 @@ v.addEventListener('loadedmetadata',()=>{{
 setInterval(()=>{{if(!v.paused)renderChapters();}},5000);
 setInterval(()=>{{if(current)loadLiveAds(current);}},300000);
 function goLive(){{
+  /* Mediathek-live channel: stay inside the Mediathek HLS and just
+     seek to its live edge — avoids spawning a DVB-C tuner. hls.js
+     needs stopLoad + startLoad to realign with fresh segments,
+     otherwise quick consecutive seeks can freeze on a stale frame. */
+  if(onMediathek){{
+    const[s,e]=seekableRange();
+    if(e>s){{
+      const target=Math.max(s+0.5,e-4);
+      if(hlsInst){{
+        try{{hlsInst.stopLoad();hlsInst.startLoad(target);}}catch(err){{}}
+      }}
+      v.currentTime=target;
+      v.play().catch(()=>{{}});
+      /* Safety retry: if playback isn't progressing after 800 ms,
+         nudge currentTime to the latest edge and replay. */
+      setTimeout(()=>{{
+        if(!onMediathek||v.paused)return;
+        const[,ee]=seekableRange();
+        if(ee>target+3&&Math.abs(v.currentTime-target)<0.3){{
+          v.currentTime=Math.max(s+0.5,ee-3);
+          v.play().catch(()=>{{}});
+        }}
+      }},800);
+      show();return;
+    }}
+  }}
   if(onMediathek||onRecording){{
     onMediathek=false;onRecording=false;
     recWindow=null;recChain=null;recCurrentIdx=-1;
@@ -2548,8 +2574,13 @@ function isReachable(ev){{
   if(mediathekAvailable&&ev.start>=Date.now()/1000-mediathekWindow)return true;
   return false;
 }}
+/* Gate chapter rendering until both Mediathek-availability and
+   the recording-chain fetches have resolved — otherwise the ticks
+   appear but tapping them would race the unfinished prerequisites. */
+let _chaptersReady=false;
 function renderChapters(){{
   document.querySelectorAll('.chapter').forEach(el=>el.remove());
+  if(!_chaptersReady)return;
   const nowWall=Date.now()/1000;
   for(const ev of epgEvents){{
     if(!isReachable(ev))continue;
@@ -2575,7 +2606,7 @@ function renderChapters(){{
   }}
 }}
 function loadMediathekAvail(slug){{
-  fetch(HOST+'/api/mediathek-live/'+slug).then(r=>r.json()).then(d=>{{
+  return fetch(HOST+'/api/mediathek-live/'+slug).then(r=>r.json()).then(d=>{{
     if(slug!==current)return;
     mediathekAvailable=!!d.url;
     mediathekWindow=d.window||0;
@@ -3211,10 +3242,15 @@ async function loadSrc(slug){{
   history.replaceState(null,'','/watch/'+slug);
   loadEpg(slug);
   loadEvents(slug);
-  loadMediathekAvail(slug);
+  _chaptersReady=false;
+  const mtP=loadMediathekAvail(slug);
   loadLiveAds(slug);
   recChain=null;recCurrentIdx=-1;
-  loadRecordingChain(slug);
+  const chP=loadRecordingChain(slug);
+  Promise.all([mtP,chP]).then(()=>{{
+    if(slug!==current)return;
+    _chaptersReady=true;renderChapters();
+  }});
   showHint(slug);
   /* Public-broadcaster channels have a Mediathek live stream — try
      that first to save a DVB-C tuner + the Pi CPU. Only fall back to
