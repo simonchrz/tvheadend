@@ -2255,8 +2255,8 @@ body{{touch-action:pan-y}}
   <button id='pp' class='iconbtn' onclick='togglePlay()'
    aria-label='Play/Pause'>▶</button>
   <button class='iconbtn' onclick='seek(10)' aria-label='+10 s'>⏩</button>
-  <button id='liveBtn' class='iconbtn' onclick='goLive()'
-   aria-label='Zu Live'>⏭</button>
+  <button id='liveBtn' class='iconbtn' onclick='goShowNext()'
+   aria-label='Zur nächsten Sendung'>⏭</button>
   <button id='skipad' onclick='skipCurrentAd()'>Werbung ⏭</button>
   <button class='iconbtn' onclick='prevCh()' aria-label='voriger Kanal'>◀︎</button>
   <button class='iconbtn' onclick='nextCh()' aria-label='nächster Kanal'>▶︎</button>
@@ -2332,13 +2332,43 @@ function isAtLive(){{
 }}
 /* Scrub bar coordinate system: fixed 2h window ending at "now".
    Both seekable content and chapter markers are mapped into it. */
-let recWindow=null;   /* [start_ts, stop_ts] when onRecording */
+let recChain=null;       /* array of chain entries (uuid/start/stop/hls_url) */
+let recCurrentIdx=-1;    /* index into recChain of the currently loaded VOD */
+let recWindow=null;      /* [chain_start_ts, chain_stop_or_now_ts] */
 function scrubWindow(){{
   if(onRecording&&recWindow){{
     return [recWindow[0],recWindow[1]];
   }}
   const now=Date.now()/1000;
+  /* Live view but we know there's a recording chain: extend scrub
+     window leftward to the chain's earliest recording so the user
+     sees every chain boundary without having to jump in first. */
+  if(recChain&&recChain.length){{
+    const earliest=recChain[0].start;
+    return [Math.min(now-WINDOW,earliest),now];
+  }}
   return [now-WINDOW,now];
+}}
+let recChainAds=[];   /* array of [wallStart,wallStop] from chain's comskip */
+function loadRecordingChain(slug){{
+  fetch(HOST+'/api/recording-window/'+slug).then(r=>r.json()).then(d=>{{
+    if(slug!==current)return;
+    const ch=(d&&d.chain)||[];
+    recChain=ch.length?ch:null;
+    recChainAds=[];
+    if(recChain){{
+      for(const rec of recChain){{
+        fetch(HOST+'/recording/'+rec.uuid+'/ads').then(r=>r.json()).then(a=>{{
+          if(slug!==current)return;
+          for(const[s,e]of(a.ads||[])){{
+            recChainAds.push([rec.start+s,rec.start+e]);
+          }}
+          renderLiveAds();
+        }}).catch(()=>{{}});
+      }}
+    }}
+    renderChapters();renderLiveAds();
+  }}).catch(()=>{{}});
 }}
 function scrubPct(wallTs){{
   const[ws,we]=scrubWindow();
@@ -2347,8 +2377,15 @@ function scrubPct(wallTs){{
 function refresh(){{
   const[s,e]=seekableRange();
   const curWall=wallAt(v.currentTime||0);
-  const seekStartW=e>s?wallAt(s):curWall;
-  const seekEndW  =e>s?wallAt(e):curWall;
+  let seekStartW,seekEndW;
+  if(onRecording&&recChain&&recChain.length){{
+    seekStartW=recChain[0].start;
+    const last=recChain[recChain.length-1];
+    seekEndW=last.running?Date.now()/1000:last.stop;
+  }} else {{
+    seekStartW=e>s?wallAt(s):curWall;
+    seekEndW  =e>s?wallAt(e):curWall;
+  }}
   const availL=scrubPct(seekStartW);
   const availR=scrubPct(seekEndW);
   avail.style.left=availL+'%';
@@ -2384,7 +2421,8 @@ setInterval(()=>{{if(!v.paused)renderChapters();}},5000);
 setInterval(()=>{{if(current)loadLiveAds(current);}},300000);
 function goLive(){{
   if(onMediathek||onRecording){{
-    onMediathek=false;onRecording=false;recWindow=null;
+    onMediathek=false;onRecording=false;
+    recWindow=null;recChain=null;recCurrentIdx=-1;
     loadDvbcSrc(current);
     v.addEventListener('loadedmetadata',()=>{{
       const[,e]=seekableRange();
@@ -2396,6 +2434,47 @@ function goLive(){{
   const[,e]=seekableRange();
   if(e>0)v.currentTime=e-2;
 }}
+/* ⏭ acts as "next show": advance to the start of the next show
+   (chain / Mediathek / live currently-airing). At the end of the
+   chain or when caught up, falls back to live edge. */
+function goShowNext(){{
+  /* Recording chain: advance one entry, or to live if at the tail. */
+  if(onRecording&&recChain&&recCurrentIdx>=0){{
+    if(recCurrentIdx<recChain.length-1){{
+      const nextIdx=recCurrentIdx+1;
+      switchToRecording(recChain[nextIdx],recChain[nextIdx].start,nextIdx);
+      return;
+    }}
+    goLive();return;
+  }}
+  /* Mediathek: jump forward to the next reachable EPG event. */
+  if(onMediathek){{
+    let cur=currentEvent();
+    const recentJump=(Date.now()-_lastJumpedTs<3000)&&_lastJumpedEv;
+    if(recentJump)cur=_lastJumpedEv;
+    if(cur){{
+      const next=epgEvents.find(e=>e.start>=cur.stop);
+      if(next&&isReachable(next)){{jumpToEvent(next);return;}}
+    }}
+    goLive();return;
+  }}
+  /* Live mode in chain-aware context: if we're in the live-window
+     but before the currently-airing event, advance to its start. */
+  if(recChain&&recChain.length){{
+    const curWall=wallForCurrent();
+    const nowS=Date.now()/1000;
+    const next=epgEvents.find(e=>e.start>curWall+5&&e.start<=nowS);
+    if(next){{
+      const[s,e]=seekableRange();
+      const wallS=e>s?wallAt(s):null;
+      if(wallS!==null&&next.start>=wallS&&next.start<=wallAt(e)){{
+        v.currentTime=Math.max(s+0.5,Math.min(e-1,next.start-wallS));
+        show();return;
+      }}
+    }}
+  }}
+  goLive();
+}}
 let onRecording=false;
 /* When the recording-VOD ends (player reached its final segment),
    switch back to the live stream. Guard against spurious events
@@ -2405,14 +2484,22 @@ v.addEventListener('ended',()=>{{
   const dur=v.duration;
   if(!isFinite(dur)||dur<=0)return;
   if(Math.abs(v.currentTime-dur)>2)return;
+  /* Advance to the next recording in the chain, if any; else go live. */
+  if(recChain&&recCurrentIdx>=0&&recCurrentIdx<recChain.length-1){{
+    const nextIdx=recCurrentIdx+1;
+    switchToRecording(recChain[nextIdx],recChain[nextIdx].start,nextIdx);
+    return;
+  }}
   goLive();
 }});
 /* Safari HLS exposes getStartDate() = wall-clock time of currentTime=0
    (from #EXT-X-PROGRAM-DATE-TIME). That gives reliable mapping between
    video time and real-world time. Fallback: Date.now() - (end-ct). */
 function wallAt(t){{
-  if(onRecording&&recWindow){{
-    return recWindow[0]+(t||0);
+  if(onRecording&&recChain&&recCurrentIdx>=0){{
+    /* Active VOD is recChain[recCurrentIdx]; its t=0 maps to that
+       entry's start wall-clock time. */
+    return recChain[recCurrentIdx].start+(t||0);
   }}
   if(typeof v.getStartDate==='function'){{
     const d=v.getStartDate();
@@ -2443,6 +2530,13 @@ let epgEvents=[];
 let mediathekAvailable=false;
 let mediathekWindow=0;
 function isReachable(ev){{
+  /* Recording-chain: any event overlapping the full chain window. */
+  if(onRecording&&recChain&&recChain.length){{
+    const first=recChain[0];
+    const last=recChain[recChain.length-1];
+    const chainEnd=last.running?Date.now()/1000:last.stop;
+    if(ev.start>=first.start-2&&ev.start<chainEnd)return true;
+  }}
   /* Local: event start must be inside currently-seekable range.  */
   const[ss,ee]=seekableRange();
   if(ee>ss){{
@@ -2510,9 +2604,18 @@ function doJump(actualStart,fromAuthoritative){{
   const targetWall=actualStart-leadIn+postRoll;
   const[s,e]=seekableRange();
   const wallS=e>s?wallAt(s):null;
-  if(wallS!==null&&targetWall>=wallS){{
+  if(!onRecording&&wallS!==null&&targetWall>=wallS){{
     v.currentTime=Math.max(s+0.5,Math.min(e-1,targetWall-wallS));
     show();return;
+  }}
+  /* Not in live buffer — if the target falls inside a known chain
+     recording, load that VOD chain. */
+  if(recChain&&recChain.length){{
+    const idx=recChain.findIndex(c=>c.start<=targetWall&&targetWall<c.stop);
+    if(idx>=0){{
+      activateRecordingChain(recChain,idx,targetWall);
+      return;
+    }}
   }}
   fetch(HOST+'/api/mediathek-live/'+current)
    .then(r=>r.json()).then(d=>{{
@@ -2527,7 +2630,9 @@ function doJump(actualStart,fromAuthoritative){{
      switchToMediathek(d.url,targetWall,0);
    }}).catch(()=>{{}});
 }}
+let _lastJumpedEv=null,_lastJumpedTs=0;
 function jumpToEvent(ev){{
+  _lastJumpedEv=ev;_lastJumpedTs=Date.now();
   fetch(HOST+'/api/show-actual-start/'+current+'?ts='+ev.start)
    .then(r=>r.json()).then(d=>{{
      const auth=(d.source==='ard-nownext'||d.source==='zdf-getepg');
@@ -2549,6 +2654,35 @@ function showHintMsg(msg,ms){{
   setTimeout(()=>hint.classList.remove('show'),ms||2500);
 }}
 async function goShowStart(){{
+  /* If we're already in recording-chain mode and near the start of
+     the current chain member, step back to the previous one. */
+  if(onRecording&&recChain&&recCurrentIdx>=0){{
+    const curT=v.currentTime||0;
+    if(curT<=8&&recCurrentIdx>0){{
+      const prevIdx=recCurrentIdx-1;
+      switchToRecording(recChain[prevIdx],recChain[prevIdx].start,prevIdx);
+      return;
+    }}
+    /* Otherwise jump to start of current chain member. */
+    v.currentTime=0;show();return;
+  }}
+  /* Mediathek mode: same step-back idea. If we're near the current
+     event's start, jump to the previous (reachable) EPG event. Uses
+     _lastJumpedEv as the "current" anchor during the ~2 s window
+     right after a jump (before Mediathek playback has settled),
+     otherwise a quick double-tap would re-jump to the same event. */
+  if(onMediathek){{
+    let cur=currentEvent();
+    const recentJump=(Date.now()-_lastJumpedTs<3000)&&_lastJumpedEv;
+    if(recentJump)cur=_lastJumpedEv;
+    const curWall=wallForCurrent();
+    const nearStart=cur&&(recentJump||Math.abs(curWall-cur.start)<=10);
+    if(cur&&nearStart){{
+      const prev=[...epgEvents].reverse().find(e=>e.stop<=cur.start);
+      if(prev&&isReachable(prev)){{jumpToEvent(prev);return;}}
+    }}
+    if(cur){{jumpToEvent(cur);return;}}
+  }}
   let ev=currentEvent();
   if(!ev){{
     /* EPG not loaded yet — fetch synchronously and retry. */
@@ -2573,22 +2707,38 @@ async function goShowStart(){{
      2) public Mediathek HLS (public broadcasters only) */
   showHintMsg('Suche Aufnahme…',4000);
   fetch(HOST+'/api/recording-window/'+current)
-   .then(r=>r.json()).then(rec=>{{
-     if(rec&&rec.hls_url&&rec.start<=ev.start){{
-       switchToRecording(rec,ev.start);
+   .then(r=>r.json()).then(resp=>{{
+     const chain=(resp&&resp.chain)||[];
+     /* Pick the chain entry whose [start,stop] covers ev.start. */
+     const targetIdx=chain.findIndex(c=>c.start<=ev.start&&ev.start<c.stop);
+     if(targetIdx<0||chain.length===0){{
+       fetch(HOST+'/api/mediathek-live/'+current)
+        .then(r=>r.json()).then(d=>{{
+          if(!d.url){{
+            showHintMsg('Sendungsanfang außerhalb Puffer');
+            return;
+          }}
+          switchToMediathek(d.url,ev.start);
+        }}).catch(()=>{{showHintMsg('Mediathek-Fehler');}});
        return;
      }}
-     fetch(HOST+'/api/mediathek-live/'+current)
-      .then(r=>r.json()).then(d=>{{
-        if(!d.url){{
-          showHintMsg('Sendungsanfang außerhalb Puffer');
-          return;
-        }}
-        switchToMediathek(d.url,ev.start);
-      }}).catch(()=>{{showHintMsg('Mediathek-Fehler');}});
+     activateRecordingChain(chain,targetIdx,ev.start);
    }}).catch(err=>{{showHintMsg('Recording-Fehler: '+err);}});
 }}
-function switchToRecording(rec,wallStartTs){{
+function activateRecordingChain(chain,targetIdx,wallStartTs){{
+  recChain=chain;
+  const first=chain[0], last=chain[chain.length-1];
+  /* The chain window covers from the earliest chain member's start
+     to either the last member's stop OR now (if last is running). */
+  const nowS=Date.now()/1000;
+  const windowEnd=last.running?nowS:last.stop;
+  recWindow=[first.start,windowEnd];
+  switchToRecording(chain[targetIdx],wallStartTs,targetIdx);
+  /* Re-render chapter ticks with the new (full-chain) reachable
+     window so all event boundaries are visible at once. */
+  setTimeout(renderChapters,100);
+}}
+function switchToRecording(rec,wallStartTs,idx){{
   /* Load the tvheadend recording as the active HLS source.
      Poll /progress first — the playlist is 202-pending until
      ffmpeg has remuxed ~10 segments. Seek offset = wall-time of
@@ -2596,7 +2746,7 @@ function switchToRecording(rec,wallStartTs){{
   destroyHls();
   onMediathek=false;
   onRecording=true;
-  recWindow=[rec.start,rec.stop];
+  recCurrentIdx=(typeof idx==='number')?idx:0;
   setSource('rec');
   const offset=Math.max(0,wallStartTs-rec.start);
   hint.textContent='Aufnahme wird vorbereitet…';
@@ -2745,18 +2895,22 @@ function loadEvents(slug){{
 }}
 let liveAds=[];
 const skipBtn=document.getElementById('skipad');
+function allAdsWall(){{
+  /* Union of live-buffer ads + chain recording ads (both already
+     wall-clock), de-duped/sorted; chain ads survive even when the
+     live buffer rolled past their segments. */
+  const all=[...liveAds,...recChainAds];
+  all.sort((a,b)=>a[0]-b[0]);
+  return all;
+}}
 function renderLiveAds(){{
   document.querySelectorAll('.ad-block').forEach(el=>el.remove());
-  /* Only render blocks that overlap the currently-seekable range —
-     otherwise stale ads from an earlier long buffer stay scattered
-     across the scrub bar even though the user can't seek to them. */
-  const[sr,er]=seekableRange();
-  if(er<=sr)return;
-  const wallS=wallAt(sr),wallE=wallAt(er);
-  for(const[wStart,wStop]of liveAds){{
-    if(wStop<=wallS||wStart>=wallE)continue;
-    const left=posForWall(Math.max(wStart,wallS));
-    const right=posForWall(Math.min(wStop,wallE));
+  const[ws,we]=scrubWindow();
+  if(we<=ws)return;
+  for(const[wStart,wStop]of allAdsWall()){{
+    if(wStop<=ws||wStart>=we)continue;
+    const left=posForWall(Math.max(wStart,ws));
+    const right=posForWall(Math.min(wStop,we));
     if(left===null||right===null||right<=left)continue;
     const el=document.createElement('div');
     el.className='ad-block';
@@ -2766,7 +2920,7 @@ function renderLiveAds(){{
 }}
 function currentLiveAd(){{
   const w=wallForCurrent();
-  for(const[a,b]of liveAds){{if(w>=a&&w<b)return[a,b];}}
+  for(const[a,b]of allAdsWall()){{if(w>=a&&w<b)return[a,b];}}
   return null;
 }}
 function skipCurrentAd(){{
@@ -2787,6 +2941,26 @@ function loadLiveAds(slug){{
   }}).catch(()=>{{}});
 }}
 function seek(d){{
+  /* Recording-chain: allow ±N-second seeks to cross chain borders
+     and advance to previous/next VOD (or to live at the end). */
+  if(onRecording&&recChain&&recCurrentIdx>=0){{
+    const curWall=recChain[recCurrentIdx].start+(v.currentTime||0);
+    const target=curWall+d;
+    const last=recChain[recChain.length-1];
+    const nowS=Date.now()/1000;
+    if(d>0&&last.running&&target>=last.stop&&target>=nowS-3){{
+      goLive();return;
+    }}
+    const idx=recChain.findIndex(c=>c.start<=target&&target<c.stop);
+    if(idx>=0&&idx!==recCurrentIdx){{
+      switchToRecording(recChain[idx],target,idx);
+      return;
+    }}
+    /* Same VOD: clamp to 0..duration. */
+    const dur=v.duration||0;
+    const newT=Math.max(0,Math.min(dur-0.5,(v.currentTime||0)+d));
+    v.currentTime=newT;show();return;
+  }}
   const[s,e]=seekableRange();
   v.currentTime=Math.max(s,Math.min(e-1,(v.currentTime||0)+d));
   show();
@@ -2797,6 +2971,26 @@ function seekTo(ev){{
   const p=Math.max(0,Math.min(1,x/r.width));
   const[ws,we]=scrubWindow();
   const targetWall=ws+p*(we-ws);
+  /* Recording-chain mode: target wall-time might fall in a different
+     chain member than the currently-loaded one — switch VOD if so. */
+  if(onRecording&&recChain){{
+    const nowS=Date.now()/1000;
+    const lastIdx=recChain.length-1;
+    const last=recChain[lastIdx];
+    /* Scrubbed past last recording's stop → go live. */
+    if(last.running&&targetWall>=last.stop&&targetWall>=nowS-3){{
+      goLive();return;
+    }}
+    const idx=recChain.findIndex(c=>c.start<=targetWall&&targetWall<c.stop);
+    const targetIdx=idx>=0?idx:(targetWall<recChain[0].start?0:lastIdx);
+    if(targetIdx!==recCurrentIdx){{
+      switchToRecording(recChain[targetIdx],targetWall,targetIdx);
+      return;
+    }}
+    /* Same VOD — seek within. */
+    v.currentTime=Math.max(0,targetWall-recChain[targetIdx].start);
+    return;
+  }}
   const[s,e]=seekableRange();
   if(e<=s)return;
   /* Clamp target into the seekable window, then translate wall→video time */
@@ -3019,6 +3213,8 @@ async function loadSrc(slug){{
   loadEvents(slug);
   loadMediathekAvail(slug);
   loadLiveAds(slug);
+  recChain=null;recCurrentIdx=-1;
+  loadRecordingChain(slug);
   showHint(slug);
   /* Public-broadcaster channels have a Mediathek live stream — try
      that first to save a DVB-C tuner + the Pi CPU. Only fall back to
@@ -3552,38 +3748,65 @@ def api_now(slug):
 
 @app.route("/api/recording-window/<slug>")
 def api_recording_window(slug):
-    """If tvheadend is currently recording something on this channel,
-    return the DVR uuid + wall-clock window so the live player can
-    use the recording as an extended back-buffer (before the 2 h live
-    DVR window). Returns {} if nothing is being recorded right now."""
+    """Find chained DVR entries on this channel that form a continuous
+    back-buffer. Starts from the currently-recording entry (if any)
+    and walks backwards through contiguous completed recordings
+    (gap ≤ 180 s counts as "contiguous"). Returns the chain sorted
+    oldest → newest. Empty if nothing relevant is on disk."""
     with cmap_lock:
         info = channel_map.get(slug)
     if not info:
-        return _cors(Response(json.dumps({}), mimetype="application/json"))
+        return _cors(Response(json.dumps({"chain": []}),
+                               mimetype="application/json"))
     ch_uuid = info.get("uuid")
     try:
         data = json.loads(urllib.request.urlopen(
-            f"{TVH_BASE}/api/dvr/entry/grid?limit=100&sort=start&dir=DESC",
+            f"{TVH_BASE}/api/dvr/entry/grid?limit=200&sort=start&dir=DESC",
             timeout=5).read())
     except Exception:
-        return _cors(Response(json.dumps({}), mimetype="application/json"))
+        return _cors(Response(json.dumps({"chain": []}),
+                               mimetype="application/json"))
     now_ts = int(time.time())
+    CHAIN_GAP = 180   # seconds — two recordings within 3 min are "chained"
+    MAX_BACK  = 6 * 3600  # how far back we'll walk (safety)
+    # Collect relevant DVR entries: currently-recording OR completed
+    # within the last 6 h on this channel.
+    candidates = []
     for e in data.get("entries", []):
         if e.get("channel") != ch_uuid:
             continue
-        if not (e.get("start", 0) <= now_ts < e.get("stop", 0)):
+        start = e.get("start", 0); stop = e.get("stop", 0)
+        sched = e.get("sched_status", "")
+        is_running = (start <= now_ts < stop and sched == "recording")
+        is_recent  = (sched == "completed"
+                      and stop > now_ts - MAX_BACK
+                      and stop <= now_ts)
+        if not (is_running or is_recent):
             continue
-        if e.get("sched_status") != "recording":
-            continue
-        uuid = e.get("uuid")
-        return _cors(Response(json.dumps({
-            "uuid": uuid,
+        if not e.get("filename") and not is_running:
+            continue   # nothing on disk yet
+        candidates.append({
+            "uuid": e.get("uuid"),
             "title": e.get("disp_title") or "",
-            "start": e.get("start"),
-            "stop": e.get("stop"),
-            "hls_url": f"{HOST_URL}/recording/{uuid}/index.m3u8",
-        }), mimetype="application/json"))
-    return _cors(Response(json.dumps({}), mimetype="application/json"))
+            "start": start,
+            "stop": stop,
+            "running": is_running,
+        })
+    candidates.sort(key=lambda c: c["start"])
+    # Walk backwards from the newest relevant entry, pulling in the
+    # previous one if it's within CHAIN_GAP of the current chain-start.
+    if not candidates:
+        return _cors(Response(json.dumps({"chain": []}),
+                               mimetype="application/json"))
+    chain = [candidates[-1]]
+    for cand in reversed(candidates[:-1]):
+        if chain[0]["start"] - cand["stop"] > CHAIN_GAP:
+            break
+        chain.insert(0, cand)
+    for c in chain:
+        c["hls_url"] = f"{HOST_URL}/recording/{c['uuid']}/index.m3u8"
+    return _cors(Response(json.dumps({"chain": chain}),
+                           mimetype="application/json"))
 
 
 @app.route("/api/channels")
