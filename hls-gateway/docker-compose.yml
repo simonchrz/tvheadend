@@ -23,8 +23,12 @@ services:
       - FAV_TAG_UUID=ed43d130b6d7f8e56b063db6de8d2b06
       - ALWAYS_WARM=
       - TZ=Europe/Berlin
-      # Live-buffer comskip runs on the Mac (tv-live-comskip.py) and
-      # writes /mnt/tv/hls/.live_ads.json directly. Setting this env
-      # var disables our internal _live_adskip_loop + /scan endpoint
-      # and makes /api/live-ads/<slug> re-read the JSON each call.
-      - LIVE_ADS_OFFLOAD=mac
+      # Live-buffer comskip can be offloaded to an external host by
+      # setting LIVE_ADS_OFFLOAD (e.g. =mac). The external scanner
+      # writes /mnt/tv/hls/.live_ads.json directly; our internal
+      # _live_adskip_loop goes dormant and /api/live-ads/<slug>
+      # re-reads the JSON each call. Currently disabled until the SSD
+      # is on USB 3 — parallel SMB reads + DVB writes over USB 2 tip
+      # the drive into EXT4 shutdown (happened 2026-04-21, see CLAUDE.md
+      # Operations section).
+      # - LIVE_ADS_OFFLOAD=mac
