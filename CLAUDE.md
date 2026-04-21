@@ -212,6 +212,39 @@ ssh <user>@<pi-host> 'docker kill -s HUP hls-gateway'
 ssh <user>@<pi-host> 'cd ~/hls-gateway && docker compose build && docker compose up -d'
 ```
 
+## Operations — SSD swap / device re-enumeration
+
+The recordings SSD is USB-connected. When swapping cables or moving the drive to another port, follow this order:
+
+```sh
+# Mac (if SMB mount + offload agent are active): stop the agent + unmount first
+launchctl bootout gui/$UID/com.user.tv-comskip
+diskutil unmount ~/mnt/pi-tv
+
+# Pi: stop anything touching /mnt/tv
+# 1. POST /api/dvr/entry/stop for any active DVR recording (else lsof shows open write handles)
+# 2. take services down — `docker compose down`, NOT stop (see gotcha below)
+for d in tvheadend hls-gateway caddy; do (cd /home/simon/$d && docker compose down); done
+sudo systemctl stop smbd nmbd
+sudo sync && sudo umount /mnt/tv
+echo 1 | sudo tee /sys/block/sda/device/delete   # flush write cache + detach USB device
+
+# --- physically swap cable / port ---
+
+# Pi: bring back up in dependency order
+sudo mount /mnt/tv           # fstab uses UUID so /dev/sdb vs /dev/sda doesn't matter
+sudo systemctl start smbd nmbd
+for d in tvheadend hls-gateway caddy; do (cd /home/simon/$d && docker compose up -d); done
+
+# Mac: remount + reload agent
+/sbin/mount_smbfs "//simon:***@raspberrypi5lan/tv" ~/mnt/pi-tv
+launchctl bootstrap gui/$UID ~/Library/LaunchAgents/com.user.tv-comskip.plist
+```
+
+**Docker bind-mount staleness after device re-enumeration** — use `docker compose down && up`, **not** `docker stop && start`. When the underlying device disappears and reappears (SSD unplug → replug), containers started with `docker start` keep a stale mount-namespace reference to the old device node; every access inside the container returns `OSError: [Errno 5] Input/output error` even though `ls /mnt/tv/hls` on the host works fine. `compose down && up` recreates the container, rebuilding the mount namespace fresh. Symptom in the wild: `/recordings` returns HTTP 500 with `[Errno 5]` in the hls-gateway traceback while every `.ts` file is visibly present from the host shell. dmesg hint: EXT4 warnings referencing the *previous* device node (e.g. `device sda1` after the drive re-enumerated as `sdb1`).
+
+**USB cable + port identification for the T5** — the Samsung T5 negotiates USB 3.2 Gen 2 (10 Gbps) only with a proper SuperSpeed A-to-C cable. Labels like "Anker 3.1A" refer to *charging amperage*, not the USB spec — those are USB 2.0 cables. Diagnose via `lsusb -t`: the T5 must attach to Bus 002 or Bus 004 (5000M root hubs) for SuperSpeed; attaching to Bus 001/003 (480M) means USB 2.0 negotiation, either wrong port or a cable without SuperSpeed pins (only 4 contacts in the USB-A plug vs. 9 for USB 3). `dmesg` distinguishes: `high-speed` = USB 2.0, `SuperSpeed` = USB 3.0. Orthogonal issue: the kernel also applies a UAS-disable quirk for the T5 (`UAS is ignored for this device, using usb-storage instead`) which costs another 30-40% throughput even after USB 3 negotiates; overrideable with `usb-storage.quirks=04e8:61f5:` on the kernel cmdline.
+
 ## Public channels currently wired
 
 | slug | Mediathek URL | Window | Now-Next source |
@@ -226,7 +259,11 @@ ssh <user>@<pi-host> 'cd ~/hls-gateway && docker compose build && docker compose
 ## What's intentionally NOT done
 
 - MediaMTX / go2rtc fallback (extensively tested, abandoned — see
-  project memory for details)
+  project memory for details). The go2rtc docker-compose and its
+  Caddy routes were removed 2026-04-21; `/home/simon/go2rtc/` still
+  exists on the Pi but the container isn't running. Caddy no longer
+  references `:1984`, `/live/*.m3u8`, `/live/hls/*`, `/api/ws`,
+  `/api/webrtc*`, `/video-rtc.js`, or `/video-stream.js`.
 - Per-channel audio silence / scene-change analysis for show boundary
   detection (comskip-for-live) — not worth the CPU and still not
   sekundengenau. We use Now-Next APIs + per-channel lead-in instead.
