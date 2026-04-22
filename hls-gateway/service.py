@@ -4684,12 +4684,42 @@ def recordings_page():
         else:
             title_cell = f'<span>{title}</span>'
         if is_done:
-            playlist = HLS_DIR / f"_rec_{uuid}" / "index.m3u8"
+            out_dir = HLS_DIR / f"_rec_{uuid}"
+            playlist = out_dir / "index.m3u8"
+            scanning_lock = out_dir / ".scanning"
+            # When the Mac handler is doing work, _rec_hls_procs and
+            # _rec_cskip_procs are empty. Infer Mac activity from the
+            # cooperative .scanning lock-file on the SMB share — fresh
+            # lock + no Pi-local proc means the Mac is mid-work on
+            # this recording.
+            try:
+                mac_active = (scanning_lock.exists() and
+                              time.time() - scanning_lock.stat().st_mtime < 900)
+            except Exception:
+                mac_active = False
+            try:
+                has_endlist = (playlist.exists() and
+                               "#EXT-X-ENDLIST" in playlist.read_text(errors="ignore"))
+            except Exception:
+                has_endlist = False
+            has_txt = any(f.stat().st_size > 0
+                          for f in out_dir.glob("*.txt")
+                          if f.is_file())
+
             proc_info = _rec_hls_procs.get(uuid)
-            running = proc_info is not None and proc_info["proc"].poll() is None
-            if playlist.exists() and not running:
+            pi_remux_running = (proc_info is not None and
+                                proc_info["proc"].poll() is None)
+            cskip_info = _rec_cskip_procs.get(uuid)
+            pi_cskip_running = (cskip_info and
+                                cskip_info["proc"].poll() is None)
+            mac_remuxing = (mac_active and not pi_remux_running
+                            and not has_endlist)
+            mac_scanning = (mac_active and not pi_cskip_running
+                            and has_endlist and not has_txt)
+
+            if playlist.exists() and not pi_remux_running and not mac_remuxing:
                 prewarm = '<span class="badge ready" title="sofort abspielbar">▶ bereit</span>'
-            elif running:
+            elif pi_remux_running:
                 total = (proc_info or {}).get("total_segs", 0)
                 segs = 0
                 if playlist.exists():
@@ -4698,12 +4728,17 @@ def recordings_page():
                 pct = (int(segs * 100 / total) if total > 0 else 0)
                 prewarm = (f'<span class="badge warming" '
                            f'title="Remux läuft">⏳ {pct}%</span>')
+            elif mac_remuxing:
+                prewarm = ('<span class="badge warming" '
+                           'title="Mac remuxt">⏳ Mac</span>')
             else:
                 prewarm = '<span class="badge pending" title="noch nicht remuxt">◌ ausstehend</span>'
-            cskip_info = _rec_cskip_procs.get(uuid)
-            if cskip_info and cskip_info["proc"].poll() is None:
+            if pi_cskip_running:
                 prewarm += (' <span class="badge scanning" '
                             'title="comskip analysiert Werbeblöcke">🔍 scan</span>')
+            elif mac_scanning:
+                prewarm += (' <span class="badge scanning" '
+                            'title="Mac comskip analysiert Werbeblöcke">🔍 Mac</span>')
         else:
             prewarm = ""
         return (f'<tr><td>{badge}</td>'
