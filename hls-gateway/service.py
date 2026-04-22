@@ -5992,6 +5992,14 @@ def _rec_prewarm_once():
         out_dir = HLS_DIR / f"_rec_{uuid}"
         playlist = out_dir / "index.m3u8"
         if not playlist.exists():
+            # Hand off to the Mac if its handler is alive — its CPU
+            # remuxes MPEG-2 -> H.264 5-10x faster and the Pi has
+            # ffmpeg + live transcodes already saturating its cores.
+            # Lazy fallback in recording_hls() (= user actually opened
+            # this recording) is unaffected — that path always spawns
+            # so the user isn't stuck waiting on the Mac.
+            if _mac_comskip_alive():
+                continue
             print(f"[rec-prewarm] remuxing {uuid[:8]} "
                   f"({e.get('disp_title', '?')[:40]})", flush=True)
             _rec_hls_spawn(uuid)
