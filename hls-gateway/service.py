@@ -6636,8 +6636,20 @@ def play_recording(uuid):
             f"  if(document.visibilityState==='hidden')saveRecPos();"
             f"}});"
             f"v.addEventListener('pause',saveRecPos);"
-            f"v.addEventListener('loadedmetadata',"
-            f"  ()=>setTimeout(restoreRecPos,400),{{once:true}});"
+            # Race-safe: defer restoreRecPos until the first progress
+            # tick has populated _recPlaylistMtime (otherwise we miss
+            # the freshness check and restore a stale offset). Cap at
+            # 5 s so we don't sit forever if the endpoint is broken.
+            f"v.addEventListener('loadedmetadata',()=>{{"
+            f"  let waited=0;"
+            f"  const tryRestore=()=>{{"
+            f"    if(window._recPlaylistMtime||waited>=5000){{"
+            f"      restoreRecPos();return;"
+            f"    }}"
+            f"    waited+=200;setTimeout(tryRestore,200);"
+            f"  }};"
+            f"  setTimeout(tryRestore,400);"
+            f"}},{{once:true}});"
             f"let srcSet=false;"
             f"function tick(){{"
             f"  fetch('{HOST_URL}/recording/{uuid}/progress').then(r=>r.json())"
