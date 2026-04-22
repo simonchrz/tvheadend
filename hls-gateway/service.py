@@ -5281,7 +5281,11 @@ def _rec_hls_spawn(uuid):
         # Kick off comskip right away — it reads the same .ts source
         # (read-only) so it can run concurrently with the remux and
         # commercial markers land on the scrub bar ~5 min sooner.
-        _rec_cskip_spawn(uuid)
+        # Skip when the Mac's tv-comskip.sh agent is alive: its
+        # M-series CPU finishes 4-10x faster than ours and the Pi has
+        # ffmpeg + 3-4 live transcodes already saturating its cores.
+        if not _mac_comskip_alive():
+            _rec_cskip_spawn(uuid)
 
         def _after_ffmpeg():
             proc.wait()
