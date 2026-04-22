@@ -2821,18 +2821,21 @@ async function goShowStart(){{
        fetch(HOST+'/api/mediathek-live/'+current)
         .then(r=>r.json()).then(d=>{{
           if(!d.url){{
-            /* Final fallback — comskip ad-cache: if there's a detected
-               commercial block in the local buffer, jump to its end
-               (= where the show resumed). Cleaner than landing
-               mid-action and matches user intent of "show me this
-               channel from a logical break point". */
+            /* Cascading final fallbacks — best UX over strict accuracy.
+               1) End of latest comskip-detected ad block in buffer →
+                  clean show-resumption point.
+               2) Buffer start → at least the user lands somewhere
+                  meaningful instead of an error toast. */
             fetch(HOST+'/api/live-ads/'+current)
              .then(r=>r.json()).then(adResp=>{{
                const ads=adResp.ads||[];
                const[s,e]=seekableRange();
-               if(ads.length&&e>s){{
+               if(e<=s){{
+                 showHintMsg('Sendungsanfang außerhalb Puffer');
+                 return;
+               }}
+               if(ads.length){{
                  const wallS=wallAt(s),wallE=wallAt(e);
-                 /* Latest ad block whose end falls inside the buffer. */
                  const last=[...ads].reverse().find(a=>a[1]>=wallS&&a[1]<=wallE);
                  if(last){{
                    _lastJumpedEv=ev;_lastJumpedTs=Date.now();
@@ -2842,7 +2845,10 @@ async function goShowStart(){{
                    return;
                  }}
                }}
-               showHintMsg('Sendungsanfang außerhalb Puffer');
+               /* No usable ad block — jump to the buffer start. */
+               _lastJumpedEv=ev;_lastJumpedTs=Date.now();
+               v.currentTime=s+0.5;show();
+               showHintMsg('Sendungsanfang außerhalb Puffer — Sprung an Buffer-Anfang',3500);
              }}).catch(()=>showHintMsg('Sendungsanfang außerhalb Puffer'));
             return;
           }}
@@ -3035,8 +3041,20 @@ function renderLiveAds(){{
   document.querySelectorAll('.ad-block').forEach(el=>el.remove());
   const[ws,we]=scrubWindow();
   if(we<=ws)return;
+  /* In live-buffer playback, hide markers for ad blocks outside the
+     seekable range — those are orphan entries from a previous buffer
+     state (e.g. before an SSD remount truncated the buffer) and you
+     can't jump to them anyway. In recording-chain mode the markers
+     for other chain members ARE reachable via switchToRecording, so
+     keep them visible there. */
+  let seekS=null,seekE=null;
+  if(!(onRecording&&recChain)){{
+    const[s,e]=seekableRange();
+    if(e>s){{seekS=wallAt(s);seekE=wallAt(e);}}
+  }}
   for(const[wStart,wStop]of allAdsWall()){{
     if(wStop<=ws||wStart>=we)continue;
+    if(seekS!==null&&(wStop<=seekS||wStart>=seekE))continue;
     const left=posForWall(Math.max(wStart,ws));
     const right=posForWall(Math.min(wStop,we));
     if(left===null||right===null||right<=left)continue;
