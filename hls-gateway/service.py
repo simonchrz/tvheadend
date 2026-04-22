@@ -3795,46 +3795,54 @@ def api_mediathek_live(slug):
 
 @app.route("/mediathek-passthru/<slug>/master.m3u8")
 def mediathek_passthru_master(slug):
-    """Transparently proxy ARD's master playlist, rewriting variant
-    URIs to point back through us. All sub-playlists + segments also
-    flow through our origin to avoid iOS cross-origin quirks."""
-    info = MEDIATHEK_LIVE.get(slug)
-    if not info:
-        abort(404)
-    base_url = info[0]
+    """Serve a single-variant master pointing to the highest BANDWIDTH
+    rendition from upstream. Rewrites the variant URI (and its audio
+    companion) through our /pl.m3u8 proxy to keep the playlist origin
+    on us — sidesteps iOS cross-origin quirks. Ignoring lower variants
+    means the player can't ABR-downgrade on a momentary bandwidth dip;
+    that's the point — Mediathek streams top out at ~5 Mbps which any
+    home connection handles, and the user has explicitly asked for max.
+
+    Upstream URL comes from MEDIATHEK_LIVE[slug] (live-channels path)
+    or, when '?u=<encoded url>' is given, that URL directly (for the
+    on-demand play / recording paths where the upstream master URL
+    isn't pre-known and is resolved per request)."""
+    upstream_override = request.args.get("u", "")
+    if upstream_override and upstream_override.startswith("http"):
+        base_url = upstream_override
+    else:
+        info = MEDIATHEK_LIVE.get(slug)
+        if not info:
+            abort(404)
+        base_url = info[0]
     try:
         txt = urllib.request.urlopen(base_url, timeout=8).read().decode()
     except Exception as e:
         abort(502, f"upstream: {e}")
-    base = base_url.rsplit("/", 1)[0] + "/"
-    strip_audio = request.args.get("no_audio") == "1"
-    out_lines = []
-    for line in txt.splitlines():
-        stripped = line.strip()
-        if strip_audio and 'TYPE=AUDIO' in stripped:
-            continue
-        if strip_audio and 'AUDIO=' in stripped:
-            stripped = re.sub(r',?AUDIO="[^"]+"', '', stripped)
-        if stripped.startswith("#EXT-X-MEDIA") and "URI=" in stripped:
-            def repl(m):
-                u = m.group(1)
-                if not u.startswith("http"):
-                    u = base + u
-                proxied = (f"{HOST_URL}/mediathek-passthru/{slug}/pl.m3u8?"
-                           f"u={urllib.parse.quote(u, safe='')}")
-                return f'URI="{proxied}"'
-            out_lines.append(re.sub(r'URI="([^"]+)"', repl, stripped))
-            continue
-        if stripped and not stripped.startswith("#") and ".m3u8" in stripped:
-            u = stripped
-            if not u.startswith("http"):
-                u = base + u
-            proxied = (f"{HOST_URL}/mediathek-passthru/{slug}/pl.m3u8?"
+    picked = _parse_master(base_url, txt)
+    if not picked:
+        # Couldn't parse — serve the raw master (legacy passthru). Better
+        # than 502'ing because at least the player gets *something*.
+        return Response(txt, mimetype="application/vnd.apple.mpegurl")
+    video_url, audio_url, codecs = picked
+    proxy = lambda u: (f"{HOST_URL}/mediathek-passthru/{slug}/pl.m3u8?"
                        f"u={urllib.parse.quote(u, safe='')}")
-            out_lines.append(proxied)
-            continue
-        out_lines.append(line)
-    return Response("\n".join(out_lines) + "\n",
+    strip_audio = request.args.get("no_audio") == "1"
+    out = ["#EXTM3U", "#EXT-X-VERSION:3"]
+    audio_attr = ""
+    if audio_url and not strip_audio:
+        out.append(
+            f'#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="aud",NAME="audio",'
+            f'DEFAULT=YES,AUTOSELECT=YES,URI="{proxy(audio_url)}"')
+        audio_attr = ',AUDIO="aud"'
+    codecs_attr = f',CODECS="{codecs}"' if codecs else ""
+    # BANDWIDTH is required by the spec but doesn't matter when there's
+    # only one variant — set it high so any future ABR-aware caller
+    # treats this as the top tier.
+    out.append(f"#EXT-X-STREAM-INF:BANDWIDTH=99999999"
+               f"{codecs_attr}{audio_attr}")
+    out.append(proxy(video_url))
+    return Response("\n".join(out) + "\n",
                      mimetype="application/vnd.apple.mpegurl")
 
 
@@ -6231,7 +6239,18 @@ def _render_mediathek_player(uuid, entry):
     the show to a local MP4 (V3), play that directly via <video src>.
     Otherwise stream the remote HLS via hls.js."""
     title_safe = entry["title"].replace("<", "&lt;")
-    hls_url = entry["hls_url"].replace("'", "%27")
+    upstream_hls = entry["hls_url"]
+    # Route through our passthru so the player gets a single-variant
+    # master pinned to the upstream's highest BANDWIDTH rendition,
+    # bypassing client-side ABR downgrade. Same endpoint that serves
+    # live-mediathek channels — the slug here is just routing for the
+    # /pl.m3u8 sub-playlist proxy and doesn't have to match anything.
+    if upstream_hls.startswith("http"):
+        wrapped = (f"{HOST_URL}/mediathek-passthru/_max/master.m3u8?"
+                   f"u={urllib.parse.quote(upstream_hls, safe='')}")
+        hls_url = wrapped.replace("'", "%27")
+    else:
+        hls_url = upstream_hls.replace("'", "%27")
     ripped_path = entry.get("ripped_path", "")
     has_local = False
     if ripped_path and uuid != "preview":
