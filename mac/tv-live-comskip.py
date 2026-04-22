@@ -441,13 +441,23 @@ def main_loop():
         sys.exit(1)
     WORK_DIR.mkdir(parents=True, exist_ok=True)
 
+    # Load state ONCE at startup, then keep it in-memory for the
+    # lifetime of the process. Reloading from disk every iteration
+    # used to race with our own atomic-rename writes on the SMB
+    # share — POSIX atomic-rename semantics aren't honoured by SMB
+    # (it's effectively delete+rename) and macOS's SMB client caches
+    # stat metadata, so a load right after a save would sometimes
+    # return {} and the per-slug cooldown would evaporate.
+    # Pi-side _live_adskip_loop is disabled when LIVE_ADS_OFFLOAD is
+    # set, so we're the only writer — no need to re-read.
+    state = load_live_ads()
+
     last_gc = 0
     while True:
         try:
             if time.time() - last_gc > 600:
                 gc_stale_caches()
                 last_gc = time.time()
-            state = load_live_ads()
             candidates = [s for s in LIVE_ADSKIP_SLUGS
                           if channel_is_active(s)]
             recent = {s for s, v in state.items()
