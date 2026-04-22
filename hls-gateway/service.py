@@ -2524,6 +2524,28 @@ function goShowNext(){{
     }}
     goLive();return;
   }}
+  /* Live-buffer step-forward: symmetric to the step-back in
+     goShowStart. Find the EPG event after the current one (anchored
+     on _lastJumpedEv during the ~3 s settle window) and seek if its
+     start lies inside the local DVR window. Falls through to the
+     recChain branch below and ultimately to goLive(). */
+  {{
+    let cur=currentEvent();
+    const recentJump=(Date.now()-_lastJumpedTs<3000)&&_lastJumpedEv;
+    if(recentJump)cur=_lastJumpedEv;
+    if(cur){{
+      const next=epgEvents.find(e=>e.start>=cur.stop);
+      if(next){{
+        const[s,e]=seekableRange();
+        const wallS=e>s?wallAt(s):null;
+        if(wallS!==null&&next.start>=wallS&&next.start<=wallAt(e)){{
+          _lastJumpedEv=next;_lastJumpedTs=Date.now();
+          v.currentTime=Math.max(s+0.5,Math.min(e-1,next.start-wallS));
+          show();return;
+        }}
+      }}
+    }}
+  }}
   /* Live mode in chain-aware context: if we're in the live-window
      but before the currently-airing event, advance to its start. */
   if(recChain&&recChain.length){{
