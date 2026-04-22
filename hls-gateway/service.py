@@ -1045,12 +1045,18 @@ def index():
         "left:-4px;right:-4px;top:-14px;bottom:-6px}"
         ".pin-btn{position:absolute;top:-9px;right:-8px;"
         "background:none;border:0;cursor:pointer;font-size:1.1em;"
-        "opacity:.2;padding:3px;line-height:1;transform:rotate(35deg);"
-        "transform-origin:center;transition:opacity .15s,transform .15s;z-index:2;"
-        "filter:drop-shadow(0 1px 2px #0008)}"
-        ".pin-btn:hover{opacity:.75;transform:rotate(45deg) scale(1.1)}"
+        "opacity:.35;padding:3px;line-height:1;transform:rotate(35deg);"
+        "transform-origin:center;"
+        "transition:opacity .15s,transform .15s,filter .15s;z-index:2;"
+        # Unpinned: grayscale + drop-shadow desaturates the emoji so it
+        # reads as "off". opacity alone wasn't enough on iOS — the
+        # native red push-pin emoji rendered as full colour even at
+        # opacity .2, indistinguishable from the active state.
+        "filter:grayscale(1) drop-shadow(0 1px 2px #0008)}"
+        ".pin-btn:hover{opacity:.75;transform:rotate(45deg) scale(1.1);"
+        "filter:grayscale(.5) drop-shadow(0 1px 2px #0008)}"
         ".pin-btn.active{opacity:1;transform:rotate(45deg);"
-        "filter:drop-shadow(0 2px 3px #0009)}"
+        "filter:none drop-shadow(0 2px 3px #0009)}"
         "ul.channels li:has(.pin-btn.active){"
         "box-shadow:0 3px 10px #0003;transform:translateY(-1px)}"
         ".pin-btn.dormant{opacity:.6}"
