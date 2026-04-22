@@ -245,7 +245,16 @@ launchctl bootstrap gui/$UID ~/Library/LaunchAgents/com.user.tv-comskip.plist
 
 **USB cable + port identification for the T5** — the Samsung T5 negotiates USB 3.2 Gen 2 (10 Gbps) only with a proper SuperSpeed A-to-C cable. Labels like "Anker 3.1A" refer to *charging amperage*, not the USB spec — those are USB 2.0 cables. Diagnose via `lsusb -t`: the T5 must attach to Bus 002 or Bus 004 (5000M root hubs) for SuperSpeed; attaching to Bus 001/003 (480M) means USB 2.0 negotiation, either wrong port or a cable without SuperSpeed pins (only 4 contacts in the USB-A plug vs. 9 for USB 3). `dmesg` distinguishes: `high-speed` = USB 2.0, `SuperSpeed` = USB 3.0. Orthogonal issue: the kernel also applies a UAS-disable quirk for the T5 (`UAS is ignored for this device, using usb-storage instead`) which costs another 30-40% throughput even after USB 3 negotiates; overrideable with `usb-storage.quirks=04e8:61f5:` on the kernel cmdline.
 
-**EXT4 shutdown under USB-2 I/O saturation** — if the SSD is on a USB 2.0 link (480M, ~40 MB/s effective), the bus becomes the bottleneck once parallel workloads stack up. Witnessed 2026-04-21: 3 concurrent DVB recordings + HLS segment writes + Mac-side SMB reads (live-comskip pulling ~900 MB per scan) → USB reset → `ext4_end_bio: I/O error 16` → journal abort → ext4 remounts read-only with `shutdown` in the mount options. Recovery path (does not require physical access — the umount itself triggered a USB reset):
+**Pi 5 USB current cap — `usb_max_current_enable=1`** — Pi 5 caps the four USB-A ports to **600 mA combined** by default, even with the official 5A power supply. The Samsung T5 SSD pulls ~900 mA peak, so under any sustained load (live TV write + recording + casual reads) the bus drops the device → USB disconnect → ext4 shutdown. Symptom: dmesg shows `usb X-Y: USB disconnect, device number Z` immediately followed by `Buffer I/O error`, `failed Synchronize Cache(10)`, journal abort. Diagnosed 2026-04-22 by isolating the SSD on a Mac (4-hour sustained 20 GB read with zero USB events) and finding `usb_max_current_enable` not set in `/boot/firmware/config.txt`. Fix:
+
+```sh
+echo "usb_max_current_enable=1" | sudo tee -a /boot/firmware/config.txt
+sudo reboot
+# verify after reboot:
+vcgencmd get_config usb_max_current_enable   # should print =1
+```
+
+**EXT4 shutdown under USB-2 I/O saturation** — if the SSD is on a USB 2.0 link (480M, ~40 MB/s effective), the bus becomes the bottleneck once parallel workloads stack up. Witnessed 2026-04-21: 3 concurrent DVB recordings + HLS segment writes + Mac-side SMB reads (live-comskip pulling ~900 MB per scan) → USB reset → `ext4_end_bio: I/O error 16` → journal abort → ext4 remounts read-only with `shutdown` in the mount options. (Note: after the `usb_max_current_enable=1` fix above, the disconnects under load mostly stopped; what remained was occasional bus-saturation under truly extreme parallel I/O, addressable by reducing read pressure.) Recovery path (does not require physical access — the umount itself triggered a USB reset):
 
 ```sh
 # 1. Stop everything writing
