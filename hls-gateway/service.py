@@ -6047,6 +6047,31 @@ def _rec_prewarm_once():
             timeout=10).read())
     except Exception:
         return
+
+    # Garbage-collect orphaned _rec_<uuid> dirs: tvheadend's native UI
+    # deletes the .ts file but doesn't know about our HLS cache, so
+    # entries deleted there leave stale dirs sitting on disk forever.
+    # Build the set of currently-known DVR uuids (finished + scheduled
+    # + recording), then remove any _rec_<uuid> not in it.
+    known_uuids = {e["uuid"] for e in data.get("entries", []) if e.get("uuid")}
+    try:
+        all_data = json.loads(urllib.request.urlopen(
+            f"{TVH_BASE}/api/dvr/entry/grid?limit=500", timeout=10).read())
+        for e in all_data.get("entries", []):
+            if e.get("uuid"):
+                known_uuids.add(e["uuid"])
+    except Exception:
+        pass
+    if known_uuids:  # only purge if we actually got a real list
+        for d in HLS_DIR.glob("_rec_*"):
+            if not d.is_dir(): continue
+            uuid = d.name[len("_rec_"):]
+            if uuid in known_uuids: continue
+            # Skip if any cleanup might race with our own work
+            if uuid in _rec_hls_procs or uuid in _rec_cskip_procs: continue
+            print(f"[rec-prewarm] gc orphan {uuid[:8]}", flush=True)
+            shutil.rmtree(d, ignore_errors=True)
+
     for e in data.get("entries", []):
         uuid = e.get("uuid")
         if not uuid or not e.get("filename"):
@@ -6773,8 +6798,11 @@ def delete_recording(uuid):
     if c and c["proc"].poll() is None:
         try: c["proc"].kill()
         except Exception: pass
-    shutil.rmtree(HLS_DIR / f"_rec_{uuid}", ignore_errors=True)
 
+    # Delete the DVR entry FIRST, then the HLS dir. If we go in the
+    # other order and the tvheadend delete silently fails, the next
+    # prewarm tick still sees the entry and re-creates the HLS dir
+    # we just emptied — orphan resurrects on its own.
     body = urllib.parse.urlencode({"uuid": uuid}).encode()
     for ep in ("/api/dvr/entry/cancel", "/api/dvr/entry/remove"):
         try:
@@ -6783,6 +6811,7 @@ def delete_recording(uuid):
             urllib.request.urlopen(req, timeout=5).read()
         except Exception:
             pass
+    shutil.rmtree(HLS_DIR / f"_rec_{uuid}", ignore_errors=True)
     return Response(status=302, headers={"Location": f"{HOST_URL}/recordings"})
 
 
