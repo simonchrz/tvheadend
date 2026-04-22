@@ -3515,7 +3515,7 @@ fetch(HOST+'/api/channels').then(r=>r.json()).then(d=>{{
   idx=channels.findIndex(c=>c.slug===current);
   if(idx<0)idx=0;
 }});
-</script></body></html>"""
+</script></body></html>""", 200, {"Cache-Control": "no-cache, no-store, must-revalidate", "Pragma": "no-cache"}
 
 
 MEDIATHEK_LIVE = {
