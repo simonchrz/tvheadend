@@ -1057,8 +1057,15 @@ def index():
         # native red push-pin emoji rendered as full colour even at
         # opacity .2, indistinguishable from the active state.
         "filter:grayscale(1) drop-shadow(0 1px 2px #0008)}"
+        # Hover gated on a device with real hover capability —
+        # iOS Safari latches :hover after a tap and never clears it
+        # without a navigation, leaving the just-tapped pin stuck in
+        # the half-grayscale "kind of pinned" middle state until a
+        # page reload.
+        "@media (hover:hover){"
         ".pin-btn:hover{opacity:.75;transform:rotate(45deg) scale(1.1);"
         "filter:grayscale(.5) drop-shadow(0 1px 2px #0008)}"
+        "}"
         ".pin-btn.active{opacity:1;transform:rotate(45deg);"
         "filter:none drop-shadow(0 2px 3px #0009)}"
         "ul.channels li:has(.pin-btn.active){"
