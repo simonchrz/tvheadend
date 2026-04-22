@@ -2524,14 +2524,11 @@ function goShowNext(){{
     }}
     goLive();return;
   }}
-  /* Live-buffer step-forward: symmetric to the step-back in
-     goShowStart. If the previous jump was an ad-walk (kind ∈
-     ad/buffer), continue walking forward through ad-block ends
-     instead of EPG events — same priority rule as in goShowStart
-     so an EPG event boundary between ads doesn't intercept the
-     sequence. Otherwise normal forward step is by EPG event. */
+  /* Live-buffer step-forward: symmetric to the step-back. Once a
+     sequence has entered merged-targets walk (kind ∈ walk/buffer),
+     stay there — same reasoning as in goShowStart. */
   const recentJumpFwd=(Date.now()-_lastJumpedTs<10000)&&_lastJumpedEv;
-  const adWalkingFwd=recentJumpFwd&&(_lastJumpedKind==='ad'||_lastJumpedKind==='buffer');
+  const adWalkingFwd=recentJumpFwd&&(_lastJumpedKind==='walk'||_lastJumpedKind==='buffer');
   if(adWalkingFwd){{
     fetch(HOST+'/api/live-ads/'+current).then(r=>r.json()).then(adResp=>{{
       const ads=adResp.ads||[];
@@ -2540,14 +2537,16 @@ function goShowNext(){{
       const nowS=Date.now()/1000;
       const wallS=nowS-(e-s),wallE=nowS;
       const cutoffWall=wallForCurrent();
-      /* Forward step-points: ad-block ends + EPG event starts that
-         are strictly after current position. Pick the earliest. */
+      /* Same target set as backward walk: both endpoints of every
+         ad block + every EPG event start. Pick earliest after
+         current. */
       const targets=[];
       for(const a of ads){{
-        if(a[1]>cutoffWall+0.5&&a[1]<=wallE)targets.push({{wall:a[1],kind:'ad'}});
+        if(a[0]>cutoffWall+0.5&&a[0]<=wallE)targets.push({{wall:a[0],kind:'walk',label:'ad-start'}});
+        if(a[1]>cutoffWall+0.5&&a[1]<=wallE)targets.push({{wall:a[1],kind:'walk',label:'ad-end'}});
       }}
       for(const epg of epgEvents){{
-        if(epg.start>cutoffWall+0.5&&epg.start<=wallE)targets.push({{wall:epg.start,kind:'epg',ev:epg}});
+        if(epg.start>cutoffWall+0.5&&epg.start<=wallE)targets.push({{wall:epg.start,kind:'walk',label:'epg-start',ev:epg}});
       }}
       targets.sort((x,y)=>x.wall-y.wall);
       if(targets.length){{
@@ -2555,7 +2554,8 @@ function goShowNext(){{
         _lastJumpedEv=pick.ev||_lastJumpedEv;_lastJumpedTs=Date.now();_lastJumpedKind=pick.kind;
         v.currentTime=Math.max(s+0.5,Math.min(e-1,pick.wall-wallS));
         show();
-        showHintMsg(pick.kind==='epg'?'Sprung an nächsten Sendungsanfang':'Sprung ans Ende der nächsten Werbung',2500);
+        const hints={{'epg-start':'Sprung an nächsten Sendungsanfang','ad-start':'Sprung an Werbeblock-Anfang','ad-end':'Sprung an Werbeblock-Ende'}};
+        showHintMsg(hints[pick.label]||'Sprung vorwärts',2500);
         return;
       }}
       goLive();
@@ -2823,17 +2823,16 @@ async function goShowStart(){{
   /* Live-buffer step-back: if we're already at (or near) the current
      event's start, treat the press as "go back one show" — same UX as
      mediathek/chain modes above. _lastJumpedEv anchors the choice
-     during the ~3 s window right after a previous jump, before the
-     player's currentTime has settled.
+     during the 10 s window right after a previous jump.
 
-     Exception: if the previous jump was to an ad-block end or to
-     buffer-start (kind ∈ ad/buffer), don't honour the EPG step-back
-     here — otherwise an EPG event boundary that happens to fall
-     between two ad blocks would intercept the ad-walking sequence
-     and jump to that show start instead of to the next-earlier ad. */
+     Exception: once a sequence has entered the merged-targets walk
+     (kind ∈ walk/buffer), stay there. Otherwise a yellow EPG tick
+     picked up by the walk would flip kind back to 'epg' and the
+     next tap would jump a whole show backwards instead of to the
+     next walk-target. */
   const curWall=wallForCurrent();
   const recentJump=(Date.now()-_lastJumpedTs<10000)&&_lastJumpedEv;
-  const adWalking=recentJump&&(_lastJumpedKind==='ad'||_lastJumpedKind==='buffer');
+  const adWalking=recentJump&&(_lastJumpedKind==='walk'||_lastJumpedKind==='buffer');
   if(!adWalking){{
     if(recentJump)ev=_lastJumpedEv;
     if(recentJump||Math.abs(curWall-ev.start)<=10){{
@@ -2885,12 +2884,17 @@ async function goShowStart(){{
                const wallS=wallAt(s),wallE=wallAt(e);
                const recentJump=(Date.now()-_lastJumpedTs)<10000;
                const cutoffWall=recentJump?wallForCurrent():wallE;
+               /* Targets: BOTH endpoints of every ad block (start =
+                  show interrupted, end = show resumed) plus every
+                  EPG event start. User can step through every
+                  endpoint with successive taps. */
                const targets=[];
                for(const a of ads){{
-                 if(a[1]>=wallS&&a[1]<=cutoffWall-0.5)targets.push({{wall:a[1],kind:'ad'}});
+                 if(a[0]>=wallS&&a[0]<=cutoffWall-0.5)targets.push({{wall:a[0],kind:'walk',label:'ad-start'}});
+                 if(a[1]>=wallS&&a[1]<=cutoffWall-0.5)targets.push({{wall:a[1],kind:'walk',label:'ad-end'}});
                }}
                for(const epg of epgEvents){{
-                 if(epg.start>=wallS&&epg.start<=cutoffWall-0.5)targets.push({{wall:epg.start,kind:'epg',ev:epg}});
+                 if(epg.start>=wallS&&epg.start<=cutoffWall-0.5)targets.push({{wall:epg.start,kind:'walk',label:'epg-start',ev:epg}});
                }}
                targets.sort((x,y)=>y.wall-x.wall);
                if(targets.length){{
@@ -2898,7 +2902,8 @@ async function goShowStart(){{
                  _lastJumpedEv=pick.ev||ev;_lastJumpedTs=Date.now();_lastJumpedKind=pick.kind;
                  v.currentTime=Math.max(s+0.5,Math.min(e-1,pick.wall-wallS));
                  show();
-                 showHintMsg(pick.kind==='epg'?'Sprung an vorherigen Sendungsanfang':'Sprung ans Ende der vorherigen Werbung',2500);
+                 const hints={{'epg-start':'Sprung an vorherigen Sendungsanfang','ad-start':'Sprung an Werbeblock-Anfang','ad-end':'Sprung an Werbeblock-Ende'}};
+                 showHintMsg(hints[pick.label]||'Sprung zurück',2500);
                  return;
                }}
                /* No more step-points earlier in the buffer — fall
