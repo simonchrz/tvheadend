@@ -2504,14 +2504,40 @@ function goLive(){{
    (chain / Mediathek / live currently-airing). At the end of the
    chain or when caught up, falls back to live edge. */
 function goShowNext(){{
-  /* Recording chain: advance one entry, or to live if at the tail. */
+  /* Recording-chain merged-targets walk forward — symmetric. */
   if(onRecording&&recChain&&recCurrentIdx>=0){{
-    if(recCurrentIdx<recChain.length-1){{
-      const nextIdx=recCurrentIdx+1;
-      switchToRecording(recChain[nextIdx],recChain[nextIdx].start,nextIdx);
+    const curWall=recChain[recCurrentIdx].start+(v.currentTime||0);
+    const recentJump=(Date.now()-_lastJumpedTs<10000)&&_lastJumpedEv;
+    const cutoffWall=recentJump?_lastJumpedWall:curWall;
+    const lastEntry=recChain[recChain.length-1];
+    const chainEnd=lastEntry.running?Date.now()/1000:lastEntry.stop;
+    const targets=[];
+    for(const a of recChainAds){{
+      if(a[1]>cutoffWall+0.5&&a[1]<=chainEnd)targets.push({{wall:a[1],label:'ad-end'}});
+    }}
+    for(const epg of epgEvents){{
+      if(epg.start>cutoffWall+0.5&&epg.start<=chainEnd)targets.push({{wall:epg.start,label:'epg-start',ev:epg}});
+    }}
+    targets.sort((x,y)=>x.wall-y.wall);
+    if(targets.length){{
+      const pick=targets[0];
+      _lastJumpedEv=pick.ev||_lastJumpedEv;_lastJumpedTs=Date.now();_lastJumpedKind='walk';_lastJumpedWall=pick.wall;
+      const idx=recChain.findIndex(c=>c.start<=pick.wall&&pick.wall<c.stop);
+      if(idx===recCurrentIdx){{
+        v.currentTime=pick.wall-recChain[recCurrentIdx].start;show();
+      }} else if(idx>=0){{
+        switchToRecording(recChain[idx],pick.wall,idx);
+      }} else {{
+        goLive();return;
+      }}
+      const hints={{'epg-start':'Sprung an nächsten Sendungsanfang','ad-end':'Sprung an Werbeblock-Ende'}};
+      showHintMsg(hints[pick.label]||'Sprung vorwärts',2500);
       return;
     }}
-    goLive();return;
+    /* No more targets in chain — go live if last entry is still running */
+    if(lastEntry.running)goLive();
+    else showHintMsg('Ende der Aufnahme');
+    return;
   }}
   /* Mediathek: jump forward to the next reachable EPG event. */
   if(onMediathek){{
@@ -2744,14 +2770,39 @@ async function goShowStart(){{
   /* If we're already in recording-chain mode and near the start of
      the current chain member, step back to the previous one. */
   if(onRecording&&recChain&&recCurrentIdx>=0){{
-    const curT=v.currentTime||0;
-    if(curT<=8&&recCurrentIdx>0){{
-      const prevIdx=recCurrentIdx-1;
-      switchToRecording(recChain[prevIdx],recChain[prevIdx].start,prevIdx);
+    /* Recording-chain merged-targets walk — same logic as live-buffer,
+       but using recChainAds (already in wall-time) and switching
+       between chain entries via switchToRecording when a target lies
+       in a different recording. */
+    const curWall=recChain[recCurrentIdx].start+(v.currentTime||0);
+    const recentJump=(Date.now()-_lastJumpedTs<10000)&&_lastJumpedEv;
+    const cutoffWall=recentJump?_lastJumpedWall:curWall;
+    const chainStart=recChain[0].start;
+    const targets=[];
+    for(const a of recChainAds){{
+      if(a[1]>=chainStart&&a[1]<=cutoffWall-0.5)targets.push({{wall:a[1],label:'ad-end'}});
+    }}
+    for(const epg of epgEvents){{
+      if(epg.start>=chainStart&&epg.start<=cutoffWall-0.5)targets.push({{wall:epg.start,label:'epg-start',ev:epg}});
+    }}
+    targets.sort((x,y)=>y.wall-x.wall);
+    if(targets.length){{
+      const pick=targets[0];
+      _lastJumpedEv=pick.ev||_lastJumpedEv;_lastJumpedTs=Date.now();_lastJumpedKind='walk';_lastJumpedWall=pick.wall;
+      const idx=recChain.findIndex(c=>c.start<=pick.wall&&pick.wall<c.stop);
+      if(idx===recCurrentIdx){{
+        v.currentTime=pick.wall-recChain[recCurrentIdx].start;show();
+      }} else if(idx>=0){{
+        switchToRecording(recChain[idx],pick.wall,idx);
+      }} else {{
+        showHintMsg('Sprungziel nicht in Aufnahme');return;
+      }}
+      const hints={{'epg-start':'Sprung an vorherigen Sendungsanfang','ad-end':'Sprung an Werbeblock-Ende'}};
+      showHintMsg(hints[pick.label]||'Sprung zurück',2500);
       return;
     }}
-    /* Otherwise jump to start of current chain member. */
-    v.currentTime=0;show();return;
+    showHintMsg('Anfang der Aufnahme');
+    return;
   }}
   /* Mediathek mode: same step-back idea. If we're near the current
      event's start, jump to the previous (reachable) EPG event. Uses
