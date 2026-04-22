@@ -5962,14 +5962,15 @@ def _mac_comskip_alive():
 
 
 def _rec_prewarm_once():
-    # Load-based gate: on a 4-core Pi each SD-MPEG-2 live stream eats
-    # ~0.7-1.0 core, so with 3+ pinned channels "any live active" was
-    # effectively "never prewarm". Instead skip only when the box is
-    # already under pressure — prewarm runs at nice 15 and won't
-    # preempt live transcodes, but we still want headroom for the
-    # scheduler to avoid segment-write stalls.
+    # Load-based gate. The dominant cost in this loop is the
+    # MPEG-2 -> H.264 transcode for VOD playback (libx264 ultrafast
+    # eats 1.5-2.5 cores on its own). nice 15 helps prevent it from
+    # preempting live transcodes, but the scheduler still has to
+    # service them — once loadavg passes ~3.0 on this 4-core box
+    # users notice live-stream segment stalls. Keep the gate well
+    # below saturation so prewarm waits for genuine slack.
     try:
-        if os.getloadavg()[0] > 6.0:
+        if os.getloadavg()[0] > 3.0:
             return
     except Exception:
         pass
