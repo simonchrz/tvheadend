@@ -4951,10 +4951,12 @@ def _rec_parse_comskip(out_dir):
         try:
             a = float(parts[0]) / fps
             b = float(parts[1]) / fps
-            if b - a >= 30:   # ignore stub blocks shorter than 30 s
-                              # — typically sponsor cards, programme
-                              # promos, single-spot teaser interruptions
-                              # rather than real commercial breaks
+            if b - a >= 60:   # ignore stub blocks shorter than 60 s
+                              # — matches comskip.ini's
+                              # min_commercialbreak=60, also serves as
+                              # safety net when comskip emits sub-60 s
+                              # detections from edge cases (older
+                              # ini, partial-window scans, etc.)
                 ads.append([round(a, 2), round(b, 2)])
         except Exception:
             continue
