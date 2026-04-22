@@ -6228,9 +6228,19 @@ def recording_hls_progress(uuid):
             _rec_cskip_spawn(uuid)
         if not (out_dir / "thumbs" / ".done").exists():
             _rec_thumbs_spawn(uuid)
+    # Expose the playlist's mtime so the player can invalidate a
+    # stored localStorage seek-position from before the recording was
+    # remuxed (otherwise an old saved offset against a partial old
+    # playlist makes the player land in the middle on every reload).
+    pl_mtime = 0
+    try:
+        pl_mtime = int(st["playlist"].stat().st_mtime * 1000)
+    except Exception:
+        pass
     return _cors(Response(json.dumps({"done": st["done"],
                                         "segments": st["segments"],
-                                        "total": st["total"]}),
+                                        "total": st["total"],
+                                        "playlist_mtime_ms": pl_mtime}),
                            mimetype="application/json"))
 
 
@@ -6606,6 +6616,17 @@ def play_recording(uuid):
             f"  try{{entry=JSON.parse(localStorage.getItem(LASTPOS_KEY)||'null');}}"
             f"  catch(e){{}}"
             f"  if(!entry||Date.now()-entry.ts>LASTPOS_TTL_MS)return;"
+            # Discard the stored seek-position if the playlist on disk
+            # was rebuilt after we saved it — otherwise a recording
+            # remuxed in the middle of being-watched lands the player
+            # at an offset that no longer corresponds to the same
+            # timeline (e.g. after a Mac re-remux that filled in
+            # missing early segments).
+            f"  if(window._recPlaylistMtime"
+            f"     && entry.ts < window._recPlaylistMtime){{"
+            f"    try{{localStorage.removeItem(LASTPOS_KEY);}}catch(e){{}}"
+            f"    return;"
+            f"  }}"
             f"  const D=isFinite(v.duration)?v.duration:0;"
             f"  if(entry.t>0&&entry.t<D-2)v.currentTime=entry.t;"
             f"}}"
@@ -6621,6 +6642,11 @@ def play_recording(uuid):
             f"function tick(){{"
             f"  fetch('{HOST_URL}/recording/{uuid}/progress').then(r=>r.json())"
             f"   .then(d=>{{"
+            # Pick up the playlist mtime so restoreRecPos can compare
+            # it against the saved position's timestamp and discard
+            # stale offsets after a re-remux.
+            f"     if(d.playlist_mtime_ms)"
+            f"       window._recPlaylistMtime=d.playlist_mtime_ms;"
             # Start playback once ~10 segments (60 s at hls_time=6) are
             # on disk — iOS can stream a growing EVENT playlist and will
             # keep polling for new segments as we remux.
