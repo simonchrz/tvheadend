@@ -4981,11 +4981,27 @@ def _rec_cskip_spawn(uuid):
         cmd = ["nice", "-n", "15", "comskip",
                "--output", str(out_dir),
                "--quiet", src]
+        # Cooperative lock-file so the Mac-side tv-comskip.sh skips
+        # this recording while we're working on it (and vice versa —
+        # tv-comskip.sh writes the same file before spawning). Stale
+        # locks are ignored after 15 min via mtime check on the reader.
+        scanning = out_dir / ".scanning"
+        try:
+            scanning.write_text(f"pi {os.getpid()} {int(time.time())}")
+        except Exception:
+            pass
         proc = subprocess.Popen(cmd,
                                  stdout=subprocess.DEVNULL,
                                  stderr=subprocess.DEVNULL)
         _rec_cskip_procs[uuid] = {"proc": proc, "started": time.time()}
         print(f"[rec-cskip {uuid[:8]}] spawned", flush=True)
+        def _cleanup_lock(p, lock):
+            try: p.wait()
+            except Exception: pass
+            try: lock.unlink(missing_ok=True)
+            except Exception: pass
+        threading.Thread(target=_cleanup_lock, args=(proc, scanning),
+                         daemon=True).start()
 
 
 THUMB_INTERVAL = 30   # seconds between thumbnails
@@ -5962,8 +5978,21 @@ def _rec_prewarm_once():
                   f"({e.get('disp_title', '?')[:40]})", flush=True)
             _rec_hls_spawn(uuid)
             return  # one per cycle
-        # HLS already present — fill in the ad markers if missing
+        # HLS already present — fill in the ad markers if missing.
+        # Also skip if a fresh '.scanning' lock-file exists in the dir:
+        # the Mac-side tv-comskip.sh writes this before spawning its
+        # own comskip and removes it on completion. Without the lock
+        # check, both sides race when no .txt is present yet — fine
+        # for correctness but wastes one of the two CPUs.
         if not list(out_dir.glob("*.txt")):
+            scanning = out_dir / ".scanning"
+            try:
+                fresh_lock = (scanning.exists()
+                              and time.time() - scanning.stat().st_mtime < 900)
+            except Exception:
+                fresh_lock = False
+            if fresh_lock:
+                continue
             cskip_info = _rec_cskip_procs.get(uuid)
             if not (cskip_info and cskip_info["proc"].poll() is None):
                 print(f"[rec-prewarm] comskip {uuid[:8]}", flush=True)
