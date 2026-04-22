@@ -2457,7 +2457,7 @@ v.addEventListener('loadedmetadata',()=>{{
   if(!onMediathek&&!onRecording)goLive();
   refresh();renderChapters();
 }});
-setInterval(()=>{{if(!v.paused)renderChapters();}},5000);
+setInterval(()=>{{if(!v.paused){{renderChapters();renderLiveAds();}}}},5000);
 setInterval(()=>{{if(current)loadLiveAds(current);}},300000);
 function goLive(){{
   /* Mediathek-live channel: stay inside the Mediathek HLS and just
