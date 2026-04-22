@@ -1211,7 +1211,13 @@ def index():
         "    await fetch('/api/always-warm/'+slug,{method:'POST',"
         "      headers:{'content-type':'application/json'},"
         "      body:JSON.stringify({on:on})});"
-        "    refreshWarm();reorderPinned();"
+        "    refreshWarm();"
+        "    /* Re-apply the user's current sort (usage|mux) AND the"
+        "       pin-first pass — needed on unpin so the channel drops"
+        "       back to its natural usage position instead of just"
+        "       sliding one slot down behind the still-pinned ones. */"
+        "    if(window.applyChannelSort)window.applyChannelSort();"
+        "    else reorderPinned();"
         "  }catch(e){}"
         "}"
         "document.addEventListener('click',e=>{"
@@ -1290,6 +1296,9 @@ def index():
         "  });"
         "})();"
         # Sort toggle: 'usage' (server default) or 'mux' (group by mux).
+        # Exposes window.applyChannelSort so togglePin can re-sort after
+        # an unpin (otherwise the un-pinned channel just slides one
+        # position down rather than returning to its usage-sorted spot).
         "(function(){"
         "  const ul=document.querySelector('ul.channels');"
         "  const btn=document.getElementById('sort-toggle');"
@@ -1315,6 +1324,7 @@ def index():
         "    for(const li of items)ul.appendChild(li);"
         "    reorderPinned();"
         "  };"
+        "  window.applyChannelSort=apply;"
         "  apply();"
         "  btn.addEventListener('click',()=>{"
         "    mode=mode==='usage'?'mux':'usage';"
