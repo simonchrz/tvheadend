@@ -5944,6 +5944,19 @@ def _rec_prewarm_loop():
         time.sleep(60)
 
 
+def _mac_comskip_alive():
+    """True if the Mac-side tv-comskip.sh launchd agent has touched
+    the heartbeat file in the last 5 min. Default-skip the Pi's
+    rec-comskip path while the Mac is alive — both can do the work
+    but Mac's M-series CPU is much faster and the Pi has live-stream
+    ffmpeg + remuxing to keep up with."""
+    try:
+        hb = HLS_DIR / ".mac-comskip-alive"
+        return hb.exists() and time.time() - hb.stat().st_mtime < 300
+    except Exception:
+        return False
+
+
 def _rec_prewarm_once():
     # Load-based gate: on a 4-core Pi each SD-MPEG-2 live stream eats
     # ~0.7-1.0 core, so with 3+ pinned channels "any live active" was
@@ -5979,12 +5992,13 @@ def _rec_prewarm_once():
             _rec_hls_spawn(uuid)
             return  # one per cycle
         # HLS already present — fill in the ad markers if missing.
-        # Also skip if a fresh '.scanning' lock-file exists in the dir:
-        # the Mac-side tv-comskip.sh writes this before spawning its
-        # own comskip and removes it on completion. Without the lock
-        # check, both sides race when no .txt is present yet — fine
-        # for correctness but wastes one of the two CPUs.
+        # Hand off to the Mac entirely if its launchd agent is alive
+        # (heartbeat < 5 min); only run our own comskip if the Mac is
+        # offline. Cooperative '.scanning' lock-file is the secondary
+        # guard against double-runs in any remaining race window.
         if not list(out_dir.glob("*.txt")):
+            if _mac_comskip_alive():
+                continue
             scanning = out_dir / ".scanning"
             try:
                 fresh_lock = (scanning.exists()
