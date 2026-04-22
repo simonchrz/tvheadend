@@ -2723,7 +2723,7 @@ function doJump(actualStart,fromAuthoritative){{
      switchToMediathek(d.url,targetWall,0);
    }}).catch(()=>{{}});
 }}
-let _lastJumpedEv=null,_lastJumpedTs=0;
+let _lastJumpedEv=null,_lastJumpedTs=0,_lastJumpedKind=null;
 function jumpToEvent(ev){{
   _lastJumpedEv=ev;_lastJumpedTs=Date.now();
   fetch(HOST+'/api/show-actual-start/'+current+'?ts='+ev.start)
@@ -2792,20 +2792,29 @@ async function goShowStart(){{
      event's start, treat the press as "go back one show" — same UX as
      mediathek/chain modes above. _lastJumpedEv anchors the choice
      during the ~3 s window right after a previous jump, before the
-     player's currentTime has settled. */
+     player's currentTime has settled.
+
+     Exception: if the previous jump was to an ad-block end or to
+     buffer-start (kind ∈ ad/buffer), don't honour the EPG step-back
+     here — otherwise an EPG event boundary that happens to fall
+     between two ad blocks would intercept the ad-walking sequence
+     and jump to that show start instead of to the next-earlier ad. */
   const curWall=wallForCurrent();
   const recentJump=(Date.now()-_lastJumpedTs<3000)&&_lastJumpedEv;
-  if(recentJump)ev=_lastJumpedEv;
-  if(recentJump||Math.abs(curWall-ev.start)<=10){{
-    const prev=[...epgEvents].reverse().find(e=>e.stop<=ev.start);
-    if(prev)ev=prev;
-  }}
-  const[s,e]=seekableRange();
-  const wallS=wallAt(s);
-  const offset=ev.start-wallS;
-  if(offset>=0&&e>s){{
-    _lastJumpedEv=ev;_lastJumpedTs=Date.now();
-    v.currentTime=Math.max(s+0.5,Math.min(e-1,offset));show();return;
+  const adWalking=recentJump&&(_lastJumpedKind==='ad'||_lastJumpedKind==='buffer');
+  if(!adWalking){{
+    if(recentJump)ev=_lastJumpedEv;
+    if(recentJump||Math.abs(curWall-ev.start)<=10){{
+      const prev=[...epgEvents].reverse().find(e=>e.stop<=ev.start);
+      if(prev)ev=prev;
+    }}
+    const[s,e]=seekableRange();
+    const wallS=wallAt(s);
+    const offset=ev.start-wallS;
+    if(offset>=0&&e>s){{
+      _lastJumpedEv=ev;_lastJumpedTs=Date.now();_lastJumpedKind='epg';
+      v.currentTime=Math.max(s+0.5,Math.min(e-1,offset));show();return;
+    }}
   }}
   /* Local buffer doesn't reach back that far. Try:
      1) tvheadend recording currently running on this channel (has
@@ -2848,7 +2857,7 @@ async function goShowStart(){{
                  const cutoffWall=recentJump?wallForCurrent():wallE;
                  const last=[...ads].reverse().find(a=>a[1]>=wallS&&a[1]<=cutoffWall-0.5);
                  if(last){{
-                   _lastJumpedEv=ev;_lastJumpedTs=Date.now();
+                   _lastJumpedEv=ev;_lastJumpedTs=Date.now();_lastJumpedKind='ad';
                    v.currentTime=Math.max(s+0.5,Math.min(e-1,last[1]-wallS));
                    show();
                    showHintMsg('Sprung ans Ende der vorherigen Werbung',2500);
@@ -2857,7 +2866,7 @@ async function goShowStart(){{
                }}
                /* No more ads earlier in the buffer — fall back to
                   the buffer's earliest seekable position. */
-               _lastJumpedEv=ev;_lastJumpedTs=Date.now();
+               _lastJumpedEv=ev;_lastJumpedTs=Date.now();_lastJumpedKind='buffer';
                v.currentTime=s+0.5;show();
                showHintMsg('Sendungsanfang außerhalb Puffer — Sprung an Buffer-Anfang',3500);
              }}).catch(()=>showHintMsg('Sendungsanfang außerhalb Puffer'));
