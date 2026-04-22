@@ -1066,8 +1066,13 @@ def index():
         ".pin-btn:hover{opacity:.75;transform:rotate(45deg) scale(1.1);"
         "filter:grayscale(.5) drop-shadow(0 1px 2px #0008)}"
         "}"
+        # Note: 'filter: none drop-shadow(...)' is invalid CSS — 'none'
+        # cancels all filters, can't compose with other functions.
+        # Just drop-shadow alone: no grayscale → emoji renders in full
+        # red; the implicit reset of grayscale relative to the parent
+        # .pin-btn rule is what we want.
         ".pin-btn.active{opacity:1;transform:rotate(45deg);"
-        "filter:none drop-shadow(0 2px 3px #0009)}"
+        "filter:drop-shadow(0 2px 3px #0009)}"
         "ul.channels li:has(.pin-btn.active){"
         "box-shadow:0 3px 10px #0003;transform:translateY(-1px)}"
         ".pin-btn.dormant{opacity:.6}"
