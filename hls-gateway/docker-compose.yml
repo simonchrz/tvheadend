@@ -32,4 +32,4 @@ services:
       # current script reads segments via Caddy on :8443 (file_server
       # bypass of Flask) with a local segment cache, so each scan
       # transfers ~15 MB after warmup instead of 900 MB.
-#      - LIVE_ADS_OFFLOAD=mac
+      - LIVE_ADS_OFFLOAD=mac
