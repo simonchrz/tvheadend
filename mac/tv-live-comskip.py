@@ -379,11 +379,17 @@ def analyze(slug, state, window_end_seg=None, window_size=WINDOW_SIZE):
         return False
 
     # ---- comskip + blackframe extend ----
+    # Use the Pi-written .comskip.ini on the SMB share so detection
+    # uses the same DE-private-TV tuning the Pi container does
+    # (min_commercialbreak=60, validate_silence=1, drop AR, etc.).
+    ini_path = HLS_DIR / ".comskip.ini"
     scan_t0 = time.time()
+    cmd = [str(COMSKIP), "--quiet"]
+    if ini_path.is_file():
+        cmd += ["--ini", str(ini_path)]
+    cmd += ["--output", str(work), str(merged)]
     try:
-        subprocess.run(
-            [str(COMSKIP), "--quiet", "--output", str(work), str(merged)],
-            timeout=600, check=False, capture_output=True)
+        subprocess.run(cmd, timeout=600, check=False, capture_output=True)
     except Exception as e:
         log(f"[{slug}] comskip: {e}")
     ads_sec = parse_comskip(work)
