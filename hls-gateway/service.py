@@ -90,16 +90,20 @@ app = Flask(__name__)
 
 
 @app.after_request
-def _no_cache_html(resp):
-    """All dynamically-rendered HTML pages should bypass browser
-    cache so JS deploys are picked up on the next navigation.
-    iOS Safari is particularly aggressive about caching static-
-    looking HTML; without explicit no-cache headers, users keep
-    running stale code days after a deploy. Static segments etc.
-    are served by Caddy directly and aren't routed through Flask,
-    so they're unaffected."""
+def _no_cache_dynamic(resp):
+    """All dynamically-rendered responses (HTML pages + JSON API
+    endpoints) should bypass browser cache. iOS Safari is
+    particularly aggressive — without explicit headers it caches:
+      - HTML pages → users keep running stale JS for days
+      - JSON API responses → polling endpoints like
+        /api/warm-status return stale state right after a POST,
+        causing the just-toggled pin button to flicker back to its
+        old class because refreshWarm sees the cached "still
+        pinned" answer.
+    Static segments etc. are served by Caddy directly and aren't
+    routed through Flask, so they're unaffected."""
     ct = resp.headers.get("Content-Type", "")
-    if ct.startswith("text/html"):
+    if ct.startswith("text/html") or ct.startswith("application/json"):
         resp.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
         resp.headers["Pragma"] = "no-cache"
     return resp
