@@ -2516,7 +2516,7 @@ function goShowNext(){{
   /* Mediathek: jump forward to the next reachable EPG event. */
   if(onMediathek){{
     let cur=currentEvent();
-    const recentJump=(Date.now()-_lastJumpedTs<3000)&&_lastJumpedEv;
+    const recentJump=(Date.now()-_lastJumpedTs<10000)&&_lastJumpedEv;
     if(recentJump)cur=_lastJumpedEv;
     if(cur){{
       const next=epgEvents.find(e=>e.start>=cur.stop);
@@ -2525,21 +2525,43 @@ function goShowNext(){{
     goLive();return;
   }}
   /* Live-buffer step-forward: symmetric to the step-back in
-     goShowStart. Find the EPG event after the current one (anchored
-     on _lastJumpedEv during the ~3 s settle window) and seek if its
-     start lies inside the local DVR window. Falls through to the
-     recChain branch below and ultimately to goLive(). */
+     goShowStart. If the previous jump was an ad-walk (kind ∈
+     ad/buffer), continue walking forward through ad-block ends
+     instead of EPG events — same priority rule as in goShowStart
+     so an EPG event boundary between ads doesn't intercept the
+     sequence. Otherwise normal forward step is by EPG event. */
+  const recentJumpFwd=(Date.now()-_lastJumpedTs<10000)&&_lastJumpedEv;
+  const adWalkingFwd=recentJumpFwd&&(_lastJumpedKind==='ad'||_lastJumpedKind==='buffer');
+  if(adWalkingFwd){{
+    fetch(HOST+'/api/live-ads/'+current).then(r=>r.json()).then(adResp=>{{
+      const ads=adResp.ads||[];
+      const[s,e]=seekableRange();
+      if(e<=s+1){{goLive();return;}}
+      const nowS=Date.now()/1000;
+      const wallS=nowS-(e-s),wallE=nowS;
+      const cutoffWall=wallForCurrent();
+      const next=ads.find(a=>a[1]>cutoffWall+0.5&&a[1]<=wallE);
+      if(next){{
+        _lastJumpedTs=Date.now();_lastJumpedKind='ad';
+        v.currentTime=Math.max(s+0.5,Math.min(e-1,next[1]-wallS));
+        show();
+        showHintMsg('Sprung ans Ende der nächsten Werbung',2500);
+        return;
+      }}
+      goLive();
+    }}).catch(()=>goLive());
+    return;
+  }}
   {{
     let cur=currentEvent();
-    const recentJump=(Date.now()-_lastJumpedTs<3000)&&_lastJumpedEv;
-    if(recentJump)cur=_lastJumpedEv;
+    if(recentJumpFwd)cur=_lastJumpedEv;
     if(cur){{
       const next=epgEvents.find(e=>e.start>=cur.stop);
       if(next){{
         const[s,e]=seekableRange();
         const wallS=e>s?wallAt(s):null;
         if(wallS!==null&&next.start>=wallS&&next.start<=wallAt(e)){{
-          _lastJumpedEv=next;_lastJumpedTs=Date.now();
+          _lastJumpedEv=next;_lastJumpedTs=Date.now();_lastJumpedKind='epg';
           v.currentTime=Math.max(s+0.5,Math.min(e-1,next.start-wallS));
           show();return;
         }}
@@ -2766,7 +2788,7 @@ async function goShowStart(){{
      otherwise a quick double-tap would re-jump to the same event. */
   if(onMediathek){{
     let cur=currentEvent();
-    const recentJump=(Date.now()-_lastJumpedTs<3000)&&_lastJumpedEv;
+    const recentJump=(Date.now()-_lastJumpedTs<10000)&&_lastJumpedEv;
     if(recentJump)cur=_lastJumpedEv;
     const curWall=wallForCurrent();
     const nearStart=cur&&(recentJump||Math.abs(curWall-cur.start)<=10);
@@ -2800,7 +2822,7 @@ async function goShowStart(){{
      between two ad blocks would intercept the ad-walking sequence
      and jump to that show start instead of to the next-earlier ad. */
   const curWall=wallForCurrent();
-  const recentJump=(Date.now()-_lastJumpedTs<3000)&&_lastJumpedEv;
+  const recentJump=(Date.now()-_lastJumpedTs<10000)&&_lastJumpedEv;
   const adWalking=recentJump&&(_lastJumpedKind==='ad'||_lastJumpedKind==='buffer');
   if(!adWalking){{
     if(recentJump)ev=_lastJumpedEv;
@@ -2853,7 +2875,7 @@ async function goShowStart(){{
                     every commercial break in the buffer with successive
                     taps until none is left, then we fall through to
                     buffer-start. */
-                 const recentJump=(Date.now()-_lastJumpedTs)<3000;
+                 const recentJump=(Date.now()-_lastJumpedTs)<10000;
                  const cutoffWall=recentJump?wallForCurrent():wallE;
                  const last=[...ads].reverse().find(a=>a[1]>=wallS&&a[1]<=cutoffWall-0.5);
                  if(last){{
