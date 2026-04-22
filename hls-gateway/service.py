@@ -4785,7 +4785,8 @@ def recordings_page():
             for e in eps)
         open_attr = " open" if any_active else ""
         summary = (f'<tr class="series-head"><td colspan="7">'
-                   f'<details{open_attr}><summary>{badge} {group_title} '
+                   f'<details data-ar="{ar_uuid}"{open_attr}>'
+                   f'<summary>{badge} {group_title} '
                    f'<small>({len(eps)} Einträge)</small>{kill_btn}</summary>'
                    f'<table class="series-sub"><tbody>'
                    + "".join(_render_row(e) for e in sorted(
@@ -4917,6 +4918,24 @@ def recordings_page():
             f"<script>"
             f"if(document.querySelector('.badge.scanning,.badge.warming,.badge.live'))"
             f"  setTimeout(()=>location.reload(),15000);"
+            # Persist <details> open/closed state per series across reloads.
+            # Key by autorec uuid (data-ar). User toggles win over the
+            # server-default 'open if any episode active'.
+            f"(function(){{"
+            f"  const KEY='rec-series-open';"
+            f"  let saved={{}};"
+            f"  try{{saved=JSON.parse(localStorage.getItem(KEY)||'{{}}');}}"
+            f"  catch(e){{}}"
+            f"  for(const d of document.querySelectorAll('details[data-ar]')){{"
+            f"    const ar=d.dataset.ar;"
+            f"    if(ar in saved)d.open=!!saved[ar];"
+            f"    d.addEventListener('toggle',()=>{{"
+            f"      saved[ar]=d.open;"
+            f"      try{{localStorage.setItem(KEY,JSON.stringify(saved));}}"
+            f"      catch(e){{}}"
+            f"    }});"
+            f"  }}"
+            f"}})();"
             f"function showDeleteModal(title,subtitle,onConfirm){{"
             f"  const m=document.createElement('div');"
             f"  m.className='del-modal';"
