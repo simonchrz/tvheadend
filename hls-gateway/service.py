@@ -2540,12 +2540,22 @@ function goShowNext(){{
       const nowS=Date.now()/1000;
       const wallS=nowS-(e-s),wallE=nowS;
       const cutoffWall=wallForCurrent();
-      const next=ads.find(a=>a[1]>cutoffWall+0.5&&a[1]<=wallE);
-      if(next){{
-        _lastJumpedTs=Date.now();_lastJumpedKind='ad';
-        v.currentTime=Math.max(s+0.5,Math.min(e-1,next[1]-wallS));
+      /* Forward step-points: ad-block ends + EPG event starts that
+         are strictly after current position. Pick the earliest. */
+      const targets=[];
+      for(const a of ads){{
+        if(a[1]>cutoffWall+0.5&&a[1]<=wallE)targets.push({{wall:a[1],kind:'ad'}});
+      }}
+      for(const epg of epgEvents){{
+        if(epg.start>cutoffWall+0.5&&epg.start<=wallE)targets.push({{wall:epg.start,kind:'epg',ev:epg}});
+      }}
+      targets.sort((x,y)=>x.wall-y.wall);
+      if(targets.length){{
+        const pick=targets[0];
+        _lastJumpedEv=pick.ev||_lastJumpedEv;_lastJumpedTs=Date.now();_lastJumpedKind=pick.kind;
+        v.currentTime=Math.max(s+0.5,Math.min(e-1,pick.wall-wallS));
         show();
-        showHintMsg('Sprung ans Ende der nächsten Werbung',2500);
+        showHintMsg(pick.kind==='epg'?'Sprung an nächsten Sendungsanfang':'Sprung ans Ende der nächsten Werbung',2500);
         return;
       }}
       goLive();
@@ -2853,10 +2863,17 @@ async function goShowStart(){{
         .then(r=>r.json()).then(d=>{{
           if(!d.url){{
             /* Cascading final fallbacks — best UX over strict accuracy.
-               1) End of the next-earlier comskip-detected ad block
-                  (walks backwards through ads on repeated taps).
-               2) Buffer start → at least the user lands somewhere
-                  meaningful instead of an error toast. */
+               Each tap finds the closest backward step-point that's
+               in the seekable buffer and strictly earlier than the
+               current position. Step-points are merged from two
+               sources:
+                 - end of every detected ad block (= show resumed)
+                 - start of every EPG event (= show began)
+               Ranking by wall-time only — kind doesn't matter for
+               picking, but we tag _lastJumpedKind so the next tap
+               knows whether to keep walking ads or to switch back
+               to EPG-driven step-back. Falls through to buffer-start
+               when nothing earlier exists. */
             fetch(HOST+'/api/live-ads/'+current)
              .then(r=>r.json()).then(adResp=>{{
                const ads=adResp.ads||[];
@@ -2865,29 +2882,27 @@ async function goShowStart(){{
                  showHintMsg('Sendungsanfang außerhalb Puffer');
                  return;
                }}
-               if(ads.length){{
-                 const wallS=wallAt(s),wallE=wallAt(e);
-                 /* On the first tap of a sequence, cutoff is the live
-                    edge → finds the latest ad in the buffer. On
-                    repeated taps within the 3 s anchor window, cutoff
-                    is the position we just jumped to → finds the
-                    next-earlier ad. So a user can walk back through
-                    every commercial break in the buffer with successive
-                    taps until none is left, then we fall through to
-                    buffer-start. */
-                 const recentJump=(Date.now()-_lastJumpedTs)<10000;
-                 const cutoffWall=recentJump?wallForCurrent():wallE;
-                 const last=[...ads].reverse().find(a=>a[1]>=wallS&&a[1]<=cutoffWall-0.5);
-                 if(last){{
-                   _lastJumpedEv=ev;_lastJumpedTs=Date.now();_lastJumpedKind='ad';
-                   v.currentTime=Math.max(s+0.5,Math.min(e-1,last[1]-wallS));
-                   show();
-                   showHintMsg('Sprung ans Ende der vorherigen Werbung',2500);
-                   return;
-                 }}
+               const wallS=wallAt(s),wallE=wallAt(e);
+               const recentJump=(Date.now()-_lastJumpedTs)<10000;
+               const cutoffWall=recentJump?wallForCurrent():wallE;
+               const targets=[];
+               for(const a of ads){{
+                 if(a[1]>=wallS&&a[1]<=cutoffWall-0.5)targets.push({{wall:a[1],kind:'ad'}});
                }}
-               /* No more ads earlier in the buffer — fall back to
-                  the buffer's earliest seekable position. */
+               for(const epg of epgEvents){{
+                 if(epg.start>=wallS&&epg.start<=cutoffWall-0.5)targets.push({{wall:epg.start,kind:'epg',ev:epg}});
+               }}
+               targets.sort((x,y)=>y.wall-x.wall);
+               if(targets.length){{
+                 const pick=targets[0];
+                 _lastJumpedEv=pick.ev||ev;_lastJumpedTs=Date.now();_lastJumpedKind=pick.kind;
+                 v.currentTime=Math.max(s+0.5,Math.min(e-1,pick.wall-wallS));
+                 show();
+                 showHintMsg(pick.kind==='epg'?'Sprung an vorherigen Sendungsanfang':'Sprung ans Ende der vorherigen Werbung',2500);
+                 return;
+               }}
+               /* No more step-points earlier in the buffer — fall
+                  back to the buffer's earliest seekable position. */
                _lastJumpedEv=ev;_lastJumpedTs=Date.now();_lastJumpedKind='buffer';
                v.currentTime=s+0.5;show();
                showHintMsg('Sendungsanfang außerhalb Puffer — Sprung an Buffer-Anfang',3500);
