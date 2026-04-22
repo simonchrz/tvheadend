@@ -87,6 +87,24 @@ SPONSOR_DURATION_BY_CHANNEL = {
 }
 
 app = Flask(__name__)
+
+
+@app.after_request
+def _no_cache_html(resp):
+    """All dynamically-rendered HTML pages should bypass browser
+    cache so JS deploys are picked up on the next navigation.
+    iOS Safari is particularly aggressive about caching static-
+    looking HTML; without explicit no-cache headers, users keep
+    running stale code days after a deploy. Static segments etc.
+    are served by Caddy directly and aren't routed through Flask,
+    so they're unaffected."""
+    ct = resp.headers.get("Content-Type", "")
+    if ct.startswith("text/html"):
+        resp.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+        resp.headers["Pragma"] = "no-cache"
+    return resp
+
+
 channels     = {}    # slug -> {"process","last_seen","started_at"}
 channel_map  = {}    # slug -> {"name","uuid"}
 codec_cache  = {}    # slug -> {"video": "h264"|..., "audio": "aac"|...}
