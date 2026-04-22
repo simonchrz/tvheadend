@@ -2524,76 +2524,38 @@ function goShowNext(){{
     }}
     goLive();return;
   }}
-  /* Live-buffer step-forward: symmetric to the step-back. Once a
-     sequence has entered merged-targets walk (kind ∈ walk/buffer),
-     stay there — same reasoning as in goShowStart. */
+  /* Live-buffer step-forward, unified merged-targets walk —
+     symmetric to goShowStart. Same target set, same _lastJumpedWall
+     cutoff. Picks earliest target after current. Falls through to
+     goLive() when nothing's left forward. */
   const recentJumpFwd=(Date.now()-_lastJumpedTs<10000)&&_lastJumpedEv;
-  const adWalkingFwd=recentJumpFwd&&(_lastJumpedKind==='walk'||_lastJumpedKind==='buffer');
-  if(adWalkingFwd){{
-    fetch(HOST+'/api/live-ads/'+current).then(r=>r.json()).then(adResp=>{{
-      const ads=adResp.ads||[];
-      const[s,e]=seekableRange();
-      if(e<=s+1){{goLive();return;}}
-      const nowS=Date.now()/1000;
-      const wallS=nowS-(e-s),wallE=nowS;
-      const cutoffWall=wallForCurrent();
-      /* Same target set as backward walk: both endpoints of every
-         ad block + every EPG event start. Pick earliest after
-         current. */
-      const targets=[];
-      for(const a of ads){{
-        if(a[0]>cutoffWall+0.5&&a[0]<=wallE)targets.push({{wall:a[0],kind:'walk',label:'ad-start'}});
-        if(a[1]>cutoffWall+0.5&&a[1]<=wallE)targets.push({{wall:a[1],kind:'walk',label:'ad-end'}});
-      }}
-      for(const epg of epgEvents){{
-        if(epg.start>cutoffWall+0.5&&epg.start<=wallE)targets.push({{wall:epg.start,kind:'walk',label:'epg-start',ev:epg}});
-      }}
-      targets.sort((x,y)=>x.wall-y.wall);
-      if(targets.length){{
-        const pick=targets[0];
-        _lastJumpedEv=pick.ev||_lastJumpedEv;_lastJumpedTs=Date.now();_lastJumpedKind=pick.kind;
-        v.currentTime=Math.max(s+0.5,Math.min(e-1,pick.wall-wallS));
-        show();
-        const hints={{'epg-start':'Sprung an nächsten Sendungsanfang','ad-start':'Sprung an Werbeblock-Anfang','ad-end':'Sprung an Werbeblock-Ende'}};
-        showHintMsg(hints[pick.label]||'Sprung vorwärts',2500);
-        return;
-      }}
-      goLive();
-    }}).catch(()=>goLive());
-    return;
-  }}
-  {{
-    let cur=currentEvent();
-    if(recentJumpFwd)cur=_lastJumpedEv;
-    if(cur){{
-      const next=epgEvents.find(e=>e.start>=cur.stop);
-      if(next){{
-        const[s,e]=seekableRange();
-        const wallS=e>s?wallAt(s):null;
-        if(wallS!==null&&next.start>=wallS&&next.start<=wallAt(e)){{
-          _lastJumpedEv=next;_lastJumpedTs=Date.now();_lastJumpedKind='epg';
-          v.currentTime=Math.max(s+0.5,Math.min(e-1,next.start-wallS));
-          show();return;
-        }}
-      }}
-    }}
-  }}
-  /* Live mode in chain-aware context: if we're in the live-window
-     but before the currently-airing event, advance to its start. */
-  if(recChain&&recChain.length){{
-    const curWall=wallForCurrent();
+  fetch(HOST+'/api/live-ads/'+current).then(r=>r.json()).then(adResp=>{{
+    const ads=adResp.ads||[];
+    const[s,e]=seekableRange();
+    if(e<=s+1){{goLive();return;}}
     const nowS=Date.now()/1000;
-    const next=epgEvents.find(e=>e.start>curWall+5&&e.start<=nowS);
-    if(next){{
-      const[s,e]=seekableRange();
-      const wallS=e>s?wallAt(s):null;
-      if(wallS!==null&&next.start>=wallS&&next.start<=wallAt(e)){{
-        v.currentTime=Math.max(s+0.5,Math.min(e-1,next.start-wallS));
-        show();return;
-      }}
+    const wallS=nowS-(e-s),wallE=nowS;
+    const cutoffWall=recentJumpFwd?_lastJumpedWall:wallForCurrent();
+    const targets=[];
+    for(const a of ads){{
+      if(a[1]>cutoffWall+0.5&&a[1]<=wallE)targets.push({{wall:a[1],label:'ad-end'}});
     }}
-  }}
-  goLive();
+    for(const epg of epgEvents){{
+      if(epg.start>cutoffWall+0.5&&epg.start<=wallE)targets.push({{wall:epg.start,label:'epg-start',ev:epg}});
+    }}
+    targets.sort((x,y)=>x.wall-y.wall);
+    if(targets.length){{
+      const pick=targets[0];
+      _lastJumpedEv=pick.ev||_lastJumpedEv;
+      _lastJumpedTs=Date.now();_lastJumpedKind='walk';_lastJumpedWall=pick.wall;
+      v.currentTime=Math.max(s+0.5,Math.min(e-1,pick.wall-wallS));
+      show();
+      const hints={{'epg-start':'Sprung an nächsten Sendungsanfang','ad-end':'Sprung an Werbeblock-Ende'}};
+      showHintMsg(hints[pick.label]||'Sprung vorwärts',2500);
+      return;
+    }}
+    goLive();
+  }}).catch(()=>goLive());
 }}
 let onRecording=false;
 /* When the recording-VOD ends (player reached its final segment),
@@ -2755,7 +2717,7 @@ function doJump(actualStart,fromAuthoritative){{
      switchToMediathek(d.url,targetWall,0);
    }}).catch(()=>{{}});
 }}
-let _lastJumpedEv=null,_lastJumpedTs=0,_lastJumpedKind=null;
+let _lastJumpedEv=null,_lastJumpedTs=0,_lastJumpedKind=null,_lastJumpedWall=0;
 function jumpToEvent(ev){{
   _lastJumpedEv=ev;_lastJumpedTs=Date.now();
   fetch(HOST+'/api/show-actual-start/'+current+'?ts='+ev.start)
@@ -2820,106 +2782,73 @@ async function goShowStart(){{
     ev=currentEvent();
     if(!ev){{showHintMsg('Kein EPG-Event gefunden');return;}}
   }}
-  /* Live-buffer step-back: if we're already at (or near) the current
-     event's start, treat the press as "go back one show" — same UX as
-     mediathek/chain modes above. _lastJumpedEv anchors the choice
-     during the 10 s window right after a previous jump.
+  /* Live-buffer step-back, unified merged-targets walk.
 
-     Exception: once a sequence has entered the merged-targets walk
-     (kind ∈ walk/buffer), stay there. Otherwise a yellow EPG tick
-     picked up by the walk would flip kind back to 'epg' and the
-     next tap would jump a whole show backwards instead of to the
-     next walk-target. */
-  const curWall=wallForCurrent();
+     Every tap evaluates the same target set:
+       - end of every detected ad block in the buffer (= "show
+         resumed after this break")
+       - start of every EPG event in the buffer (= "this show began")
+     Cutoff for "before current position":
+       - first tap of a sequence: live edge — picks the latest
+         target overall (often the most recent ad-end, sometimes
+         the current show start if no ad has aired since)
+       - subsequent taps within the 10 s anchor window: the wall-time
+         we last jumped to (NOT v.currentTime, which can lag a
+         second or two on iOS Safari right after a seek and cause
+         "every other tap re-picks the same target")
+
+     If no target lies earlier in the buffer, fall through to the
+     classical extend-backward cascade (recording-window → mediathek
+     → buffer-start). */
   const recentJump=(Date.now()-_lastJumpedTs<10000)&&_lastJumpedEv;
-  const adWalking=recentJump&&(_lastJumpedKind==='walk'||_lastJumpedKind==='buffer');
-  if(!adWalking){{
-    if(recentJump)ev=_lastJumpedEv;
-    if(recentJump||Math.abs(curWall-ev.start)<=10){{
-      const prev=[...epgEvents].reverse().find(e=>e.stop<=ev.start);
-      if(prev)ev=prev;
-    }}
-    const[s,e]=seekableRange();
-    const wallS=wallAt(s);
-    const offset=ev.start-wallS;
-    if(offset>=0&&e>s){{
-      _lastJumpedEv=ev;_lastJumpedTs=Date.now();_lastJumpedKind='epg';
-      v.currentTime=Math.max(s+0.5,Math.min(e-1,offset));show();return;
-    }}
-  }}
-  /* Local buffer doesn't reach back that far. Try:
-     1) tvheadend recording currently running on this channel (has
-        whatever was broadcast since recording start)
-     2) public Mediathek HLS (public broadcasters only) */
-  showHintMsg('Suche Aufnahme…',4000);
-  fetch(HOST+'/api/recording-window/'+current)
-   .then(r=>r.json()).then(resp=>{{
-     const chain=(resp&&resp.chain)||[];
-     /* Pick the chain entry whose [start,stop] covers ev.start. */
-     const targetIdx=chain.findIndex(c=>c.start<=ev.start&&ev.start<c.stop);
-     if(targetIdx<0||chain.length===0){{
-       fetch(HOST+'/api/mediathek-live/'+current)
-        .then(r=>r.json()).then(d=>{{
-          if(!d.url){{
-            /* Cascading final fallbacks — best UX over strict accuracy.
-               Each tap finds the closest backward step-point that's
-               in the seekable buffer and strictly earlier than the
-               current position. Step-points are merged from two
-               sources:
-                 - end of every detected ad block (= show resumed)
-                 - start of every EPG event (= show began)
-               Ranking by wall-time only — kind doesn't matter for
-               picking, but we tag _lastJumpedKind so the next tap
-               knows whether to keep walking ads or to switch back
-               to EPG-driven step-back. Falls through to buffer-start
-               when nothing earlier exists. */
-            fetch(HOST+'/api/live-ads/'+current)
-             .then(r=>r.json()).then(adResp=>{{
-               const ads=adResp.ads||[];
-               const[s,e]=seekableRange();
-               if(e<=s){{
-                 showHintMsg('Sendungsanfang außerhalb Puffer');
-                 return;
-               }}
-               const wallS=wallAt(s),wallE=wallAt(e);
-               const recentJump=(Date.now()-_lastJumpedTs)<10000;
-               const cutoffWall=recentJump?wallForCurrent():wallE;
-               /* Targets: BOTH endpoints of every ad block (start =
-                  show interrupted, end = show resumed) plus every
-                  EPG event start. User can step through every
-                  endpoint with successive taps. */
-               const targets=[];
-               for(const a of ads){{
-                 if(a[0]>=wallS&&a[0]<=cutoffWall-0.5)targets.push({{wall:a[0],kind:'walk',label:'ad-start'}});
-                 if(a[1]>=wallS&&a[1]<=cutoffWall-0.5)targets.push({{wall:a[1],kind:'walk',label:'ad-end'}});
-               }}
-               for(const epg of epgEvents){{
-                 if(epg.start>=wallS&&epg.start<=cutoffWall-0.5)targets.push({{wall:epg.start,kind:'walk',label:'epg-start',ev:epg}});
-               }}
-               targets.sort((x,y)=>y.wall-x.wall);
-               if(targets.length){{
-                 const pick=targets[0];
-                 _lastJumpedEv=pick.ev||ev;_lastJumpedTs=Date.now();_lastJumpedKind=pick.kind;
-                 v.currentTime=Math.max(s+0.5,Math.min(e-1,pick.wall-wallS));
-                 show();
-                 const hints={{'epg-start':'Sprung an vorherigen Sendungsanfang','ad-start':'Sprung an Werbeblock-Anfang','ad-end':'Sprung an Werbeblock-Ende'}};
-                 showHintMsg(hints[pick.label]||'Sprung zurück',2500);
-                 return;
-               }}
-               /* No more step-points earlier in the buffer — fall
-                  back to the buffer's earliest seekable position. */
-               _lastJumpedEv=ev;_lastJumpedTs=Date.now();_lastJumpedKind='buffer';
-               v.currentTime=s+0.5;show();
-               showHintMsg('Sendungsanfang außerhalb Puffer — Sprung an Buffer-Anfang',3500);
-             }}).catch(()=>showHintMsg('Sendungsanfang außerhalb Puffer'));
-            return;
-          }}
-          switchToMediathek(d.url,ev.start);
-        }}).catch(()=>{{showHintMsg('Mediathek-Fehler');}});
+  fetch(HOST+'/api/live-ads/'+current)
+   .then(r=>r.json()).then(adResp=>{{
+     const ads=adResp.ads||[];
+     const[s,e]=seekableRange();
+     if(e<=s+1){{showHintMsg('Buffer leer');return;}}
+     const nowS=Date.now()/1000;
+     const wallS=nowS-(e-s),wallE=nowS;
+     const cutoffWall=recentJump?_lastJumpedWall:wallE;
+     const targets=[];
+     for(const a of ads){{
+       if(a[1]>=wallS&&a[1]<=cutoffWall-0.5)targets.push({{wall:a[1],label:'ad-end'}});
+     }}
+     for(const epg of epgEvents){{
+       if(epg.start>=wallS&&epg.start<=cutoffWall-0.5)targets.push({{wall:epg.start,label:'epg-start',ev:epg}});
+     }}
+     targets.sort((x,y)=>y.wall-x.wall);
+     if(targets.length){{
+       const pick=targets[0];
+       _lastJumpedEv=pick.ev||_lastJumpedEv||ev;
+       _lastJumpedTs=Date.now();_lastJumpedKind='walk';_lastJumpedWall=pick.wall;
+       v.currentTime=Math.max(s+0.5,Math.min(e-1,pick.wall-wallS));
+       show();
+       const hints={{'epg-start':'Sprung an vorherigen Sendungsanfang','ad-end':'Sprung an Werbeblock-Ende'}};
+       showHintMsg(hints[pick.label]||'Sprung zurück',2500);
        return;
      }}
-     activateRecordingChain(chain,targetIdx,ev.start);
-   }}).catch(err=>{{showHintMsg('Recording-Fehler: '+err);}});
+     /* No targets earlier in buffer — try chain → mediathek → buffer-start */
+     showHintMsg('Suche Aufnahme…',4000);
+     fetch(HOST+'/api/recording-window/'+current)
+      .then(r=>r.json()).then(resp=>{{
+        const chain=(resp&&resp.chain)||[];
+        const targetIdx=chain.findIndex(c=>c.start<=ev.start&&ev.start<c.stop);
+        if(targetIdx<0||chain.length===0){{
+          fetch(HOST+'/api/mediathek-live/'+current)
+           .then(r=>r.json()).then(d=>{{
+             if(!d.url){{
+               _lastJumpedEv=ev;_lastJumpedTs=Date.now();_lastJumpedKind='buffer';_lastJumpedWall=wallS+0.5;
+               v.currentTime=s+0.5;show();
+               showHintMsg('Sendungsanfang außerhalb Puffer — Sprung an Buffer-Anfang',3500);
+               return;
+             }}
+             switchToMediathek(d.url,ev.start);
+           }}).catch(()=>showHintMsg('Mediathek-Fehler'));
+          return;
+        }}
+        activateRecordingChain(chain,targetIdx,ev.start);
+      }}).catch(err=>showHintMsg('Recording-Fehler: '+err));
+   }}).catch(()=>showHintMsg('Live-Ads-Fehler'));
 }}
 function activateRecordingChain(chain,targetIdx,wallStartTs){{
   recChain=chain;
