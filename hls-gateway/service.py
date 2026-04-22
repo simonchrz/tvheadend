@@ -3050,7 +3050,18 @@ function renderLiveAds(){{
   let seekS=null,seekE=null;
   if(!(onRecording&&recChain)){{
     const[s,e]=seekableRange();
-    if(e>s){{seekS=wallAt(s);seekE=wallAt(e);}}
+    if(e>s+1){{
+      /* Derive wall-time of the seekable bounds from "now - duration"
+         instead of wallAt(s)/wallAt(e). Safari's getStartDate() can
+         return the original playlist start (drifting hours-old) for
+         sliding HLS windows, which makes wallAt(s) too early — and
+         then the filter wrongly thinks ancient ads are still in the
+         buffer. The live edge is by definition ~now, so live edge
+         minus buffer duration gives the actual seekable start. */
+      const nowS=Date.now()/1000;
+      seekE=nowS;
+      seekS=nowS-(e-s);
+    }}
   }}
   for(const[wStart,wStop]of allAdsWall()){{
     if(wStop<=ws||wStart>=we)continue;
