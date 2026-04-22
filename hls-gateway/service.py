@@ -2822,8 +2822,8 @@ async function goShowStart(){{
         .then(r=>r.json()).then(d=>{{
           if(!d.url){{
             /* Cascading final fallbacks — best UX over strict accuracy.
-               1) End of latest comskip-detected ad block in buffer →
-                  clean show-resumption point.
+               1) End of the next-earlier comskip-detected ad block
+                  (walks backwards through ads on repeated taps).
                2) Buffer start → at least the user lands somewhere
                   meaningful instead of an error toast. */
             fetch(HOST+'/api/live-ads/'+current)
@@ -2836,16 +2836,27 @@ async function goShowStart(){{
                }}
                if(ads.length){{
                  const wallS=wallAt(s),wallE=wallAt(e);
-                 const last=[...ads].reverse().find(a=>a[1]>=wallS&&a[1]<=wallE);
+                 /* On the first tap of a sequence, cutoff is the live
+                    edge → finds the latest ad in the buffer. On
+                    repeated taps within the 3 s anchor window, cutoff
+                    is the position we just jumped to → finds the
+                    next-earlier ad. So a user can walk back through
+                    every commercial break in the buffer with successive
+                    taps until none is left, then we fall through to
+                    buffer-start. */
+                 const recentJump=(Date.now()-_lastJumpedTs)<3000;
+                 const cutoffWall=recentJump?wallForCurrent():wallE;
+                 const last=[...ads].reverse().find(a=>a[1]>=wallS&&a[1]<=cutoffWall-0.5);
                  if(last){{
                    _lastJumpedEv=ev;_lastJumpedTs=Date.now();
                    v.currentTime=Math.max(s+0.5,Math.min(e-1,last[1]-wallS));
                    show();
-                   showHintMsg('Sendungsanfang außerhalb Puffer — Sprung ans Ende der letzten Werbung',3500);
+                   showHintMsg('Sprung ans Ende der vorherigen Werbung',2500);
                    return;
                  }}
                }}
-               /* No usable ad block — jump to the buffer start. */
+               /* No more ads earlier in the buffer — fall back to
+                  the buffer's earliest seekable position. */
                _lastJumpedEv=ev;_lastJumpedTs=Date.now();
                v.currentTime=s+0.5;show();
                showHintMsg('Sendungsanfang außerhalb Puffer — Sprung an Buffer-Anfang',3500);
