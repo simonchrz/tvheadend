@@ -11,12 +11,35 @@ HLS_DIR        = Path("/data/hls")
 COMSKIP_INI    = HLS_DIR / ".comskip.ini"
 COMSKIP_INI_TEXT = """\
 ; Overrides for comskip defaults, written at service startup.
-; Only bump the max-length thresholds so longer DE-private Werbepausen
-; (often 10-15 min with station-promos inside) don't get split into
-; two blocks by comskip's default 10-min ceiling. Everything else
-; stays at comskip default to avoid fragmenting detection.
+; Tuned for German private TV (RTL/VOX/Sat.1/ProSieben/Kabel Eins/etc.).
+
+; --- Block-length ceilings ---
+; DE-private Werbepausen are often 10-15 min with station promos
+; inside; default 10-min ceiling splits one break into two entries.
 max_commercialbreak=900
 max_commercial_size=150
+
+; --- Minimum thresholds, prevent sponsor cards / promos / single
+;     teaser interruptions being mis-detected as ad breaks ---
+min_commercialbreak=60       ; default 20 — a real break is >= 60 s total
+min_commercial_size=20       ; default 4  — a real spot is >= 20 s
+min_show_segment_length=120  ; merge breaks separated by < 2 min of show
+
+; --- Detection methods ---
+; default detect_method=47 (Black + Logo + Scene + Resolution + AR).
+; Drop AR (32) — every DE channel runs 16:9 since ~2010, AR detection
+; produces false positives on dark Letterbox film scenes.
+detect_method=15
+
+; Confirm block boundaries with audio silence — DE-private ads have
+; a reliable audio dip at start/end.
+validate_silence=1
+
+; --- Intro/outro grace ---
+; First/last 60 s of each show are excluded from detection — show
+; intros (Vorspann) often contain blackframes that look ad-like.
+intro_max_seconds=60
+outro_max_seconds=60
 """
 TVH_BASE       = os.environ.get("TVH_BASE", "http://localhost:9981")
 HOST_URL       = os.environ.get("HOST_URL", "http://raspberrypi5lan:8080")
