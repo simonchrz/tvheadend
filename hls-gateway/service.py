@@ -2766,10 +2766,23 @@ async function goShowStart(){{
     ev=currentEvent();
     if(!ev){{showHintMsg('Kein EPG-Event gefunden');return;}}
   }}
+  /* Live-buffer step-back: if we're already at (or near) the current
+     event's start, treat the press as "go back one show" — same UX as
+     mediathek/chain modes above. _lastJumpedEv anchors the choice
+     during the ~3 s window right after a previous jump, before the
+     player's currentTime has settled. */
+  const curWall=wallForCurrent();
+  const recentJump=(Date.now()-_lastJumpedTs<3000)&&_lastJumpedEv;
+  if(recentJump)ev=_lastJumpedEv;
+  if(recentJump||Math.abs(curWall-ev.start)<=10){{
+    const prev=[...epgEvents].reverse().find(e=>e.stop<=ev.start);
+    if(prev)ev=prev;
+  }}
   const[s,e]=seekableRange();
   const wallS=wallAt(s);
   const offset=ev.start-wallS;
   if(offset>=0&&e>s){{
+    _lastJumpedEv=ev;_lastJumpedTs=Date.now();
     v.currentTime=Math.max(s+0.5,Math.min(e-1,offset));show();return;
   }}
   /* Local buffer doesn't reach back that far. Try:
