@@ -3050,25 +3050,24 @@ function renderLiveAds(){{
   let seekS=null,seekE=null;
   const inChain=onRecording&&recChain;
   if(!inChain){{
+    /* HAVE_CURRENT_DATA (readyState>=2) — anything below that and
+       v.seekable can still report the previous channel's range or
+       NaN bounds during the ~1 s between v.src= and the new
+       playlist parsing. Render NO markers in that window rather
+       than flash stale orphan markers. The video event listeners
+       (loadeddata/canplay/loadedmetadata) re-render once it's ready. */
+    if(v.readyState<2)return;
     const[s,e]=seekableRange();
-    if(e>s+1){{
-      /* Derive wall-time of the seekable bounds from "now - duration"
-         instead of wallAt(s)/wallAt(e). Safari's getStartDate() can
-         return the original playlist start (drifting hours-old) for
-         sliding HLS windows, which makes wallAt(s) too early — and
-         then the filter wrongly thinks ancient ads are still in the
-         buffer. The live edge is by definition ~now, so live edge
-         minus buffer duration gives the actual seekable start. */
-      const nowS=Date.now()/1000;
-      seekE=nowS;
-      seekS=nowS-(e-s);
-    }} else {{
-      /* Live mode but the player hasn't loaded enough yet to know
-         its seekable range. Render NO markers rather than show
-         stale orphans from .live_ads.json — the loadedmetadata
-         listener + 5 s tick will re-render once the buffer settles. */
-      return;
-    }}
+    if(!isFinite(s)||!isFinite(e)||e<=s+1)return;
+    /* Derive wall-time of the seekable bounds from "now - duration"
+       instead of wallAt(s)/wallAt(e). Safari's getStartDate() can
+       return the original playlist start (drifting hours-old) for
+       sliding HLS windows, making wallAt(s) too early. The live
+       edge is by definition ~now, so live edge minus buffer duration
+       gives the actual seekable start. */
+    const nowS=Date.now()/1000;
+    seekE=nowS;
+    seekS=nowS-(e-s);
   }}
   for(const[wStart,wStop]of allAdsWall()){{
     if(wStop<=ws||wStart>=we)continue;
