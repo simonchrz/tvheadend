@@ -5632,6 +5632,20 @@ def _live_ads_analyze(slug, window_end_seg=None, window_size=1800):
                 if (a[1] <= scan_start or a[0] >= scan_end)
                 and a[1] > buffer_cutoff]
     merged_ads = sorted(retained + ads_wall)
+    # Cross-scan merge pass: _rec_parse_comskip merges adjacent
+    # detections within 25 s INSIDE one scan, but a single commercial
+    # break can span a scan boundary — sub-ads detected in two
+    # different scans end up as separate entries here. Re-run the
+    # same merge across the combined list so the player sees one
+    # block per actual commercial break instead of fragmented stubs.
+    MERGE_GAP = 25.0
+    coalesced = []
+    for a, b in merged_ads:
+        if coalesced and a - coalesced[-1][1] <= MERGE_GAP:
+            coalesced[-1][1] = max(coalesced[-1][1], b)
+        else:
+            coalesced.append([a, b])
+    merged_ads = coalesced
     with _live_ads_lock:
         _live_ads[slug] = {"generated": time.time(), "ads": merged_ads,
                             "latest_seg": latest_name}
