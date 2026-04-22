@@ -4928,7 +4928,10 @@ def _rec_parse_comskip(out_dir):
         try:
             a = float(parts[0]) / fps
             b = float(parts[1]) / fps
-            if b - a >= 10:   # ignore stub blocks shorter than 10 s
+            if b - a >= 30:   # ignore stub blocks shorter than 30 s
+                              # — typically sponsor cards, programme
+                              # promos, single-spot teaser interruptions
+                              # rather than real commercial breaks
                 ads.append([round(a, 2), round(b, 2)])
         except Exception:
             continue
@@ -4943,7 +4946,9 @@ def _rec_parse_comskip(out_dir):
             dedup.append([a, b])
     dedup.sort(key=lambda x: x[0])
     # Merge blocks with short gaps (sponsor card / Praesentation-Einblendung).
-    MERGE_GAP = 25.0
+    # 45 s catches German private-TV sponsor cards including the
+    # "Werbung · Sponsor · Werbung" pattern with mid-block teasers.
+    MERGE_GAP = 45.0
     merged = []
     for a, b in dedup:
         if merged and a - merged[-1][1] <= MERGE_GAP:
@@ -5633,12 +5638,13 @@ def _live_ads_analyze(slug, window_end_seg=None, window_size=1800):
                 and a[1] > buffer_cutoff]
     merged_ads = sorted(retained + ads_wall)
     # Cross-scan merge pass: _rec_parse_comskip merges adjacent
-    # detections within 25 s INSIDE one scan, but a single commercial
-    # break can span a scan boundary — sub-ads detected in two
-    # different scans end up as separate entries here. Re-run the
-    # same merge across the combined list so the player sees one
-    # block per actual commercial break instead of fragmented stubs.
-    MERGE_GAP = 25.0
+    # detections within MERGE_GAP INSIDE one scan, but a single
+    # commercial break can span a scan boundary — sub-ads detected
+    # in two different scans end up as separate entries here. Re-run
+    # the same merge across the combined list so the player sees
+    # one block per actual commercial break instead of fragmented
+    # stubs.
+    MERGE_GAP = 45.0
     coalesced = []
     for a, b in merged_ads:
         if coalesced and a - coalesced[-1][1] <= MERGE_GAP:
