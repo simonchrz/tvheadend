@@ -1012,8 +1012,9 @@ def index():
         mux_style = (f' style="--mux-color:{mux_colour[mu]}"'
                      if mu in mux_colour else "")
         mux_attr = f' data-mux="{mu}"' if mu else ""
+        mt_attr  = ' data-mediathek="1"' if s in MEDIATHEK_LIVE else ""
         rows.append(
-            f'<li data-slug="{s}"{mux_attr} title="{info["name"]}"{mux_style}>'
+            f'<li data-slug="{s}"{mux_attr}{mt_attr} title="{info["name"]}"{mux_style}>'
             f'<button class="pin-btn" data-slug="{s}" title="Dauer-warm">📌</button>'
             f'<a class="logo" href="{watch_url}">{logo}</a>'
             f'<span class="buffer-bar" data-slug="{s}"></span>'
@@ -1102,6 +1103,12 @@ def index():
         ".mux-dot{display:inline-block;width:8px;height:8px;"
         "border-radius:50%;margin-right:6px;vertical-align:1px;"
         "cursor:help}"
+        # Subtle blue accent line at the bottom-inside edge of the tile,
+        # marks channels that have a public-broadcaster Mediathek-Live
+        # fallback stream (MEDIATHEK_LIVE). Sits below the buffer-bar
+        # (which is bottom:3px height:4px) without overlap.
+        "ul.channels li[data-mediathek]{"
+        "box-shadow:inset 0 -3px 0 #2980b9}"
         ".rec-modal{position:fixed;inset:0;background:#000a;"
         "display:flex;align-items:center;justify-content:center;"
         "z-index:100}"
