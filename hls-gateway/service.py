@@ -2821,7 +2821,29 @@ async function goShowStart(){{
        fetch(HOST+'/api/mediathek-live/'+current)
         .then(r=>r.json()).then(d=>{{
           if(!d.url){{
-            showHintMsg('Sendungsanfang außerhalb Puffer');
+            /* Final fallback — comskip ad-cache: if there's a detected
+               commercial block in the local buffer, jump to its end
+               (= where the show resumed). Cleaner than landing
+               mid-action and matches user intent of "show me this
+               channel from a logical break point". */
+            fetch(HOST+'/api/live-ads/'+current)
+             .then(r=>r.json()).then(adResp=>{{
+               const ads=adResp.ads||[];
+               const[s,e]=seekableRange();
+               if(ads.length&&e>s){{
+                 const wallS=wallAt(s),wallE=wallAt(e);
+                 /* Latest ad block whose end falls inside the buffer. */
+                 const last=[...ads].reverse().find(a=>a[1]>=wallS&&a[1]<=wallE);
+                 if(last){{
+                   _lastJumpedEv=ev;_lastJumpedTs=Date.now();
+                   v.currentTime=Math.max(s+0.5,Math.min(e-1,last[1]-wallS));
+                   show();
+                   showHintMsg('Sendungsanfang außerhalb Puffer — Sprung ans Ende der letzten Werbung',3500);
+                   return;
+                 }}
+               }}
+               showHintMsg('Sendungsanfang außerhalb Puffer');
+             }}).catch(()=>showHintMsg('Sendungsanfang außerhalb Puffer'));
             return;
           }}
           switchToMediathek(d.url,ev.start);
