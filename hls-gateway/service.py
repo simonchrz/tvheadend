@@ -2450,12 +2450,12 @@ function refresh(){{
   }}
 }}
 v.addEventListener('timeupdate',()=>{{refresh();updateLiveBadge();refreshSkipAdBtn();}});
-v.addEventListener('progress',()=>{{refresh();renderChapters();}});
-v.addEventListener('loadeddata',()=>{{refresh();renderChapters();}});
-v.addEventListener('canplay',()=>{{refresh();renderChapters();}});
+v.addEventListener('progress',()=>{{refresh();renderChapters();renderLiveAds();}});
+v.addEventListener('loadeddata',()=>{{refresh();renderChapters();renderLiveAds();}});
+v.addEventListener('canplay',()=>{{refresh();renderChapters();renderLiveAds();}});
 v.addEventListener('loadedmetadata',()=>{{
   if(!onMediathek&&!onRecording)goLive();
-  refresh();renderChapters();
+  refresh();renderChapters();renderLiveAds();
 }});
 setInterval(()=>{{if(!v.paused){{renderChapters();renderLiveAds();}}}},5000);
 setInterval(()=>{{if(current)loadLiveAds(current);}},300000);
@@ -3048,7 +3048,8 @@ function renderLiveAds(){{
      for other chain members ARE reachable via switchToRecording, so
      keep them visible there. */
   let seekS=null,seekE=null;
-  if(!(onRecording&&recChain)){{
+  const inChain=onRecording&&recChain;
+  if(!inChain){{
     const[s,e]=seekableRange();
     if(e>s+1){{
       /* Derive wall-time of the seekable bounds from "now - duration"
@@ -3061,6 +3062,12 @@ function renderLiveAds(){{
       const nowS=Date.now()/1000;
       seekE=nowS;
       seekS=nowS-(e-s);
+    }} else {{
+      /* Live mode but the player hasn't loaded enough yet to know
+         its seekable range. Render NO markers rather than show
+         stale orphans from .live_ads.json — the loadedmetadata
+         listener + 5 s tick will re-render once the buffer settles. */
+      return;
     }}
   }}
   for(const[wStart,wStop]of allAdsWall()){{
