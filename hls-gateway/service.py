@@ -3577,6 +3577,35 @@ function seekTo(ev){{
   v.currentTime=s+(clamped-wallS);
 }}
 let pauseState=null;
+/* Native HLS pause workaround: iOS Safari ignores v.pause() on a
+   live HLS stream, so togglePlay strips v.src to actually halt
+   playback — but stripping src blanks the <video>. Capture the
+   current frame to a canvas and overlay it for the duration of the
+   pause so the user still sees the still image. */
+let _pauseCanvas=null;
+function showPauseFreeze(){{
+  try{{
+    if(!_pauseCanvas){{
+      _pauseCanvas=document.createElement('canvas');
+      _pauseCanvas.id='pause-freeze';
+      _pauseCanvas.style.cssText=
+        'position:absolute;left:0;top:0;width:100%;height:100%;'
+        +'object-fit:contain;z-index:5;pointer-events:none;'
+        +'background:#000';
+      v.parentNode.insertBefore(_pauseCanvas,v.nextSibling);
+    }}
+    const w=v.videoWidth||v.clientWidth;
+    const h=v.videoHeight||v.clientHeight;
+    if(w<=0||h<=0){{_pauseCanvas.style.display='none';return;}}
+    _pauseCanvas.width=w;_pauseCanvas.height=h;
+    const ctx=_pauseCanvas.getContext('2d');
+    ctx.drawImage(v,0,0,w,h);
+    _pauseCanvas.style.display='block';
+  }}catch(e){{}}
+}}
+function hidePauseFreeze(){{
+  if(_pauseCanvas)_pauseCanvas.style.display='none';
+}}
 function togglePlay(){{
   if(pauseState){{
     const ps=pauseState;pauseState=null;
@@ -3586,6 +3615,7 @@ function togglePlay(){{
       try{{if(hlsInst)hlsInst.startLoad();}}catch(e){{}}
       v.play().catch(()=>{{}});
     }} else {{
+      hidePauseFreeze();
       v.src=ps.pausedSrc;v.load();
       v.addEventListener('loadedmetadata',()=>{{
         const d=typeof v.getStartDate==='function'?v.getStartDate():null;
@@ -3622,6 +3652,9 @@ function togglePlay(){{
   if(usingHlsJs){{
     try{{hlsInst.stopLoad();}}catch(e){{}}
   }} else {{
+    /* Native HLS live (iOS Safari): grab the current frame to canvas
+       BEFORE we strip src — once src is gone the <video> blanks. */
+    showPauseFreeze();
     v.removeAttribute('src');
     v.load();
   }}
