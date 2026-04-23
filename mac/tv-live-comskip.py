@@ -72,6 +72,17 @@ SPONSOR_DURATION_BY_CHANNEL = {
     "sport1":     20.0,
 }
 
+# Per-channel minimum backward extension when blackframe-extend
+# finds nothing usable. Channels with soft logo fades (logo dims
+# rather than hard-cuts) leave comskip 15-20 s behind the visual
+# ad-start; without a blackframe to snap to we'd otherwise show
+# the skip button that late. Witnessed:
+#   rtlzwei 12:13:38 vs 12:13:57 detection = 19 s
+#   rtlzwei 12:39:19 vs 12:39:38 detection = 19 s
+START_LAG_FALLBACK = {
+    "rtlzwei": 20.0,
+}
+
 LIVE_ADSKIP_SLUGS = {
     "prosieben", "sat-1", "kabel-eins", "kabeleins", "prosiebenmaxx",
     "rtl", "vox", "rtlzwei", "nitro", "rtlup", "superrtl",
@@ -265,6 +276,12 @@ def blackframe_extend_ads(video_path, ads, channel_slug=None,
             earliest = min(blacks_before)
             if start - earliest <= START_MAX_EXTEND:
                 new_start = earliest
+        # Fallback: if backward-extend found no earlier blackframe and
+        # the channel is known to have a soft logo fade (comskip lags
+        # by N s), shift back by at least that much.
+        min_back = START_LAG_FALLBACK.get(channel_slug or "", 0)
+        if min_back > 0 and new_start >= start - 1.0:
+            new_start = max(0.0, start - min_back)
         out.append([round(new_start, 2), round(new_end, 2)])
     merged = []
     for a, b in out:
