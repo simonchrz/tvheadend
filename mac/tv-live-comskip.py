@@ -112,6 +112,40 @@ START_LAG_FALLBACK = {
     "rtlzwei": 20.0,
 }
 
+# Auto-applied tuning learned from user ad-block edits (computed by
+# the Pi-side hls-gateway, written to .detection_learning.json on the
+# SMB share). Read on every scan so updates land without restarting.
+DETECTION_LEARNING_FILE = HLS_DIR / ".detection_learning.json"
+
+
+def load_detection_learning():
+    """Read the persisted learning JSON if present. Returns
+    {slug: {start_lag, sponsor_duration}} or {} on miss."""
+    try:
+        if DETECTION_LEARNING_FILE.is_file():
+            return json.loads(DETECTION_LEARNING_FILE.read_text())
+    except Exception:
+        pass
+    return {}
+
+
+def effective_start_lag(slug):
+    """START_LAG_FALLBACK lookup with learned overrides taking
+    precedence over hardcoded defaults."""
+    learned = load_detection_learning().get(slug, {})
+    if "start_lag" in learned:
+        return float(learned["start_lag"])
+    return START_LAG_FALLBACK.get(slug or "", 0)
+
+
+def effective_sponsor_duration(slug):
+    """SPONSOR_DURATION_BY_CHANNEL lookup with learned overrides."""
+    learned = load_detection_learning().get(slug, {})
+    if "sponsor_duration" in learned:
+        return float(learned["sponsor_duration"])
+    return SPONSOR_DURATION_BY_CHANNEL.get(
+        slug or "", SPONSOR_DURATION_DEFAULT)
+
 LIVE_ADSKIP_SLUGS = {
     "prosieben", "sat-1", "kabel-eins", "kabeleins", "prosiebenmaxx",
     "rtl", "vox", "rtlzwei", "nitro", "rtlup", "superrtl",
@@ -335,8 +369,7 @@ def blackframe_extend_ads(video_path, ads, channel_slug=None,
       (3) no black → no extension.
     Plus a backward-extension for ad-start if a black sits within 25 s before."""
     if sponsor_duration is None:
-        sponsor_duration = SPONSOR_DURATION_BY_CHANNEL.get(
-            channel_slug or "", SPONSOR_DURATION_DEFAULT)
+        sponsor_duration = effective_sponsor_duration(channel_slug)
     if max_extend is None:
         max_extend = sponsor_duration + 10.0
     if not ads or not video_path or sponsor_duration <= 0:
@@ -421,7 +454,7 @@ def blackframe_extend_ads(video_path, ads, channel_slug=None,
         # Fallback: if backward-extend found no earlier blackframe and
         # the channel is known to have a soft logo fade (comskip lags
         # by N s), shift back by at least that much.
-        min_back = START_LAG_FALLBACK.get(channel_slug or "", 0)
+        min_back = effective_start_lag(channel_slug)
         if min_back > 0 and new_start >= start - 1.0:
             new_start = max(0.0, start - min_back)
         out.append([round(new_start, 2), round(new_end, 2)])

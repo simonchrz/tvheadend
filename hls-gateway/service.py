@@ -8172,16 +8172,59 @@ def _compute_feedback_stats():
 
 _feedback_cache = {"data": None, "computed_at": 0}
 _feedback_lock = threading.Lock()
+DETECTION_LEARNING_FILE = HLS_DIR / ".detection_learning.json"
+LEARNING_MIN_SAMPLES = 5  # auto-apply only with ≥N edited recordings
+
+
+def _persist_detection_learning(stats):
+    """Write the auto-applied subset of feedback to a JSON the live
+    scanner reads on every scan. Only entries with enough samples and
+    a meaningful drift get persisted — conservative threshold to
+    avoid flip-flopping the live constants on early data."""
+    learned = {}
+    for slug, s in stats.items():
+        if s.get("matched", 0) < LEARNING_MIN_SAMPLES:
+            continue
+        entry = {}
+        ds = s["mean_dstart_s"]
+        de = s["mean_dend_s"]
+        if ds <= -8:
+            entry["start_lag"] = round(abs(ds), 1)
+        if de >= 8:
+            entry["sponsor_duration"] = round(de, 1)
+        if entry:
+            entry["sample_n"] = s["matched"]
+            entry["computed_at"] = int(time.time())
+            learned[slug] = entry
+    try:
+        tmp = DETECTION_LEARNING_FILE.with_suffix(".tmp")
+        tmp.write_text(json.dumps(learned, indent=2))
+        tmp.replace(DETECTION_LEARNING_FILE)
+    except Exception as e:
+        print(f"[learning persist]: {e}", flush=True)
+    return learned
 
 
 def _get_feedback_stats(max_age_s=300):
-    """Cached wrapper — recompute at most every 5 min."""
+    """Cached wrapper — recompute at most every 5 min. Side effect:
+    refreshes the persisted learning file so the live scanner can
+    pick up the latest tuning per channel."""
     with _feedback_lock:
         if _feedback_cache["data"] is None \
                 or time.time() - _feedback_cache["computed_at"] > max_age_s:
             try:
-                _feedback_cache["data"] = _compute_feedback_stats()
+                stats = _compute_feedback_stats()
+                _feedback_cache["data"] = stats
                 _feedback_cache["computed_at"] = time.time()
+                applied = _persist_detection_learning(stats)
+                # Tag each stats entry with whether it was applied
+                for slug, s in stats.items():
+                    s["applied"] = slug in applied
+                    if slug in applied:
+                        s["applied_values"] = {
+                            k: v for k, v in applied[slug].items()
+                            if k in ("start_lag", "sponsor_duration")
+                        }
             except Exception as e:
                 print(f"[feedback-stats] {e}", flush=True)
                 if _feedback_cache["data"] is None:
@@ -8273,6 +8316,7 @@ def api_health():
             c["feedback"] = feedback[c["slug"]]
     return _cors(Response(json.dumps({
         "now": int(now),
+        "learning_min_samples": LEARNING_MIN_SAMPLES,
         "mac_live_scanner_age_s": mac_live_age,
         "mac_rec_scanner_age_s": mac_rec_age,
         "channels": chans,
@@ -8357,19 +8401,25 @@ async function load(){
   const fbRows=[];
   for(const c of d.channels){
     const fb=c.feedback;if(!fb||fb.n===0)continue;
+    const status=fb.applied
+      ?'<span class="ok">✓ aktiv</span>'
+      :(fb.matched>=3?'<small style="color:var(--muted)">Vorschlag</small>':'<small style="color:var(--muted)">zu wenig Daten</small>');
     const sug=fb.suggestions.length
       ?fb.suggestions.map(s=>'<code style="background:#0006;padding:2px 6px;border-radius:3px">'+s+'</code>').join('<br>')
-      :'<small style="color:var(--muted)">noch zu wenig Daten</small>';
+      :'<small style="color:var(--muted)">—</small>';
     fbRows.push('<tr><td>'+c.slug+'</td>'
       +'<td>'+fb.n+' rec, '+fb.matched+' matched</td>'
       +'<td>Δstart '+fb.mean_dstart_s+'s · Δend '+fb.mean_dend_s+'s</td>'
       +'<td>+'+fb.added+' / -'+fb.deleted+'</td>'
-      +'<td>'+sug+'</td></tr>');
+      +'<td>'+status+'<br>'+sug+'</td></tr>');
   }
   if(fbRows.length){
-    html+='<h2>User-Feedback Learning</h2><table>'
+    html+='<h2>User-Feedback Learning</h2>'
+      +'<p style="color:var(--muted);font-size:.85em;margin:0 0 8px">'
+      +'Vorschläge mit ≥'+(d.learning_min_samples||5)+' editierten Aufnahmen werden automatisch live übernommen (Mac live-comskip liest die Werte pro scan).</p>'
+      +'<table>'
       +'<tr><th>Channel</th><th>Sample</th><th>Boundary-Drift</th>'
-      +'<th>Add/Del</th><th>Vorschläge</th></tr>'
+      +'<th>Add/Del</th><th>Status / Vorschläge</th></tr>'
       +fbRows.join('')+'</table>';
   }
   document.getElementById('root').innerHTML=html;
