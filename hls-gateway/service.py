@@ -5280,7 +5280,11 @@ def _rec_parse_comskip(out_dir):
     Adjacent blocks separated by a short sponsor card (≤25 s of "show")
     are merged — typical pattern on VOX/RTL/Pro7: Werbung · 15 s
     Präsentation-Einblendung · Werbung · Sendungsstart."""
-    txts = list(out_dir.glob("*.txt"))
+    # Exclude *.logo.txt — comskip writes that file alongside the
+    # cutlist (since the SaveLogoMaskData patch in mpeg2dec.c) and
+    # filesystem ordering can put it ahead of the actual cutlist.
+    txts = [p for p in out_dir.glob("*.txt")
+            if not p.name.endswith(".logo.txt")]
     if not txts:
         return []
     try:
@@ -7391,6 +7395,12 @@ if __name__ == "__main__":
         COMSKIP_INI.write_text(COMSKIP_INI_TEXT)
     except Exception as e:
         print(f"comskip.ini write: {e}", flush=True)
+    # Pre-generate per-channel inis so the Mac scanner sees them on
+    # the SMB share even when LIVE_ADS_OFFLOAD disables the Pi-side
+    # comskip path that would otherwise lazily create them via
+    # comskip_ini_for() at first call.
+    for _slug in COMSKIP_INI_PER_CHANNEL:
+        comskip_ini_for(_slug)
     load_codec_cache()
     load_stats()
     load_epg_archive()

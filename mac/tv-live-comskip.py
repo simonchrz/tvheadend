@@ -31,8 +31,10 @@ import shutil
 import ssl
 import subprocess
 import sys
+import threading
 import time
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
 
@@ -66,6 +68,11 @@ MIN_INCREMENTAL_NEW = 5
 RESCAN_SECONDS  = 720
 LOOP_SLEEP      = 30
 HTTP_TIMEOUT    = 30
+# How many channel scans run concurrently. M-series Macs have plenty of
+# cores idle here — comskip itself is single-threaded but pinning one
+# scan per active channel parallelises naturally. 3 covers our typical
+# ALWAYS_WARM set without over-saturating SMB/Caddy fetch bandwidth.
+MAX_PARALLEL_SCANS = 3
 
 # Caddy's tls-internal CA isn't in the system trust store. We're on the
 # LAN, talking to a known IP — disable verification rather than wire up
@@ -133,21 +140,32 @@ def load_live_ads():
         return {}
 
 
+_save_lock = threading.Lock()
+
+
 def save_live_ads(state):
-    """Atomic write so the Pi never reads a half-written file."""
-    try:
-        tmp = LIVE_ADS_FILE.with_suffix(".tmp")
-        tmp.write_text(json.dumps(state))
-        tmp.replace(LIVE_ADS_FILE)
-    except Exception as e:
-        log(f"save live-ads: {e}")
+    """Atomic write so the Pi never reads a half-written file. Lock
+    serialises concurrent writes from parallel scan workers — without
+    it, two threads would race on the .tmp file and one tmp.replace()
+    could clobber the other's payload mid-rename."""
+    with _save_lock:
+        try:
+            tmp = LIVE_ADS_FILE.with_suffix(".tmp")
+            tmp.write_text(json.dumps(state))
+            tmp.replace(LIVE_ADS_FILE)
+        except Exception as e:
+            log(f"save live-ads: {e}")
 
 
 def parse_comskip(out_dir):
     """Parse comskip's default .txt output → list of [start_s, stop_s].
     Adjacent blocks separated by a short sponsor card (≤25 s of "show")
     are merged."""
-    txts = list(out_dir.glob("*.txt"))
+    # Exclude *.logo.txt — comskip writes that file alongside the
+    # cutlist (since the SaveLogoMaskData patch in mpeg2dec.c) and
+    # filesystem ordering can put it ahead of the actual cutlist.
+    txts = [p for p in out_dir.glob("*.txt")
+            if not p.name.endswith(".logo.txt")]
     if not txts:
         return []
     try:
@@ -542,8 +560,25 @@ def gc_stale_caches():
                 pass
 
 
+_inflight = set()
+_inflight_lock = threading.Lock()
+
+
+def _run_scan(slug, state):
+    """ThreadPoolExecutor worker: run analyze() and clear inflight on
+    exit so the loop can re-submit this slug on the next cycle."""
+    try:
+        analyze(slug, state)
+    except Exception as e:
+        log(f"[{slug}] analyse: {e}")
+    finally:
+        with _inflight_lock:
+            _inflight.discard(slug)
+
+
 def main_loop():
-    log(f"starting; comskip={COMSKIP}, hls={HLS_DIR}, caddy={CADDY_BASE}")
+    log(f"starting; comskip={COMSKIP}, hls={HLS_DIR}, "
+        f"caddy={CADDY_BASE}, parallel={MAX_PARALLEL_SCANS}")
     if not HLS_DIR.is_dir():
         log(f"ERROR: {HLS_DIR} not mounted — exit so launchd retries later")
         sys.exit(1)
@@ -560,6 +595,8 @@ def main_loop():
     # set, so we're the only writer — no need to re-read.
     state = load_live_ads()
 
+    pool = ThreadPoolExecutor(max_workers=MAX_PARALLEL_SCANS,
+                              thread_name_prefix="scan")
     last_gc = 0
     while True:
         try:
@@ -570,11 +607,19 @@ def main_loop():
                           if channel_is_active(s)]
             recent = {s for s, v in state.items()
                       if time.time() - v.get("generated", 0) < RESCAN_SECONDS}
-            todo = [s for s in candidates if s not in recent]
-            if todo:
-                slug = todo[0]
-                log(f"[{slug}] analysing ({len(todo)-1} more queued)")
-                analyze(slug, state)
+            with _inflight_lock:
+                busy = set(_inflight)
+            todo = [s for s in candidates
+                    if s not in recent and s not in busy]
+            free = MAX_PARALLEL_SCANS - len(busy)
+            for slug in todo[:free]:
+                with _inflight_lock:
+                    _inflight.add(slug)
+                    active = len(_inflight)
+                log(f"[{slug}] analysing "
+                    f"({active}/{MAX_PARALLEL_SCANS} active, "
+                    f"{max(0, len(todo) - free)} queued)")
+                pool.submit(_run_scan, slug, state)
         except Exception as e:
             log(f"loop: {e}")
         time.sleep(LOOP_SLEEP)
