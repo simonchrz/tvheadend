@@ -2740,12 +2740,35 @@ v.addEventListener('loadedmetadata',()=>{{
   refresh();renderChapters();renderLiveAds();
 }});
 setInterval(()=>{{if(!v.paused){{renderChapters();renderLiveAds();}}}},5000);
-/* Re-fetch ad-block JSON every 30 s — was 5 min, which made the
-   "Werbung ⏭" button show up to 5 min after a freshly-detected ad
-   block landed in .live_ads.json. The Mac handler scans roughly
-   every 30 s per channel, so this cadence keeps us at most one
-   detection cycle behind. The endpoint reads a small JSON file. */
-setInterval(()=>{{if(current)loadLiveAds(current);}},30000);
+/* Live-ads delivery: SSE stream that pushes a new payload whenever
+   the Mac scanner saves a fresh .live_ads.json. Replaces the prior
+   30 s polling — skip button now appears with the detection latency
+   instead of +0-30 s extra. EventSource auto-reconnects on transient
+   network errors, so no manual fallback timer is needed. */
+let _liveAdsES=null;
+let _liveAdsESSlug=null;
+function subscribeLiveAds(slug){{
+  if(_liveAdsESSlug===slug&&_liveAdsES)return;
+  unsubscribeLiveAds();
+  _liveAdsESSlug=slug;
+  loadLiveAds(slug);  /* paint immediately, don't wait for first push */
+  try{{
+    const es=new EventSource(HOST+'/api/live-ads-stream/'+slug);
+    es.onmessage=(e)=>{{
+      if(slug!==current)return;
+      try{{
+        const d=JSON.parse(e.data);
+        liveAds=d.ads||[];
+        renderLiveAds();refreshSkipAdBtn();
+      }}catch(err){{}}
+    }};
+    _liveAdsES=es;
+  }}catch(err){{}}
+}}
+function unsubscribeLiveAds(){{
+  if(_liveAdsES){{try{{_liveAdsES.close();}}catch(e){{}}_liveAdsES=null;}}
+  _liveAdsESSlug=null;
+}}
 function goLive(){{
   /* Mediathek-live channel: stay inside the Mediathek HLS and just
      seek to its live edge — avoids spawning a DVB-C tuner. hls.js
@@ -3714,7 +3737,7 @@ async function loadSrc(slug){{
   loadEvents(slug);
   _chaptersReady=false;
   const mtP=loadMediathekAvail(slug);
-  loadLiveAds(slug);
+  subscribeLiveAds(slug);
   recChain=null;recCurrentIdx=-1;
   const chP=loadRecordingChain(slug);
   Promise.all([mtP,chP]).then(()=>{{
