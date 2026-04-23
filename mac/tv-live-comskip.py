@@ -189,15 +189,17 @@ def blackframe_extend_ads(video_path, ads, channel_slug=None,
     if not ads or not video_path or sponsor_duration <= 0:
         return ads
     scan_window = max(sponsor_duration + 8.0, 20.0)
-    # Backward window for ad-START. comskip's logo+silence detection
-    # typically lags the real ad-start by 15-30 s on DE private TV.
-    # We sniff for blackframes that far back and snap to the earliest
-    # one found. Was 25/20 s — caught the easy cases but missed
-    # frequent 25-40 s lags. 45 s window is still safely smaller than
-    # min_show_segment_length (120 s) so we won't pull a blackframe
-    # from inside a previous show segment.
-    START_SCAN = 45.0
-    START_MAX_EXTEND = 45.0
+    # Backward window for ad-START. Two blackframes typically precede
+    # comskip's logo-loss-based detection on DE private TV:
+    #   show-end (BF1) → ~25 s "Programmhinweis" sponsor card
+    #   (logo still visible, looks like content) → (BF2) → real ad
+    # We snap back to the EARLIEST blackframe in the window — 75 s
+    # catches both: BF2 (~30-40 s back) when no promo, BF1 (~50-65 s
+    # back) when there is one. Safely smaller than
+    # min_show_segment_length=120 s so we won't pull a blackframe
+    # from inside the show.
+    START_SCAN = 75.0
+    START_MAX_EXTEND = 75.0
     out = []
     for start, end in ads:
         ss = max(0, end - 1.0)
