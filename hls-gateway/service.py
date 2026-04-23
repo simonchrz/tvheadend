@@ -1090,7 +1090,7 @@ def index():
     for s, info in items:
         watch_url = f"{HOST_URL}/watch/{s}"
         dvr_url   = f"{HOST_URL}/hls/{s}/dvr.m3u8"
-        icon = info.get("icon", "")
+        icon = _channel_logo_url(s, info.get("icon", ""))
         logo = (f'<img src="{icon}" alt="" loading="lazy">'
                 if icon else "")
         st = st_snap.get(s, {})
@@ -1545,8 +1545,9 @@ def playlist_m3u():
         for slug, info in sorted(channel_map.items(),
                                   key=lambda kv: kv[1]["name"].lower()):
             attrs = [f'tvg-id="{slug}"', f'tvg-name="{info["name"]}"']
-            if info.get("icon"):
-                attrs.append(f'tvg-logo="{info["icon"]}"')
+            logo_url = _channel_logo_url(slug, info.get("icon", ""))
+            if logo_url:
+                attrs.append(f'tvg-logo="{logo_url}"')
             lines.append(f'#EXTINF:-1 {" ".join(attrs)},{info["name"]}')
             lines.append(f"{HOST_URL}/hls/{slug}/index.m3u8")
     return _cors(Response("\n".join(lines), mimetype="audio/x-mpegurl"))
@@ -1844,7 +1845,7 @@ def epg_grid():
     tl_rows = [f'<div class="tl-row header">{marker_html}</div>']
 
     for slug, info in items:
-        icon = info.get("icon", "")
+        icon = _channel_logo_url(slug, info.get("icon", ""))
         name_escaped = info["name"].replace('"', "&quot;")
         stream_url = f"{HOST_URL}/watch/{slug}"
         if icon:
@@ -4376,7 +4377,8 @@ def api_channels():
     ))
     return {"channels": [{"slug": s,
                           "name": info["name"],
-                          "icon": info.get("icon", "")} for s, info in items]}
+                          "icon": _channel_logo_url(s, info.get("icon", ""))}
+                         for s, info in items]}
 
 
 @app.route("/record/<slug>")
@@ -7539,18 +7541,22 @@ def static_ch_logo(fname):
                                  max_age=86400)
 
 
-def _channel_logo_url(slug, fallback_icon_path):
+def _channel_logo_url(slug, fallback):
     """Return the best channel-logo URL for `slug`. Prefers a local
     override from static/ch-logos/<slug>.(svg|png|jpg) over the
-    low-res tvheadend imagecache default."""
+    low-res tvheadend imagecache default. `fallback` may be a full
+    URL (already-prefixed icon_public_url) or a relative path like
+    "imagecache/108"."""
     if slug:
         for ext in ("svg", "png", "jpg"):
             p = CH_LOGO_DIR / f"{slug}.{ext}"
             if p.is_file():
                 return f"{HOST_URL}/static/ch-logos/{slug}.{ext}"
-    if fallback_icon_path:
-        return f"{HOST_URL}/{fallback_icon_path}"
-    return ""
+    if not fallback:
+        return ""
+    if fallback.startswith("http"):
+        return fallback
+    return f"{HOST_URL}/{fallback.lstrip('/')}"
 
 
 @app.route("/status")
