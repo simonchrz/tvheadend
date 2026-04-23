@@ -5160,18 +5160,18 @@ def recordings_page():
         if in_series:
             # Inside a series group the title is redundant (already in
             # the purple group header). Drop the column to free up
-            # horizontal space for the date/duration/size on mobile.
+            # horizontal space for the date/duration on mobile. File-
+            # size column also dropped — without a header users had
+            # no way to interpret the bare "650 MB" / "—" placeholder.
             return (f'<tr><td>{badge}</td>'
                     f'<td>{when}</td>'
                     f'<td>{dur_min} min</td>'
-                    f'<td>{size_str}</td>'
                     f'<td>{prewarm}</td>'
                     f'{tools_cell}</tr>')
         return (f'<tr><td>{badge}</td>'
                 f'<td>{title_cell}</td>'
                 f'<td>{when}</td>'
                 f'<td>{dur_min} min</td>'
-                f'<td>{size_str}</td>'
                 f'<td>{prewarm}</td>'
                 f'{tools_cell}</tr>')
 
@@ -5217,7 +5217,7 @@ def recordings_page():
         rating_html = (f' <span class="rec-rating" title="TVmaze rating">'
                        f'★ {meta["rating"]}</span>'
                        if meta.get("rating") else '')
-        summary = (f'<tr class="series-head"><td colspan="7">'
+        summary = (f'<tr class="series-head"><td colspan="6">'
                    f'<details data-ar="{ar_uuid}"{open_attr}>'
                    f'<summary>{poster_html}{badge}'
                    f'<span class="series-title">{group_title}'
@@ -5278,7 +5278,6 @@ def recordings_page():
             f'<td>{title_cell}</td>'
             f'<td>{when}</td>'
             f'<td>{dur_min} min</td>'
-            f'<td>—</td>'
             f'<td>{avail_cell}</td>'
             f'<td class="row-tools">'
             f'<a class="del-btn" href="{HOST_URL}/mediathek-rec/{vuuid}/delete" '
@@ -5367,7 +5366,7 @@ def recordings_page():
             f"</div>"
             f"<div class='rec-body'>"
             f"<table>"
-            f"{''.join(rows) if rows else '<tr><td colspan=7>Keine Aufnahmen</td></tr>'}"
+            f"{''.join(rows) if rows else '<tr><td colspan=6>Keine Aufnahmen</td></tr>'}"
             f"</table>"
             f"</div>"
             f"<script>"
