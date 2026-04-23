@@ -7243,7 +7243,7 @@ def play_recording(uuid):
             f"animation:spin 1s linear infinite}}"
             f"@keyframes spin{{to{{transform:rotate(360deg)}}}}"
             f"</style></head><body>"
-            f"<video id='v' autoplay playsinline "
+            f"<video id='v' autoplay muted playsinline "
             f"webkit-playsinline disablepictureinpicture></video>"
             f"<div id='loader'>"
             f"<div class='spinner'></div>"
@@ -7414,6 +7414,18 @@ def play_recording(uuid):
             f"  }};"
             f"  setTimeout(tryRestore,400);"
             f"}},{{once:true}});"
+            # Recording player autoplays muted (Safari/Chrome require
+            # muted for cross-page-load autoplay). First user gesture
+            # anywhere on the page unmutes — they came here to watch,
+            # so the silent first frame is just bridging the gap.
+            f"function _firstGestureUnmute(){{"
+            f"  v.muted=false;"
+            f"  document.removeEventListener('touchstart',_firstGestureUnmute);"
+            f"  document.removeEventListener('click',_firstGestureUnmute);"
+            f"}}"
+            f"document.addEventListener('touchstart',_firstGestureUnmute,"
+            f"  {{once:true,passive:true}});"
+            f"document.addEventListener('click',_firstGestureUnmute,{{once:true}});"
             f"let srcSet=false;"
             f"function tick(){{"
             f"  fetch('{HOST_URL}/recording/{uuid}/progress').then(r=>r.json())"
