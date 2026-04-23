@@ -2191,10 +2191,14 @@ html,body{height:100%;background:#000;color:#eee;
  background:linear-gradient(#000d,transparent);transition:opacity .3s}
 .row{display:flex;align-items:center;gap:6px;margin-top:8px;
  flex-wrap:wrap;row-gap:8px}
-/* Minimal-controls mode: hide every button in the row, keep the
-   #cur timer + scrubbar + title visible. Toggle via #ctrlMin in
-   the topbar; state persisted in localStorage('player-ctrl-min'). */
-body.ctrl-min .row > button,
+/* Minimal-controls mode: hide every button in the row except
+   #liveBtn (⏭), keep the #cur timer + scrubbar + title visible.
+   Toggle via #ctrlMin in the topbar; state persisted in
+   localStorage('player-ctrl-min'). #liveBtn stays so the user has
+   a one-tap path to live edge — dragging the thumb to the very
+   right works (snap-to-live at p>=0.98) but a button is more
+   reliable on small thumbs. */
+body.ctrl-min .row > button:not(#liveBtn),
 body.ctrl-min .row > #skipad,
 body.ctrl-min .row > #volume-wrap{display:none}
 .spacer{flex:1 1 auto}
@@ -3361,7 +3365,10 @@ function seekTo(ev){{
   }}
   const[s,e]=seekableRange();
   if(e<=s)return;
-  /* Clamp target into the seekable window, then translate wall→video time */
+  /* Snap to live edge if the drag landed in the rightmost 2 % of the
+     scrubbar — otherwise the cursor never quite reaches "live" because
+     we clamp 1 s short and the player keeps a tiny gap visible. */
+  if(p>=0.98){{goLive();return;}}
   const wallS=wallAt(s),wallE=wallAt(e);
   const clamped=Math.max(wallS,Math.min(wallE-1,targetWall));
   v.currentTime=s+(clamped-wallS);
