@@ -7197,6 +7197,8 @@ def play_recording(uuid):
             f"</div>"
             f"<div id='topbar'>"
             f"<button class='iconbtn' onclick='toggleFs()' aria-label='Vollbild'>⛶</button>"
+            f"<button id='ctrlMin' class='iconbtn' onclick='toggleCtrlMin()' "
+            f"aria-label='Steuerleiste verbergen'>⊟</button>"
             f"<a class='iconbtn' href='{HOST_URL}/recordings' aria-label='Schließen' "
             f"onclick='return closePlayer(event)'>✕</a>"
             f"</div>"
