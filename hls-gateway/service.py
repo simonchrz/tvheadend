@@ -2411,14 +2411,41 @@ function closePlayer(ev){
   location.href=PLAYER_HOME;
   return false;
 }
-// Scrub-bar drag (mouse + touch). Per-mode seekTo(ev) is hoisted.
+// Scrub-bar drag (mouse + touch). Visual-only during drag — actual
+// seek happens once on release. Setting v.currentTime per mousemove
+// (~30+/s) drowns hls.js in segment-fetch requests and makes drag
+// feel laggy/jumpy. With visual-only drag the thumb tracks the
+// pointer at full DOM speed and a single seekTo() commits at the end.
+// Each per-mode refresh() guards thumb.style.left + played.style.*
+// behind `if(!_dragging)` so the playback ticker doesn't fight the
+// drag position mid-gesture.
 let _dragging=false;
-scrub.addEventListener('mousedown',e=>{_dragging=true;seekTo(e);show();});
-window.addEventListener('mousemove',e=>{if(_dragging){seekTo(e);show();}});
-window.addEventListener('mouseup',()=>{_dragging=false;});
-scrub.addEventListener('touchstart',e=>{_dragging=true;seekTo(e);show();},{passive:true});
-scrub.addEventListener('touchmove',e=>{if(_dragging){seekTo(e);show();}},{passive:true});
-scrub.addEventListener('touchend',()=>{_dragging=false;},{passive:true});
+function _dragVisual(ev){{
+  const r=scrub.getBoundingClientRect();
+  const cx=(ev.touches?ev.touches[0]:ev).clientX;
+  const x=Math.max(0,Math.min(r.width,cx-r.left));
+  const pct=(x/r.width)*100;
+  thumb.style.left=pct+'%';
+  const playL=parseFloat(played.style.left)||0;
+  played.style.width=Math.max(0,pct-playL)+'%';
+  const[ws,we]=scrubWindow();
+  const w=ws+(pct/100)*(we-ws);
+  if(isFinite(w)&&w>0)cur.textContent=new Date(w*1000).toLocaleTimeString(
+    'de-DE',{{hour:'2-digit',minute:'2-digit',second:'2-digit'}});
+}}
+scrub.addEventListener('mousedown',e=>{{_dragging=true;_dragVisual(e);show();}});
+window.addEventListener('mousemove',e=>{{if(_dragging){{_dragVisual(e);show();}}}});
+window.addEventListener('mouseup',e=>{{if(_dragging){{_dragging=false;seekTo(e);}}}});
+scrub.addEventListener('touchstart',e=>{{_dragging=true;_dragVisual(e);show();}},{{passive:true}});
+scrub.addEventListener('touchmove',e=>{{if(_dragging){{_dragVisual(e);show();}}}},{{passive:true}});
+scrub.addEventListener('touchend',e=>{{
+  if(!_dragging)return;
+  _dragging=false;
+  /* touchend's .touches is empty — synthesize from changedTouches so
+     seekTo() can pull a clientX out of it. */
+  const t=e.changedTouches&&e.changedTouches[0];
+  if(t)seekTo({{touches:[t],clientX:t.clientX}});
+}},{{passive:true}});
 let _lastTapT=0,_lastTapX=0;
 v.addEventListener('touchend',e=>{
   if(!e.changedTouches[0])return;
@@ -2686,8 +2713,10 @@ function refresh(){{
   const playL=scrubPct(seekStartW);
   const playR=scrubPct(curWall);
   played.style.left=playL+'%';
-  played.style.width=Math.max(0,playR-playL)+'%';
-  thumb.style.left=scrubPct(curWall)+'%';
+  if(!_dragging){{
+    played.style.width=Math.max(0,playR-playL)+'%';
+    thumb.style.left=scrubPct(curWall)+'%';
+  }}
   /* Show wall-clock time of current playback position, not offset to
      live edge — more intuitive and doesn't suffer from segment-jitter. */
   if(!pauseState){{
@@ -6589,7 +6618,7 @@ def _render_mediathek_player(uuid, entry):
             f"  const T=v.currentTime||0;"
             f"  cur.textContent=fmt(T);dur.textContent=fmt(D);"
             f"  const pct=D>0?(T/D)*100:0;"
-            f"  played.style.width=pct+'%';thumb.style.left=pct+'%';"
+            f"  if(!_dragging){{played.style.width=pct+'%';thumb.style.left=pct+'%';}}"
             f"}}"
             f"v.addEventListener('timeupdate',refresh);"
             f"v.addEventListener('loadedmetadata',refresh);"
@@ -6818,8 +6847,7 @@ def play_recording(uuid):
             f"  const T=v.currentTime||0;"
             f"  cur.textContent=fmt(T);dur.textContent=fmt(D);"
             f"  const pct=D>0?(T/D)*100:0;"
-            f"  played.style.width=pct+'%';"
-            f"  thumb.style.left=pct+'%';"
+            f"  if(!_dragging){{played.style.width=pct+'%';thumb.style.left=pct+'%';}}"
             f"  skipBtn.classList.toggle('on',currentAd()!==null);"
             f"}}"
             f"v.addEventListener('timeupdate',refresh);"

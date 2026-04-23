@@ -1,12 +1,25 @@
 FROM python:3.12-slim AS build
 
+# Local patch on top of upstream Comskip — bundles ffmpeg 7+ ABI compat
+# (ticks_per_frame=1) plus a SaveLogoMaskData hook that reliably writes
+# <basename>.logo.txt at end-of-analysis. The live scanner caches
+# per-channel logo templates from that file; without the patch, the
+# Pi-side comskip fallback (when the Mac is offline) loses both the
+# cache writes and the goodEdge-based refinement the Mac side relies on.
+# Canonical patch lives at ../comskip/ in the dev repo; mirrored here
+# so the build context stays self-contained on the Pi (which doesn't
+# have the full repo checked out).
+COPY comskip-patches/0001-ffmpeg-compat-and-logo-output.patch /tmp/patches/
+
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates git autoconf automake libtool build-essential \
         pkg-config \
         libargtable2-dev libavformat-dev libavcodec-dev libavutil-dev \
         libswscale-dev libswresample-dev libsdl2-dev && \
     git clone --depth 1 https://github.com/erikkaashoek/Comskip /tmp/comskip && \
-    cd /tmp/comskip && ./autogen.sh && ./configure && make -j$(nproc) && \
+    cd /tmp/comskip && \
+    git apply /tmp/patches/0001-ffmpeg-compat-and-logo-output.patch && \
+    ./autogen.sh && ./configure && make -j$(nproc) && \
     mkdir -p /out && cp comskip /out/comskip
 
 
