@@ -390,10 +390,19 @@ def analyze(slug, state, window_end_seg=None, window_size=WINDOW_SIZE):
     # uses the same DE-private-TV tuning the Pi container does
     # (min_commercialbreak=60, validate_silence=1, drop AR, etc.).
     ini_path = HLS_DIR / ".comskip.ini"
+    # Persistent per-channel logo template. comskip otherwise re-learns
+    # the logo on every 25-min scan window — quality varies per scan
+    # depending on how much logo-only material falls inside, and the
+    # learning phase itself adds 10-20 s of detection lag at the start
+    # of a block. Caching one good template per channel skips both.
+    logo_cache_dir = HLS_DIR / ".logos"
+    logo_cache = logo_cache_dir / f"{slug}.logo.txt"
     scan_t0 = time.time()
     cmd = [str(COMSKIP), "--quiet"]
     if ini_path.is_file():
         cmd += ["--ini", str(ini_path)]
+    if logo_cache.is_file() and logo_cache.stat().st_size > 0:
+        cmd += ["--logo", str(logo_cache)]
     cmd += ["--output", str(work), str(merged)]
     try:
         subprocess.run(cmd, timeout=600, check=False, capture_output=True)
@@ -401,6 +410,17 @@ def analyze(slug, state, window_end_seg=None, window_size=WINDOW_SIZE):
         log(f"[{slug}] comskip: {e}")
     ads_sec = parse_comskip(work)
     ads_sec = blackframe_extend_ads(str(merged), ads_sec, channel_slug=slug)
+    # Refresh the cached logo template if comskip wrote a fresh one and
+    # the scan looked successful (≥2 ad blocks ≈ logo learning worked).
+    # Avoids poisoning the cache from a degenerate scan with no ads.
+    fresh_logo = work / "merged.logo.txt"
+    if fresh_logo.is_file() and fresh_logo.stat().st_size > 0 \
+            and len(ads_sec) >= 2:
+        try:
+            logo_cache_dir.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(fresh_logo, logo_cache)
+        except Exception as e:
+            log(f"[{slug}] logo cache write: {e}")
     merged.unlink(missing_ok=True)
     scan_dt = time.time() - scan_t0
 
