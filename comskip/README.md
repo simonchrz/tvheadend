@@ -53,13 +53,14 @@ git apply /path/to/comskip/0001-ffmpeg-compat-and-logo-output.patch
 
 ### Apply at Pi container build
 
-Recommended once part (b) starts to matter on the Pi (e.g. live-buffer
-adskip moves back to the Pi). Add to `hls-gateway/Dockerfile` after
-the `git clone`:
+Already wired into `hls-gateway/Dockerfile`. The patch file is mirrored
+into `hls-gateway/comskip-patches/` (the Pi container build context is
+`hls-gateway/`, so the canonical `../comskip/` location isn't reachable
+from the Dockerfile — keep the two copies in sync when editing).
 
-```Dockerfile
-COPY comskip/0001-ffmpeg-compat-and-logo-output.patch /tmp/patches/
-RUN cd /tmp/comskip && git apply /tmp/patches/0001-ffmpeg-compat-and-logo-output.patch
-```
-
-Currently unused — Pi works without it.
+Why it matters on the Pi: when the Mac live-comskip agent is offline,
+the Pi's `_live_ads_analyze` takes over. Without the SaveLogoMaskData
+hook the Pi's comskip wouldn't write `.logo.txt` files, so the cached
+per-channel logo templates in `/data/hls/.logos/` would never refresh
+and the Python-side `refine_ads_by_logo()` (which depends on `--csvout`
++ a stable logo template via `--logo`) would degrade.
