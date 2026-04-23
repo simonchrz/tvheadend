@@ -124,6 +124,12 @@ HOST_URL       = os.environ.get("HOST_URL", "http://raspberrypi5lan:8080")
 IDLE_TIMEOUT   = int(os.environ.get("IDLE_TIMEOUT", "120"))
 MAX_WARM_STREAMS = int(os.environ.get("MAX_WARM_STREAMS", "3"))
 WARM_TTL_SECONDS = int(os.environ.get("WARM_TTL_SECONDS", "180"))
+# Watched recordings older than this get auto-deleted by the cleanup
+# loop. tvheadend's `watched` field is read-only/computed; the user-
+# settable proxy is `playcount` (>0 means watched). Player auto-marks
+# at AUTO_WATCHED_THRESHOLD playback fraction.
+WATCHED_AUTO_DELETE_DAYS = int(os.environ.get("WATCHED_AUTO_DELETE_DAYS", "7"))
+AUTO_WATCHED_THRESHOLD   = 0.90
 # Channels to keep warm permanently. Initial seed from env var, then
 # persisted to disk so UI toggles survive restarts. LRU eviction never
 # touches these; a background loop re-spawns ffmpeg if they die. Cap
@@ -4802,6 +4808,71 @@ def cancel_series(autorec_uuid):
                            mimetype="application/json"))
 
 
+@app.route("/api/recording/<uuid>/watched", methods=["POST"])
+def api_recording_watched(uuid):
+    """Toggle the watched flag on a recording. tvheadend's `watched`
+    field is read-only/computed — set the user-settable `playcount`
+    instead. The auto-cleanup loop uses playcount>0 to decide what's
+    eligible for deletion after WATCHED_AUTO_DELETE_DAYS days."""
+    try:
+        body = request.get_json(silent=True) or {}
+        watched = bool(body.get("watched", True))
+    except Exception:
+        watched = True
+    payload = urllib.parse.urlencode({
+        "node": json.dumps({"uuid": uuid,
+                              "playcount": 1 if watched else 0})
+    }).encode()
+    try:
+        req = urllib.request.Request(f"{TVH_BASE}/api/idnode/save",
+                                      data=payload, method="POST")
+        urllib.request.urlopen(req, timeout=5).read()
+        return _cors(Response(json.dumps({"ok": True, "watched": watched}),
+                               mimetype="application/json"))
+    except Exception as e:
+        return Response(json.dumps({"ok": False, "error": str(e)}),
+                        status=500, mimetype="application/json")
+
+
+def _cleanup_watched_loop():
+    """Delete recordings that have been marked watched (playcount>0)
+    for longer than WATCHED_AUTO_DELETE_DAYS days. Runs every 6 h.
+    Only touches `Completed` entries — never deletes something still
+    being recorded or remuxed."""
+    time.sleep(120)  # let other startup work settle
+    while True:
+        try:
+            cutoff = time.time() - WATCHED_AUTO_DELETE_DAYS * 86400
+            d = json.loads(urllib.request.urlopen(
+                f"{TVH_BASE}/api/dvr/entry/grid?limit=1000",
+                timeout=20).read())
+            deleted = 0
+            for e in d.get("entries", []):
+                if (e.get("playcount", 0) > 0
+                        and "Completed" in (e.get("status") or "")
+                        and (e.get("stop") or 0) < cutoff):
+                    try:
+                        body = urllib.parse.urlencode({"uuid": e["uuid"]}).encode()
+                        urllib.request.urlopen(urllib.request.Request(
+                            f"{TVH_BASE}/api/dvr/entry/remove",
+                            data=body, method="POST"),
+                            timeout=10).read()
+                        deleted += 1
+                        print(f"[watched-cleanup] removed "
+                              f"{e.get('disp_title','?')[:40]} "
+                              f"(stopped {time.strftime('%Y-%m-%d', time.localtime(e.get('stop', 0)))})",
+                              flush=True)
+                    except Exception as ex:
+                        print(f"[watched-cleanup] remove {e['uuid']}: {ex}",
+                              flush=True)
+            if deleted:
+                print(f"[watched-cleanup] {deleted} recording(s) deleted",
+                      flush=True)
+        except Exception as ex:
+            print(f"[watched-cleanup] loop: {ex}", flush=True)
+        time.sleep(6 * 3600)
+
+
 @app.route("/cancel-recording/<uuid>")
 def cancel_recording(uuid):
     """Cancel a scheduled (or running) DVR entry, JSON response."""
@@ -4958,12 +5029,21 @@ def recordings_page():
                             'title="Mac comskip analysiert Werbeblöcke">🔍 Mac</span>')
         else:
             prewarm = ""
+        watched = (e.get("playcount") or 0) > 0
+        watch_cell = (
+            f'<a class="watch-btn{" on" if watched else ""}" '
+            f'href="#" data-uuid="{uuid}" '
+            f'data-watched="{1 if watched else 0}" '
+            f'title="Als {"un" if watched else ""}gesehen markieren">'
+            f'{"✓" if watched else "○"}</a>'
+        )
         return (f'<tr><td>{badge}</td>'
                 f'<td>{title_cell}</td>'
                 f'<td>{when}</td>'
                 f'<td>{dur_min} min</td>'
                 f'<td>{size_str}</td>'
                 f'<td>{prewarm}</td>'
+                f'<td>{watch_cell}</td>'
                 f'<td><a class="del-btn" href="{HOST_URL}/recording/{uuid}/delete" '
                 f'data-title="{title.replace(chr(34),"&quot;")}" '
                 f'data-when="{when}">🗑</a></td></tr>')
@@ -5113,6 +5193,10 @@ def recordings_page():
             f".del-confirm{{background:#c0392b !important;color:#fff !important;"
             f"border-color:#c0392b !important}}"
             f".del-cancel{{background:transparent !important;font-weight:400 !important}}"
+            f".watch-btn{{display:inline-block;width:24px;height:24px;line-height:22px;"
+            f"text-align:center;border-radius:50%;border:1px solid var(--border);"
+            f"color:var(--muted);text-decoration:none;font-size:.95em;cursor:pointer}}"
+            f".watch-btn.on{{background:#27ae60;color:#fff;border-color:#27ae60}}"
             f".badge.series{{background:#8e44ad;color:#fff}}"
             f".badge.mediathek{{background:#2980b9;color:#fff}}"
             f".badge.mediathek.local{{background:#27ae60}}"
@@ -5134,8 +5218,10 @@ def recordings_page():
             f"</div>"
             f"<div class='rec-body'>"
             f"<table><tr><th></th><th>Titel</th><th>Start</th>"
-            f"<th>Dauer</th><th>Größe</th><th>Cache</th><th></th></tr>"
-            f"{''.join(rows) if rows else '<tr><td colspan=7>Keine Aufnahmen</td></tr>'}"
+            f"<th>Dauer</th><th>Größe</th><th>Cache</th>"
+            f"<th title='Gesehen — wird nach {WATCHED_AUTO_DELETE_DAYS} d auto-gelöscht'>👁</th>"
+            f"<th></th></tr>"
+            f"{''.join(rows) if rows else '<tr><td colspan=8>Keine Aufnahmen</td></tr>'}"
             f"</table>"
             f"</div>"
             f"<script>"
@@ -5183,6 +5269,21 @@ def recordings_page():
             f"  const sub=a.dataset.mt?'Aus Liste entfernen (falls lokale Datei existiert, wird sie gelöscht).':"
             f"    (a.dataset.when?'Geplant/aufgenommen am '+a.dataset.when:'');"
             f"  showDeleteModal(title,sub,()=>{{location.href=a.href;}});"
+            f"}});"
+            f"document.addEventListener('click',ev=>{{"
+            f"  const a=ev.target.closest('.watch-btn');if(!a)return;"
+            f"  ev.preventDefault();"
+            f"  const next=a.dataset.watched==='1'?0:1;"
+            f"  fetch('{HOST_URL}/api/recording/'+a.dataset.uuid+'/watched',"
+            f"    {{method:'POST',headers:{{'Content-Type':'application/json'}},"
+            f"     body:JSON.stringify({{watched:next===1}})}})"
+            f"    .then(r=>r.json()).then(d=>{{"
+            f"      if(!d.ok)return;"
+            f"      a.dataset.watched=String(next);"
+            f"      a.classList.toggle('on',next===1);"
+            f"      a.textContent=next===1?'\\u2713':'\\u25CB';"
+            f"      a.title='Als '+(next===1?'un':'')+'gesehen markieren';"
+            f"    }}).catch(()=>{{}});"
             f"}});"
             f"function cancelSeries(ev,uuid,title,upcoming){{"
             f"  ev.preventDefault();ev.stopPropagation();"
@@ -7079,6 +7180,20 @@ def play_recording(uuid):
             f"  else if(e.key==='ArrowLeft')seek(-10);"
             f"  else if(e.key===' '){{e.preventDefault();togglePlay();show();}}"
             f"}});"
+            # Auto-mark recording watched once playback crosses the
+            # AUTO_WATCHED_THRESHOLD fraction. Fires once per page load.
+            # The cleanup loop deletes anything with playcount>0 older
+            # than WATCHED_AUTO_DELETE_DAYS days.
+            f"let _markedWatched=false;"
+            f"v.addEventListener('timeupdate',()=>{{"
+            f"  if(_markedWatched)return;"
+            f"  const D=v.duration;if(!isFinite(D)||D<=0)return;"
+            f"  if((v.currentTime||0)/D < {AUTO_WATCHED_THRESHOLD})return;"
+            f"  _markedWatched=true;"
+            f"  fetch('{HOST_URL}/api/recording/{uuid}/watched',"
+            f"    {{method:'POST',headers:{{'Content-Type':'application/json'}},"
+            f"     body:JSON.stringify({{watched:true}})}}).catch(()=>{{}});"
+            f"}});"
             f"</script></body></html>")
     return html
 
@@ -7546,6 +7661,7 @@ if __name__ == "__main__":
     threading.Thread(target=ffmpeg_watchdog_loop, daemon=True).start()
     threading.Thread(target=disk_cleanup_loop, daemon=True).start()
     threading.Thread(target=state_backup_loop, daemon=True).start()
+    threading.Thread(target=_cleanup_watched_loop, daemon=True).start()
     # waitress in production; fall back to Flask's built-in only if
     # waitress somehow isn't importable (e.g. an older image).
     try:
