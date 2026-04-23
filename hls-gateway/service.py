@@ -2191,6 +2191,12 @@ html,body{height:100%;background:#000;color:#eee;
  background:linear-gradient(#000d,transparent);transition:opacity .3s}
 .row{display:flex;align-items:center;gap:6px;margin-top:8px;
  flex-wrap:wrap;row-gap:8px}
+/* Minimal-controls mode: hide every button in the row, keep the
+   #cur timer + scrubbar + title visible. Toggle via #ctrlMin in
+   the topbar; state persisted in localStorage('player-ctrl-min'). */
+body.ctrl-min .row > button,
+body.ctrl-min .row > #skipad,
+body.ctrl-min .row > #volume-wrap{display:none}
 .spacer{flex:1 1 auto}
 .iconbtn{background:#fff2;color:#fff;border:0;width:34px;height:34px;
  border-radius:17px;font-size:1em;cursor:pointer;display:flex;
@@ -2282,6 +2288,22 @@ function toggleFs(){
   if(root.webkitRequestFullscreen){root.webkitRequestFullscreen();return;}
   if(v.webkitEnterFullscreen){v.webkitEnterFullscreen();}
 }
+const CTRL_MIN_KEY='player-ctrl-min';
+function applyCtrlMin(min){
+  document.body.classList.toggle('ctrl-min',!!min);
+  const btn=document.getElementById('ctrlMin');
+  if(btn){
+    btn.textContent=min?'⊞':'⊟';
+    btn.setAttribute('aria-label',
+      min?'Steuerleiste einblenden':'Steuerleiste verbergen');
+  }
+}
+function toggleCtrlMin(){
+  const min=!document.body.classList.contains('ctrl-min');
+  try{localStorage.setItem(CTRL_MIN_KEY,min?'1':'0');}catch(e){}
+  applyCtrlMin(min);
+}
+try{applyCtrlMin(localStorage.getItem(CTRL_MIN_KEY)==='1');}catch(e){}
 function closePlayer(ev){
   if(ev)ev.preventDefault();
   try{
@@ -2411,6 +2433,8 @@ body{{touch-action:pan-y}}
 <button id='unmute' onclick='doUnmute()'>🔊 Ton an</button>
 <div id='topbar'>
  <button class='iconbtn' onclick='toggleFs()' aria-label='Vollbild'>⛶</button>
+ <button id='ctrlMin' class='iconbtn' onclick='toggleCtrlMin()'
+   aria-label='Steuerleiste verbergen'>⊟</button>
  <a class='iconbtn' href='{HOST_URL}/' aria-label='Schließen' onclick='return closePlayer(event)'>✕</a>
 </div>
 <div id='chrome'>
