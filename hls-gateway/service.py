@@ -2191,14 +2191,18 @@ html,body{height:100%;background:#000;color:#eee;
  background:linear-gradient(#000d,transparent);transition:opacity .3s}
 .row{display:flex;align-items:center;gap:6px;margin-top:8px;
  flex-wrap:wrap;row-gap:8px}
-/* Minimal-controls mode: hide every button in the row, keep the
-   #cur timer + scrubbar + title visible. Toggle via #ctrlMin in
-   the topbar; state persisted in localStorage('player-ctrl-min').
-   Live-edge is reachable by dragging the scrub thumb to the
-   rightmost 2 % (seekTo snaps to goLive() in that range). */
+/* Minimal-controls mode: hide every button in the row except
+   #skipad, keep the #cur timer + scrubbar + title visible. Toggle
+   via #ctrlMin in the topbar; state persisted in
+   localStorage('player-ctrl-min'). Live-edge is reachable by
+   dragging the scrub thumb to the rightmost 2 % (seekTo snaps to
+   goLive() in that range). #skipad stays because skipping a 4-min
+   ad block by hand on the scrubbar is annoying — but in min mode
+   we tone it down so it's not a screaming red CTA. */
 body.ctrl-min .row > button,
-body.ctrl-min .row > #skipad,
 body.ctrl-min .row > #volume-wrap{display:none}
+body.ctrl-min #skipad{background:#0006;color:#ddd;padding:4px 9px;
+ font-size:.72em;font-weight:500;border:1px solid #fff3}
 .spacer{flex:1 1 auto}
 .iconbtn{background:#fff2;color:#fff;border:0;width:34px;height:34px;
  border-radius:17px;font-size:1em;cursor:pointer;display:flex;
