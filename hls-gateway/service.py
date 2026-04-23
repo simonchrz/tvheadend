@@ -123,7 +123,7 @@ TVH_BASE       = os.environ.get("TVH_BASE", "http://localhost:9981")
 HOST_URL       = os.environ.get("HOST_URL", "http://raspberrypi5lan:8080")
 IDLE_TIMEOUT   = int(os.environ.get("IDLE_TIMEOUT", "120"))
 MAX_WARM_STREAMS = int(os.environ.get("MAX_WARM_STREAMS", "3"))
-WARM_TTL_SECONDS = int(os.environ.get("WARM_TTL_SECONDS", str(2 * 3600)))
+WARM_TTL_SECONDS = int(os.environ.get("WARM_TTL_SECONDS", "180"))
 # Channels to keep warm permanently. Initial seed from env var, then
 # persisted to disk so UI toggles survive restarts. LRU eviction never
 # touches these; a background loop re-spawns ffmpeg if they die. Cap
@@ -797,9 +797,12 @@ def ensure_running(slug):
 
 
 def idle_killer_loop():
-    """Only stop warm streams that have sat idle longer than the 2h
-    DVR window (older content would roll off anyway) — short-term
-    idleness is *desirable* (keeps DVR warm for timeshift)."""
+    """Stop non-pinned warm streams after WARM_TTL_SECONDS of idleness.
+    Short TTL (3 min default) frees the DVB tuner + CPU + SSD writes
+    quickly when the user genuinely walks away from a channel, while
+    still riding through brief cross-channel comparisons or quick
+    info-screens that bring the user back within the grace period.
+    Pinned (ALWAYS_WARM) channels are exempt and run forever."""
     while True:
         time.sleep(30)
         try:
