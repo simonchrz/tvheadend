@@ -3615,16 +3615,12 @@ function togglePlay(){{
       try{{if(hlsInst)hlsInst.startLoad();}}catch(e){{}}
       v.play().catch(()=>{{}});
     }} else {{
+      /* Native HLS: hide the freeze overlay and resume. The canvas
+         covered the video while Safari was paused; v.play() picks
+         up from currentTime which Safari kept inside the DVR
+         seekable range. */
       hidePauseFreeze();
-      v.src=ps.pausedSrc;v.load();
-      v.addEventListener('loadedmetadata',()=>{{
-        const d=typeof v.getStartDate==='function'?v.getStartDate():null;
-        if(d&&!isNaN(d.getTime())){{
-          const wallS=d.getTime()/1000;
-          v.currentTime=Math.max(0,ps.pausedWall-wallS);
-        }}
-        v.play().catch(()=>{{}});
-      }},{{once:true}});
+      v.play().catch(()=>{{}});
     }}
     pp.textContent='\u23F8';
     return;
@@ -3648,15 +3644,16 @@ function togglePlay(){{
     pausedWall:wallAt(v.currentTime),
     pausedCurrent:v.currentTime
   }};
-  v.pause();
   if(usingHlsJs){{
+    v.pause();
     try{{hlsInst.stopLoad();}}catch(e){{}}
   }} else {{
-    /* Native HLS live (iOS Safari): grab the current frame to canvas
-       BEFORE we strip src — once src is gone the <video> blanks. */
+    /* Native HLS live (iOS Safari): capture frame to canvas overlay
+       BEFORE pause, then v.pause(). Don't strip src — Safari keeps
+       the seekable DVR window intact and resumes from currentTime
+       (no jump to live edge on play). */
     showPauseFreeze();
-    v.removeAttribute('src');
-    v.load();
+    v.pause();
   }}
   pp.textContent='\u25B6';
   setTimeout(()=>{{if(pauseState)pp.textContent='\u25B6';}},80);
