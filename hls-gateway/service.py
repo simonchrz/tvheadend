@@ -2895,7 +2895,13 @@ function currentEvent(){{
 }}
 let onMediathek=false;
 function localSrc(){{return HOST+'/hls/'+current+'/dvr.m3u8';}}
-function showHintMsg(msg,ms){{
+function showHintMsg(msg,ms,kind){{
+  /* Default kind='info' → no-op. Only kind='error' actually shows the
+     toast. The "Sprung an Werbeblock-Ende" / "Sendungsanfang" /
+     "Anfang der Aufnahme" etc. cues felt noisy in the player; the
+     visual scrub jump itself is enough confirmation that the action
+     worked. Errors stay visible because they're actionable. */
+  if(kind!=='error')return;
   hint.textContent=msg;hint.classList.add('show');
   setTimeout(()=>hint.classList.remove('show'),ms||2500);
 }}
@@ -2928,7 +2934,7 @@ async function goShowStart(){{
       }} else if(idx>=0){{
         switchToRecording(recChain[idx],pick.wall,idx);
       }} else {{
-        showHintMsg('Sprungziel nicht in Aufnahme');return;
+        showHintMsg('Sprungziel nicht in Aufnahme',null,'error');return;
       }}
       const hints={{'epg-start':'Sprung an vorherigen Sendungsanfang','ad-end':'Sprung an Werbeblock-Ende'}};
       showHintMsg(hints[pick.label]||'Sprung zurück',2500);
@@ -2964,7 +2970,7 @@ async function goShowStart(){{
       epgEvents=d.events||[];renderChapters();
     }}catch(e){{}}
     ev=currentEvent();
-    if(!ev){{showHintMsg('Kein EPG-Event gefunden');return;}}
+    if(!ev){{showHintMsg('Kein EPG-Event gefunden',null,'error');return;}}
   }}
   /* Live-buffer step-back, unified merged-targets walk.
 
@@ -2989,7 +2995,7 @@ async function goShowStart(){{
    .then(r=>r.json()).then(adResp=>{{
      const ads=adResp.ads||[];
      const[s,e]=seekableRange();
-     if(e<=s+1){{showHintMsg('Buffer leer');return;}}
+     if(e<=s+1){{showHintMsg('Buffer leer',null,'error');return;}}
      const nowS=Date.now()/1000;
      const wallS=nowS-(e-s),wallE=nowS;
      const cutoffWall=recentJump?_lastJumpedWall:wallE;
@@ -3027,12 +3033,12 @@ async function goShowStart(){{
                return;
              }}
              switchToMediathek(d.url,ev.start);
-           }}).catch(()=>showHintMsg('Mediathek-Fehler'));
+           }}).catch(()=>showHintMsg('Mediathek-Fehler',null,'error'));
           return;
         }}
         activateRecordingChain(chain,targetIdx,ev.start);
-      }}).catch(err=>showHintMsg('Recording-Fehler: '+err));
-   }}).catch(()=>showHintMsg('Live-Ads-Fehler'));
+      }}).catch(err=>showHintMsg('Recording-Fehler: '+err,null,'error'));
+   }}).catch(()=>showHintMsg('Live-Ads-Fehler',null,'error'));
 }}
 function activateRecordingChain(chain,targetIdx,wallStartTs){{
   recChain=chain;
