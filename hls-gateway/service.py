@@ -2456,20 +2456,38 @@ scrub.addEventListener('touchend',e=>{
   const t=e.changedTouches&&e.changedTouches[0];
   if(t)seekTo({touches:[t],clientX:t.clientX});
 },{passive:true});
-let _lastTapT=0,_lastTapX=0;
+let _lastTapT=0,_lastTapX=0,_singleTapT=null,_lastTouchT=0;
 v.addEventListener('touchend',e=>{
   if(!e.changedTouches[0])return;
-  const now=Date.now();
+  _lastTouchT=Date.now();
+  const now=_lastTouchT;
   const x=e.changedTouches[0].clientX;
   if(now-_lastTapT<300&&Math.abs(x-_lastTapX)<60){
+    /* Double-tap: seek 10s. Cancel pending single-tap toggle. */
+    if(_singleTapT){clearTimeout(_singleTapT);_singleTapT=null;}
     const delta=x<window.innerWidth/2?-10:10;
     seek(delta);
     hint.textContent=(delta<0?'\u23EA ':'\u23E9 ')+Math.abs(delta)+' s';
     hint.classList.add('show');
     setTimeout(()=>hint.classList.remove('show'),600);
     _lastTapT=0;
-  }else{_lastTapT=now;_lastTapX=x;}
+  }else{
+    _lastTapT=now;_lastTapX=x;
+    /* Single tap: defer togglePlay until the double-tap window
+       closes so a quick second tap can still seek instead. */
+    _singleTapT=setTimeout(()=>{
+      _singleTapT=null;
+      togglePlay();show();
+    },280);
+  }
 },{passive:true});
+/* Desktop: click toggles playback. Skip when a touch just fired so
+   we don't double-trigger via the synthetic click that follows
+   touchend on mobile. */
+v.addEventListener('click',()=>{
+  if(Date.now()-_lastTouchT<500)return;
+  togglePlay();show();
+});
 /* --- Volume + mute control (persisted to localStorage) --------- */
 const volWrap=document.getElementById('volume-wrap');
 if(volWrap){
