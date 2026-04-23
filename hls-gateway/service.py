@@ -4653,6 +4653,19 @@ def record_series(event_id):
         "channel": ch_uuid,
         "comment": f"auto via /record-series for eid={event_id}",
     }
+    # Lock to the seed event's time-of-day so a midday rerun on the
+    # same channel doesn't get picked up alongside the prime-time
+    # original. tvheadend autorec uses HH:MM strings and treats
+    # start_window as the upper bound of the acceptable start time
+    # (not a duration). 15-min slack covers EPG drift / programme
+    # overrun on the channel before this slot.
+    seed_start = entry.get("start")
+    if seed_start:
+        lt = time.localtime(seed_start)
+        start_min = lt.tm_hour * 60 + lt.tm_min
+        end_min = (start_min + 15) % (24 * 60)
+        conf["start"] = f"{start_min // 60:02d}:{start_min % 60:02d}"
+        conf["start_window"] = f"{end_min // 60:02d}:{end_min % 60:02d}"
     body = urllib.parse.urlencode({"conf": json.dumps(conf)}).encode()
     try:
         req = urllib.request.Request(
