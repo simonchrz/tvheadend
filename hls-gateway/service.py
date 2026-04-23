@@ -5198,9 +5198,10 @@ def recordings_page():
                        if meta.get("rating") else '')
         summary = (f'<tr class="series-head"><td colspan="8">'
                    f'<details data-ar="{ar_uuid}"{open_attr}>'
-                   f'<summary>{poster_html}{badge} {group_title}'
-                   f'{rating_html} '
-                   f'<small>({len(eps)} Einträge)</small>{kill_btn}</summary>'
+                   f'<summary>{poster_html}{badge}'
+                   f'<span class="series-title">{group_title}'
+                   f' <small>({len(eps)})</small></span>'
+                   f'{rating_html}{kill_btn}</summary>'
                    f'<table class="series-sub"><tbody>'
                    + "".join(_render_row(e, in_series=True) for e in sorted(
                        eps, key=lambda x: x.get("start", 0)))
@@ -5313,19 +5314,22 @@ def recordings_page():
             f"text-align:center;border-radius:50%;border:1px solid var(--border);"
             f"color:var(--muted);text-decoration:none;font-size:.95em;cursor:pointer}}"
             f".watch-btn.on{{background:#27ae60;color:#fff;border-color:#27ae60}}"
-            f".rec-poster{{width:30px;height:42px;object-fit:cover;border-radius:3px;"
-            f"vertical-align:middle;margin-right:8px;background:var(--stripe)}}"
+            f".rec-poster{{width:24px;height:34px;object-fit:cover;border-radius:3px;"
+            f"vertical-align:middle;margin-right:6px;background:var(--stripe);"
+            f"flex-shrink:0}}"
             f".rec-rating{{display:inline-block;background:#f39c12;color:#000;"
             f"padding:1px 6px;border-radius:3px;font-size:.8em;font-weight:600;"
-            f"margin-left:6px;vertical-align:middle}}"
-            f".badge.series{{background:#8e44ad;color:#fff}}"
+            f"margin-left:6px;vertical-align:middle;flex-shrink:0}}"
+            f".badge.series{{background:#8e44ad;color:#fff;flex-shrink:0}}"
             f".badge.mediathek{{background:#2980b9;color:#fff}}"
             f".badge.mediathek.local{{background:#27ae60}}"
             f".badge.expired{{background:#7f8c8d;color:#fff}}"
             f"tr.series-head td{{padding:0}}"
             f"tr.series-head summary{{cursor:pointer;padding:6px 8px;"
             f"background:var(--stripe);display:flex;align-items:center;"
-            f"gap:8px;flex-wrap:wrap}}"
+            f"gap:8px}}"
+            f"tr.series-head summary .series-title{{flex:1;min-width:0;"
+            f"overflow:hidden;text-overflow:ellipsis;white-space:nowrap}}"
             f"tr.series-head .series-kill{{margin-left:auto;background:none;"
             f"border:0;color:var(--muted);cursor:pointer;font-size:.9em;"
             f"padding:2px 6px}}"
