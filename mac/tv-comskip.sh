@@ -40,7 +40,7 @@ fi
 touch "$MOUNT/hls/.mac-comskip-alive" 2>/dev/null
 
 python3 - <<PY
-import json, os, shlex, subprocess, time, urllib.request
+import json, os, shlex, shutil, subprocess, time, urllib.request
 API = "$TVH_API"
 MOUNT = os.path.expanduser("$MOUNT")
 COMSKIP = os.path.expanduser("$COMSKIP")
@@ -48,6 +48,30 @@ FFMPEG = "$FFMPEG"
 FFPROBE = "$FFPROBE"
 
 SAFE_VIDEO = {"h264", "hevc"}
+
+LOGO_CACHE = os.path.join(MOUNT, "hls", ".logos")
+
+# tvheadend DVR entries carry channelname (e.g. "VOX"); the live
+# scanner caches per channel slug (e.g. "vox"). Build name→slug from
+# hls-gateway once per script run.
+def load_chname_slug_map():
+    out = {}
+    try:
+        url = "https://raspberrypi5lan:8443/api/channels"
+        import ssl
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        data = json.loads(urllib.request.urlopen(url, timeout=10,
+                                                  context=ctx).read())
+        for c in data.get("channels", []):
+            n = c.get("name"); s = c.get("slug")
+            if n and s: out[n] = s
+    except Exception as e:
+        print("chname-slug map:", e, flush=True)
+    return out
+
+CHNAME_TO_SLUG = load_chname_slug_map()
 
 def have_complete_hls(out_dir):
     pl = os.path.join(out_dir, "index.m3u8")
@@ -179,13 +203,19 @@ def remux(uuid, src, out_dir):
           f"{mb_per_s:.0f} MB/s)", flush=True)
     return True
 
-def comskip(uuid, src, out_dir):
+def comskip(uuid, src, out_dir, slug=None):
     ini_path = os.path.join(MOUNT, "hls", ".comskip.ini")
     cmd = [COMSKIP, "--quiet"]
     if os.path.isfile(ini_path):
         cmd += ["--ini", ini_path]
+    # Use the per-channel cached logo template if we have one. Speeds
+    # up + tightens detection (no per-run learning phase).
+    cached_logo = os.path.join(LOGO_CACHE, f"{slug}.logo.txt") if slug else None
+    if cached_logo and os.path.isfile(cached_logo) \
+            and os.path.getsize(cached_logo) > 0:
+        cmd += ["--logo", cached_logo]
     cmd += ["--output", out_dir, src]
-    print(f"  comskip", flush=True)
+    print(f"  comskip{' (cached logo)' if cached_logo and os.path.isfile(cached_logo) else ''}", flush=True)
     t0 = time.time()
     r = subprocess.run(cmd, timeout=1200, check=False,
                        capture_output=True, text=True)
@@ -194,6 +224,23 @@ def comskip(uuid, src, out_dir):
         print(f"  comskip exit={r.returncode} {r.stderr[:200]}",
               flush=True)
         return False
+    # Refresh per-channel logo cache from this run. A finished
+    # recording is 60+ min vs the live scanner's 25-min window, so
+    # the logo template trained here is strictly better — overwrite
+    # unconditionally on any successful comskip exit.
+    if slug:
+        try:
+            for f in os.listdir(out_dir):
+                if f.endswith(".logo.txt") and \
+                        os.path.getsize(os.path.join(out_dir, f)) > 0:
+                    os.makedirs(LOGO_CACHE, exist_ok=True)
+                    shutil.copy2(os.path.join(out_dir, f),
+                                  os.path.join(LOGO_CACHE,
+                                                f"{slug}.logo.txt"))
+                    print(f"  logo cached for {slug}", flush=True)
+                    break
+        except Exception as e:
+            print(f"  logo cache: {e}", flush=True)
     print(f"  comskip done in {dt:.0f}s", flush=True)
     return True
 
@@ -251,7 +298,8 @@ for e in data.get("entries", []):
             if remux(uuid, mac_ts, out_dir):
                 did_work = True
         if needs_cskip:
-            if comskip(uuid, mac_ts, out_dir):
+            slug = CHNAME_TO_SLUG.get(e.get("channelname", ""))
+            if comskip(uuid, mac_ts, out_dir, slug=slug):
                 did_work = True
     except subprocess.TimeoutExpired:
         print("  timeout", flush=True)
