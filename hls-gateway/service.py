@@ -3606,6 +3606,14 @@ function showPauseFreeze(){{
 function hidePauseFreeze(){{
   if(_pauseCanvas)_pauseCanvas.style.display='none';
 }}
+/* While paused, refresh the freeze overlay any time the underlying
+   <video> seeks to a new position — so scrubbing during pause shows
+   the new still frame instead of the original captured one. iOS
+   Safari decodes the frame at the seek target even while paused, so
+   drawImage() gets the fresh content. */
+v.addEventListener('seeked',()=>{{
+  if(pauseState&&!pauseState.pausedHlsJs)showPauseFreeze();
+}});
 function togglePlay(){{
   if(pauseState){{
     const ps=pauseState;pauseState=null;
