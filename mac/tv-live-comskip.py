@@ -751,9 +751,20 @@ def main_loop():
     pool = ThreadPoolExecutor(max_workers=MAX_PARALLEL_SCANS,
                               thread_name_prefix="scan")
     last_gc = 0
+    last_hb = 0
+    hb_path = HLS_DIR / ".mac-live-comskip-alive"
     while True:
         try:
-            if time.time() - last_gc > 600:
+            now = time.time()
+            # Heartbeat — touched every 30 s, read by the Pi-side
+            # /health endpoint to know if this Mac scanner is alive.
+            if now - last_hb > 30:
+                try:
+                    hb_path.touch()
+                except Exception:
+                    pass
+                last_hb = now
+            if now - last_gc > 600:
                 gc_stale_caches()
                 last_gc = time.time()
             candidates = [s for s in LIVE_ADSKIP_SLUGS

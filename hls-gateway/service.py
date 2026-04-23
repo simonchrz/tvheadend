@@ -7574,6 +7574,170 @@ def api_warm_status():
     }), mimetype="application/json"))
 
 
+def _hb_age(filename):
+    """Seconds since the named heartbeat file was last touched, or None."""
+    try:
+        return int(time.time() - (HLS_DIR / filename).stat().st_mtime)
+    except Exception:
+        return None
+
+
+@app.route("/api/health")
+def api_health():
+    """Aggregate health snapshot for the dashboard. Reads heartbeats
+    from the SMB share for the Mac scanners and probes per-channel
+    state from in-memory caches + the live-ads JSON."""
+    now = time.time()
+    # Mac-side scanners drop heartbeat files on the SMB share. None
+    # = file missing entirely, age in seconds = how long since last
+    # touch. Stale > 120 s ≈ "scanner died".
+    mac_live_age = _hb_age(".mac-live-comskip-alive")
+    mac_rec_age = _hb_age(".mac-comskip-alive")
+    # Per-channel scan freshness from .live_ads.json.
+    chans = []
+    try:
+        if LIVE_ADS_FILE.exists():
+            d = json.loads(LIVE_ADS_FILE.read_text())
+            for slug, v in d.items():
+                gen = v.get("generated", 0)
+                chans.append({
+                    "slug": slug,
+                    "ad_count": len(v.get("ads", [])),
+                    "scan_age_s": int(now - gen) if gen else None,
+                    "latest_seg": v.get("latest_seg"),
+                })
+    except Exception:
+        pass
+    chans.sort(key=lambda x: x["slug"])
+    # System metrics (subset of what api_warm_status returns).
+    cpu_temp_c = None
+    try:
+        cpu_temp_c = round(int(Path(
+            "/sys/class/thermal/thermal_zone0/temp").read_text()) / 1000, 1)
+    except Exception:
+        pass
+    mem_avail_mb = mem_total_mb = None
+    try:
+        for line in Path("/proc/meminfo").read_text().splitlines():
+            if line.startswith("MemTotal:"):
+                mem_total_mb = int(line.split()[1]) // 1024
+            elif line.startswith("MemAvailable:"):
+                mem_avail_mb = int(line.split()[1]) // 1024
+    except Exception:
+        pass
+    disk_free_gb = disk_total_gb = None
+    try:
+        import shutil as _sh
+        du = _sh.disk_usage(HLS_DIR)
+        disk_free_gb = round(du.free / (1024**3), 1)
+        disk_total_gb = round(du.total / (1024**3), 1)
+    except Exception:
+        pass
+    load1 = None
+    try:
+        load1 = round(os.getloadavg()[0], 2)
+    except Exception:
+        pass
+    # Active warm streams.
+    with active_lock:
+        warm = sorted([s for s in channels.keys()])
+    # Recording counts.
+    recs_completed = recs_scheduled = recs_watched = 0
+    try:
+        d = json.loads(urllib.request.urlopen(
+            f"{TVH_BASE}/api/dvr/entry/grid?limit=500", timeout=5).read())
+        for e in d.get("entries", []):
+            if "Completed" in (e.get("status") or ""):
+                recs_completed += 1
+                if (e.get("playcount") or 0) > 0:
+                    recs_watched += 1
+            elif "Scheduled" in (e.get("status") or "") \
+                    or e.get("sched_status") in ("recording",
+                                                   "scheduled"):
+                recs_scheduled += 1
+    except Exception:
+        pass
+    return _cors(Response(json.dumps({
+        "now": int(now),
+        "mac_live_scanner_age_s": mac_live_age,
+        "mac_rec_scanner_age_s": mac_rec_age,
+        "channels": chans,
+        "warm": warm,
+        "always_warm": sorted(ALWAYS_WARM),
+        "cpu_temp_c": cpu_temp_c,
+        "mem_avail_mb": mem_avail_mb,
+        "mem_total_mb": mem_total_mb,
+        "disk_free_gb": disk_free_gb,
+        "disk_total_gb": disk_total_gb,
+        "load1": load1,
+        "recs_completed": recs_completed,
+        "recs_scheduled": recs_scheduled,
+        "recs_watched": recs_watched,
+    }), mimetype="application/json"))
+
+
+HEALTH_HTML = """<!doctype html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Health</title>
+<style>
+:root{--bg:#1a1a1a;--fg:#eee;--muted:#888;--ok:#27ae60;--warn:#f39c12;--err:#e74c3c;--card:#252525;--border:#333}
+body{margin:0;padding:16px;background:var(--bg);color:var(--fg);font-family:-apple-system,sans-serif;max-width:900px;margin:0 auto}
+h1{margin:0 0 16px;font-size:1.4em}
+h2{margin:20px 0 10px;font-size:1.1em;color:var(--muted);text-transform:uppercase;letter-spacing:.05em}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:10px}
+.card{background:var(--card);border:1px solid var(--border);border-radius:8px;padding:12px}
+.lbl{color:var(--muted);font-size:.8em;text-transform:uppercase}
+.val{font-size:1.4em;font-weight:600;margin-top:4px}
+.ok{color:var(--ok)} .warn{color:var(--warn)} .err{color:var(--err)}
+table{width:100%;border-collapse:collapse;background:var(--card);border-radius:8px;overflow:hidden;margin-top:8px}
+th,td{padding:8px 12px;text-align:left;border-bottom:1px solid var(--border);font-size:.95em}
+th{background:#2c2c2c;color:var(--muted);font-weight:500;text-transform:uppercase;font-size:.75em}
+tr:last-child td{border:0}
+.dot{display:inline-block;width:10px;height:10px;border-radius:50%;margin-right:6px;vertical-align:baseline}
+.refresh{color:var(--muted);font-size:.8em}
+a{color:#5dade2}
+</style></head><body>
+<h1>System Health <span class="refresh" id="refresh"></span></h1>
+<div id="root">Loading…</div>
+<script>
+function fmtAge(s){if(s==null)return'<span class="err">offline</span>';
+  if(s<60)return s+'s';if(s<3600)return Math.floor(s/60)+'m '+(s%60)+'s';
+  return Math.floor(s/3600)+'h '+Math.floor((s%3600)/60)+'m';}
+function classifyHb(s){if(s==null)return'err';if(s<120)return'ok';if(s<300)return'warn';return'err';}
+function pct(part,whole){return whole>0?Math.round(part/whole*100):0;}
+async function load(){
+  const d=await fetch('/api/health').then(r=>r.json());
+  const cells=[];
+  cells.push(card('Mac Live-Scanner','<span class="dot '+classifyHb(d.mac_live_scanner_age_s)+'"></span>'+fmtAge(d.mac_live_scanner_age_s),classifyHb(d.mac_live_scanner_age_s)));
+  cells.push(card('Mac Rec-Scanner','<span class="dot '+classifyHb(d.mac_rec_scanner_age_s)+'"></span>'+fmtAge(d.mac_rec_scanner_age_s),classifyHb(d.mac_rec_scanner_age_s)));
+  cells.push(card('CPU Temp',(d.cpu_temp_c||'?')+'°C',d.cpu_temp_c>=75?'err':d.cpu_temp_c>=65?'warn':'ok'));
+  cells.push(card('Load 1m',d.load1||'?',d.load1>=4?'err':d.load1>=2?'warn':'ok'));
+  cells.push(card('Memory free',(d.mem_avail_mb||'?')+'M / '+(d.mem_total_mb||'?')+'M',d.mem_avail_mb<256?'err':d.mem_avail_mb<512?'warn':'ok'));
+  const dPct=d.disk_free_gb&&d.disk_total_gb?pct(d.disk_free_gb,d.disk_total_gb):0;
+  cells.push(card('Disk free',(d.disk_free_gb||'?')+'G / '+(d.disk_total_gb||'?')+'G',dPct<10?'err':dPct<20?'warn':'ok'));
+  cells.push(card('Recordings',d.recs_completed+' fertig, '+d.recs_watched+' gesehen, '+d.recs_scheduled+' geplant'));
+  cells.push(card('Warm streams',(d.warm.length?d.warm.join(', '):'—')));
+  let html='<div class="grid">'+cells.join('')+'</div>';
+  html+='<h2>Channel Scanner</h2><table><tr><th>Channel</th><th>Letzter Scan</th><th>Ad-Blöcke</th><th>Latest Seg</th></tr>';
+  for(const c of d.channels){
+    const age=c.scan_age_s;
+    const cls=age==null?'err':age<900?'ok':age<1800?'warn':'err';
+    html+='<tr><td>'+c.slug+'</td><td class="'+cls+'">'+fmtAge(age)+'</td><td>'+c.ad_count+'</td><td>'+(c.latest_seg||'—')+'</td></tr>';
+  }
+  html+='</table>';
+  document.getElementById('root').innerHTML=html;
+  document.getElementById('refresh').textContent='aktualisiert '+new Date().toLocaleTimeString('de-DE');
+}
+function card(lbl,val,cls){return '<div class="card"><div class="lbl">'+lbl+'</div><div class="val '+(cls||'')+'">'+val+'</div></div>';}
+load();setInterval(load,5000);
+</script></body></html>"""
+
+
+@app.route("/health")
+def health_page():
+    return Response(HEALTH_HTML, mimetype="text/html")
+
+
 def _self_exec(reason):
     # Replace this Python process in place. Child ffmpegs (spawned with
     # start_new_session=True and tracked via PID files) remain our
