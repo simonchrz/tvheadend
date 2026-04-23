@@ -527,8 +527,23 @@ def analyze(slug, state, window_end_seg=None, window_size=WINDOW_SIZE):
         start_idx = incr_start
         scan_mode = "incr"
     else:
-        start_idx = max(0, end_idx - window_size)
-        scan_mode = "init"
+        # Cold init scan. If we have no cached logo template for this
+        # channel yet, expand the window to the full 2 h buffer so
+        # comskip's logo-learning has the maximum amount of show-with-
+        # logo material to converge on a stable template. Logo training
+        # quality drops sharply when a 1 h window happens to land in an
+        # ad-heavy slot (lots of logo-less frames). One-time cost per
+        # channel session — subsequent inits use the cached --logo and
+        # fall back to the regular window_size.
+        cached_logo = HLS_DIR / ".logos" / f"{slug}.logo.txt"
+        if cached_logo.is_file() and cached_logo.stat().st_size > 0:
+            init_size = window_size
+            scan_mode = "init"
+        else:
+            init_size = 7200
+            scan_mode = "init-deep"
+            log(f"[{slug}] no cached logo — using 2 h deep init scan")
+        start_idx = max(0, end_idx - init_size)
     window = all_segs[start_idx:end_idx]
 
     window_first_pdt = first_pdt + start_idx * SEGMENT_TIME
@@ -644,7 +659,7 @@ def analyze(slug, state, window_end_seg=None, window_size=WINDOW_SIZE):
     # may legitimately have <2 ads, but the template they'd produce is
     # trained on too little material to be reliable.
     fresh_logo = work / "merged.logo.txt"
-    if scan_mode == "init" and fresh_logo.is_file() \
+    if scan_mode in ("init", "init-deep") and fresh_logo.is_file() \
             and fresh_logo.stat().st_size > 0 and len(ads_sec) >= 2:
         try:
             logo_cache_dir.mkdir(parents=True, exist_ok=True)
