@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 120 80">
+  <rect width="120" height="80" fill="#fff"/>
+  <text x="60" y="40" font-family="Helvetica,Arial,sans-serif" font-weight="900" font-size="26" text-anchor="middle" fill="#004890" letter-spacing="-0.5">RTL</text>
+  <text x="60" y="68" font-family="Helvetica,Arial,sans-serif" font-weight="900" font-size="28" text-anchor="middle" fill="#f39200" letter-spacing="-0.5">ZWEI</text>
+</svg>

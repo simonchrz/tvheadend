@@ -147,6 +147,8 @@ EPG_ARCHIVE_FILE = HLS_DIR / ".epg_archive.jsonl"
 ALWAYS_WARM_FILE = HLS_DIR / ".always_warm.json"
 EPG_META_FILE    = HLS_DIR / ".epg_meta.json"  # tvmaze poster + rating cache
 EPG_META_TTL_S   = 30 * 86400                  # re-fetch each title monthly
+CH_LOGO_DIR      = Path(__file__).parent / "static" / "ch-logos"
+TMDB_API_KEY     = os.environ.get("TMDB_API_KEY", "").strip()  # optional: better DE show coverage
 PIN_HARD_MAX = 3   # tuner-driven upper bound; minus active/scheduled DVR jobs
 TUNER_TOTAL = int(os.environ.get("TUNER_TOTAL", "4"))   # FRITZ!Box DVB-C tuners
 EPG_SNAPSHOT_INTERVAL = 600   # 10 min
@@ -4847,25 +4849,72 @@ def _normalize_title(t):
     return t.strip()
 
 
+def _fetch_tmdb(title):
+    """Query TMDB for a show. Needs TMDB_API_KEY env var set.
+    Returns dict or None on miss. TMDB has much better DE-TV coverage
+    than TVmaze — Das perfekte Dinner, Galileo, Die Geissens etc. all
+    have ratings on TMDB that TVmaze is missing."""
+    try:
+        url = ("https://api.themoviedb.org/3/search/tv?"
+               + urllib.parse.urlencode({
+                   "api_key": TMDB_API_KEY,
+                   "query": title,
+                   "language": "de-DE",
+                 }))
+        with urllib.request.urlopen(url, timeout=8) as r:
+            d = json.loads(r.read())
+        results = d.get("results") or []
+        if not results:
+            return None
+        top = results[0]
+        poster = top.get("poster_path")
+        return {
+            "poster": (f"https://image.tmdb.org/t/p/w185{poster}"
+                         if poster else None),
+            "rating": round(top["vote_average"], 1) if top.get("vote_average") else None,
+            "tmdb_id": top.get("id"),
+        }
+    except Exception as e:
+        print(f"[epg-enrich tmdb] {title}: {e}", flush=True)
+        return None
+
+
 def _fetch_tvmaze(title):
-    """Query TVmaze for one title. Returns dict with poster + rating
-    or {} if no match. Always touches `fetched_at` so we don't retry
-    failed lookups every minute."""
-    out = {"fetched_at": int(time.time())}
+    """Fallback enricher when TMDB isn't configured or misses. TVmaze
+    skews US/UK so most DE reality/cooking shows miss."""
     try:
         url = ("https://api.tvmaze.com/singlesearch/shows?q="
                + urllib.parse.quote(title))
         with urllib.request.urlopen(url, timeout=8) as r:
             d = json.loads(r.read())
         img = d.get("image") or {}
-        out["poster"] = img.get("medium") or img.get("original")
-        out["rating"] = (d.get("rating") or {}).get("average")
-        out["tvmaze_id"] = d.get("id")
+        return {
+            "poster": img.get("medium") or img.get("original"),
+            "rating": (d.get("rating") or {}).get("average"),
+            "tvmaze_id": d.get("id"),
+        }
     except urllib.error.HTTPError as e:
         if e.code != 404:
-            print(f"[epg-enrich] {title}: {e}", flush=True)
+            print(f"[epg-enrich tvmaze] {title}: {e}", flush=True)
+        return None
     except Exception as e:
-        print(f"[epg-enrich] {title}: {e}", flush=True)
+        print(f"[epg-enrich tvmaze] {title}: {e}", flush=True)
+        return None
+
+
+def _fetch_show_meta(title):
+    """Try TMDB first when an API key is configured, fall back to
+    TVmaze on miss. Either way return a dict stamped with fetched_at
+    so we cache the negative result too and don't retry hourly."""
+    out = {"fetched_at": int(time.time())}
+    if TMDB_API_KEY:
+        meta = _fetch_tmdb(title)
+        if meta and (meta.get("poster") or meta.get("rating") is not None):
+            out.update(meta)
+            return out
+    meta = _fetch_tvmaze(title)
+    if meta:
+        out.update(meta)
     return out
 
 
@@ -4890,11 +4939,11 @@ def _enrich_recordings_loop():
                     cached = _epg_meta.get(key)
                 if cached and now - cached.get("fetched_at", 0) < EPG_META_TTL_S:
                     continue
-                meta = _fetch_tvmaze(key)
+                meta = _fetch_show_meta(key)
                 with _epg_meta_lock:
                     _epg_meta[key] = meta
                 _save_epg_meta()
-                time.sleep(0.5)  # gentle on TVmaze API
+                time.sleep(0.5)  # gentle on upstream APIs
         except Exception as e:
             print(f"[epg-enrich] loop: {e}", flush=True)
         time.sleep(3600)
@@ -5053,10 +5102,12 @@ def recordings_page():
         play_url = f"{HOST_URL}/recording/{uuid}"
         ch_icon = e.get("channel_icon") or ""
         ch_name = (e.get("channelname") or "").replace('"', "&quot;")
+        ch_slug = slugify(e.get("channelname") or "")
+        ch_logo_src = _channel_logo_url(ch_slug, ch_icon)
         ch_logo_html = (
-            f'<img class="ch-logo" src="{HOST_URL}/{ch_icon}" '
+            f'<img class="ch-logo" src="{ch_logo_src}" '
             f'alt="{ch_name}" title="{ch_name}" loading="lazy">'
-            if ch_icon else ''
+            if ch_logo_src else ''
         )
         if is_live or is_done:
             title_cell = f'<a href="{play_url}">{title}</a>'
@@ -5224,10 +5275,12 @@ def recordings_page():
         first_ep = eps[0] if eps else {}
         ep_ch_icon = first_ep.get("channel_icon") or ""
         ep_ch_name = (first_ep.get("channelname") or "").replace('"', "&quot;")
+        ep_ch_slug = slugify(first_ep.get("channelname") or "")
+        ep_ch_logo_src = _channel_logo_url(ep_ch_slug, ep_ch_icon)
         ch_logo_html = (
-            f'<img class="ch-logo" src="{HOST_URL}/{ep_ch_icon}" '
+            f'<img class="ch-logo" src="{ep_ch_logo_src}" '
             f'alt="{ep_ch_name}" title="{ep_ch_name}" loading="lazy">'
-            if ep_ch_icon else ''
+            if ep_ch_logo_src else ''
         )
         summary = (f'<tr class="series-head"><td colspan="5">'
                    f'<details data-ar="{ar_uuid}"{open_attr}>'
@@ -7458,6 +7511,32 @@ def stop_all_endpoint():
         stop_channel(s)
     return _cors(Response(json.dumps({"ok": True, "stopped": slugs}),
                            mimetype="application/json"))
+
+
+@app.route("/static/ch-logos/<fname>")
+def static_ch_logo(fname):
+    """Serve a bundled / user-supplied channel logo from the repo's
+    static/ch-logos/ directory. Falls back to 404 if missing — the
+    recordings template probes for file existence before building the
+    URL so a 404 here implies drift, not a normal miss."""
+    if "/" in fname or ".." in fname:
+        abort(400)
+    return send_from_directory(CH_LOGO_DIR, fname,
+                                 max_age=86400)
+
+
+def _channel_logo_url(slug, fallback_icon_path):
+    """Return the best channel-logo URL for `slug`. Prefers a local
+    override from static/ch-logos/<slug>.(svg|png|jpg) over the
+    low-res tvheadend imagecache default."""
+    if slug:
+        for ext in ("svg", "png", "jpg"):
+            p = CH_LOGO_DIR / f"{slug}.{ext}"
+            if p.is_file():
+                return f"{HOST_URL}/static/ch-logos/{slug}.{ext}"
+    if fallback_icon_path:
+        return f"{HOST_URL}/{fallback_icon_path}"
+    return ""
 
 
 @app.route("/status")
