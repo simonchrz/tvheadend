@@ -5322,17 +5322,23 @@ def _blackframe_extend_ads(video_path, ads,
             extend_to = blacks_after[-1] + 0.5
         new_end = max(new_end, min(end + max_extend, extend_to))
         # --- backward extension (ad-start → earlier blackframe) ---
-        ss2 = max(0, start - START_SCAN - 1.0)
+        # ffmpeg fast-seek (-ss BEFORE -i) drops blackdetect output
+        # for the first ~6 s after the seek-point — filter warm-up.
+        # Pre-roll 12 s before our window so any blackframe at the
+        # very start of the actual window survives. Blackframes still
+        # filtered to [start - START_SCAN, start - 1].
+        WARMUP = 12.0
+        ss2 = max(0, start - START_SCAN - WARMUP)
         new_start = start
         blacks_before = []
         try:
             proc = subprocess.run(
                 ["ffmpeg", "-hide_banner", "-nostats",
                  "-ss", str(ss2), "-i", str(video_path),
-                 "-t", str(START_SCAN + 2),
+                 "-t", str(START_SCAN + WARMUP + 2),
                  "-vf", "blackdetect=d=0.04:pix_th=0.30:pic_th=0.80",
                  "-an", "-f", "null", "-"],
-                capture_output=True, text=True, timeout=20)
+                capture_output=True, text=True, timeout=25)
             for line in proc.stderr.splitlines():
                 if "blackdetect" in line and "black_start:" in line:
                     try:
