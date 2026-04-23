@@ -66,14 +66,36 @@ subtitles=1
 # so per-channel values are PREPENDED to the base ini (not appended).
 # Add entries here when a channel needs a tighter threshold, a
 # different logo position, etc.
+# Per-channel logo position constraints. Comskip only knows three
+# logo-position flags (comskip.c:798-800):
+#   subtitles=1       → search top half only
+#   logo_at_bottom=1  → search bottom half only
+#   logo_at_side=1    → search right half only
+# There's no _at_top / _at_left / _at_right, so:
+#   top-left   logos → subtitles=1 only (global default; no x flag possible)
+#   top-right  logos → subtitles=1 + logo_at_side=1   = TR quadrant
+#   bottom-... logos → subtitles=0 + logo_at_bottom=1 (+ logo_at_side
+#                      for BR) — must override the global subtitles=1
 COMSKIP_INI_PER_CHANNEL = {
-    # rtlzwei: soft logo fade makes even 0.60 occasionally late.
-    # aggressive_logo_rejection=1 catches logo-loss faster at slight
-    # false-positive cost.
+    # rtlzwei: bottom-right logo. Override global top-half restriction.
+    # Soft logo fade also makes even 0.60 occasionally late — tighter
+    # threshold + aggressive_logo_rejection to catch logo-loss faster.
     "rtlzwei": {
+        "subtitles": "0",
+        "logo_at_bottom": "1",
+        "logo_at_side": "1",
         "logo_threshold": "0.50",
         "aggressive_logo_rejection": "1",
     },
+    # Top-right corner — combined with global subtitles=1 → top-right
+    # quadrant only. ~2× faster logo learning, fewer false positives
+    # from left-side promo bugs / DOG watermarks.
+    "prosieben":  {"logo_at_side": "1"},
+    "kabel-eins": {"logo_at_side": "1"},
+    "sixx":       {"logo_at_side": "1"},
+    # Top-left corner (vox, rtl, kika-hd, toggo-plus, nitro) gets the
+    # global subtitles=1 only — comskip has no logo_at_left flag, so
+    # no per-channel entry needed.
 }
 
 
