@@ -40,6 +40,11 @@ from pathlib import Path
 
 HLS_DIR         = Path.home() / "mnt" / "pi-tv" / "hls"
 COMSKIP         = Path.home() / "src" / "Comskip" / "comskip"
+# launchd starts agents with an empty PATH, so bare "ffmpeg" raises
+# FileNotFoundError when subprocess.run looks it up. Resolve once at
+# import via the parent shell's PATH (or the Homebrew default), then
+# pass an absolute path to every subprocess call.
+FFMPEG          = shutil.which("ffmpeg") or "/opt/homebrew/bin/ffmpeg"
 WORK_DIR        = Path("/tmp/tv-live-scan")
 LIVE_ADS_FILE   = HLS_DIR / ".live_ads.json"
 CADDY_BASE      = "https://raspberrypi5lan:8443"
@@ -253,7 +258,7 @@ def blackframe_extend_ads(video_path, ads, channel_slug=None,
         blacks_after = []
         try:
             proc = subprocess.run(
-                ["ffmpeg", "-hide_banner", "-nostats",
+                [FFMPEG, "-hide_banner", "-nostats",
                  "-ss", str(ss), "-i", str(video_path),
                  "-t", str(scan_window + 2),
                  "-vf", "blackdetect=d=0.04:pix_th=0.30:pic_th=0.80",
@@ -290,7 +295,7 @@ def blackframe_extend_ads(video_path, ads, channel_slug=None,
         blacks_before = []
         try:
             proc = subprocess.run(
-                ["ffmpeg", "-hide_banner", "-nostats",
+                [FFMPEG, "-hide_banner", "-nostats",
                  "-ss", str(ss2), "-i", str(video_path),
                  "-t", str(START_SCAN + WARMUP + 2),
                  "-vf", "blackdetect=d=0.04:pix_th=0.30:pic_th=0.80",
