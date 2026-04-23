@@ -5144,6 +5144,10 @@ def recordings_page():
                            f'★ {meta["rating"]}</span>'
                            if meta.get("rating") else '')
             title_cell = poster_html + title_cell + rating_html
+        del_btn = (f'<a class="del-btn" href="{HOST_URL}/recording/{uuid}/delete" '
+                   f'data-title="{title.replace(chr(34),"&quot;")}" '
+                   f'data-when="{when}">🗑</a>')
+        tools_cell = f'<td class="row-tools">{watch_cell}{del_btn}</td>'
         if in_series:
             # Inside a series group the title is redundant (already in
             # the purple group header). Drop the column to free up
@@ -5153,20 +5157,14 @@ def recordings_page():
                     f'<td>{dur_min} min</td>'
                     f'<td>{size_str}</td>'
                     f'<td>{prewarm}</td>'
-                    f'<td>{watch_cell}</td>'
-                    f'<td><a class="del-btn" href="{HOST_URL}/recording/{uuid}/delete" '
-                    f'data-title="{title.replace(chr(34),"&quot;")}" '
-                    f'data-when="{when}">🗑</a></td></tr>')
+                    f'{tools_cell}</tr>')
         return (f'<tr><td>{badge}</td>'
                 f'<td>{title_cell}</td>'
                 f'<td>{when}</td>'
                 f'<td>{dur_min} min</td>'
                 f'<td>{size_str}</td>'
                 f'<td>{prewarm}</td>'
-                f'<td>{watch_cell}</td>'
-                f'<td><a class="del-btn" href="{HOST_URL}/recording/{uuid}/delete" '
-                f'data-title="{title.replace(chr(34),"&quot;")}" '
-                f'data-when="{when}">🗑</a></td></tr>')
+                f'{tools_cell}</tr>')
 
     rows = []
     # Solo recordings (no autorec) — render flat.
@@ -5210,7 +5208,7 @@ def recordings_page():
         rating_html = (f' <span class="rec-rating" title="TVmaze rating">'
                        f'★ {meta["rating"]}</span>'
                        if meta.get("rating") else '')
-        summary = (f'<tr class="series-head"><td colspan="8">'
+        summary = (f'<tr class="series-head"><td colspan="7">'
                    f'<details data-ar="{ar_uuid}"{open_attr}>'
                    f'<summary>{poster_html}{badge}'
                    f'<span class="series-title">{group_title}'
@@ -5273,7 +5271,8 @@ def recordings_page():
             f'<td>{dur_min} min</td>'
             f'<td>—</td>'
             f'<td>{avail_cell}</td>'
-            f'<td><a class="del-btn" href="{HOST_URL}/mediathek-rec/{vuuid}/delete" '
+            f'<td class="row-tools">'
+            f'<a class="del-btn" href="{HOST_URL}/mediathek-rec/{vuuid}/delete" '
             f'data-title="{mt_title.replace(chr(34),"&quot;")}" '
             f'data-mt="1">🗑</a></td></tr>')
 
@@ -5334,6 +5333,8 @@ def recordings_page():
             f".rec-rating{{display:inline-block;background:#f39c12;color:#000;"
             f"padding:1px 6px;border-radius:3px;font-size:.8em;font-weight:600;"
             f"margin-left:6px;vertical-align:middle;flex-shrink:0}}"
+            f".row-tools{{text-align:right;white-space:nowrap;width:1%}}"
+            f".row-tools .watch-btn{{margin-right:6px}}"
             f".badge.series{{background:#8e44ad;color:#fff;flex-shrink:0}}"
             f".badge.mediathek{{background:#2980b9;color:#fff}}"
             f".badge.mediathek.local{{background:#27ae60}}"
@@ -5357,7 +5358,7 @@ def recordings_page():
             f"</div>"
             f"<div class='rec-body'>"
             f"<table>"
-            f"{''.join(rows) if rows else '<tr><td colspan=8>Keine Aufnahmen</td></tr>'}"
+            f"{''.join(rows) if rows else '<tr><td colspan=7>Keine Aufnahmen</td></tr>'}"
             f"</table>"
             f"</div>"
             f"<script>"
