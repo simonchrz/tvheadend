@@ -721,6 +721,17 @@ def analyze(slug, state, window_end_seg=None, window_size=WINDOW_SIZE):
         new_s = ls if sm else (ss if ssi else bs)
         new_e = le if em else (se if esi else be)
         ads_sec.append([new_s, new_e])
+    # Quality stats for the per-channel health dashboard. Counts how
+    # often each evidence source had to step in — heavy reliance on
+    # blackframe/silence fallbacks (vs logo) suggests the cached logo
+    # template is degrading or the channel changed branding.
+    logo_shifts = sum(1 for sm, em in moved if sm) \
+                  + sum(1 for sm, em in moved if em)
+    silence_shifts = sum(1 for ssi, esi in moved_si if ssi) \
+                     + sum(1 for ssi, esi in moved_si if esi)
+    bf_shifts = sum(1 for (rs, re_), (bs, be) in zip(ads_raw, ads_bf)
+                    if abs(rs - bs) > 0.05 or abs(re_ - be) > 0.05)
+    tail_extended = False
     # If the last block runs through the end of the scan window, comskip
     # can't see where it actually ends — neither logo-refine nor
     # blackframe-extend can extend past the available frames. Without
@@ -735,6 +746,7 @@ def analyze(slug, state, window_end_seg=None, window_size=WINDOW_SIZE):
         last_start, last_end = ads_sec[-1]
         if win_end_sec - last_end < 1.0:
             ads_sec[-1] = [last_start, last_end + 600.0]
+            tail_extended = True
     # Refresh the cached logo template if comskip wrote a fresh one and
     # the scan looked successful (≥2 ad blocks ≈ logo learning worked).
     # Avoids poisoning the cache from a degenerate scan with no ads.
@@ -764,8 +776,38 @@ def analyze(slug, state, window_end_seg=None, window_size=WINDOW_SIZE):
                 and a[1] > buffer_cutoff]
     merged_ads = sorted(retained + ads_wall)
 
+    # Quality score 0-100. 100 = clean detection. Penalties:
+    #   -25 if no ads found in init/init-deep scan with > 25-min window
+    #         (KiKa runs ad-free so don't penalise short scans)
+    #   -15 if last block was tail-extended (open block, won't trust end)
+    #   -10 if logo-refine moved 0 boundaries but blackframe/silence
+    #         had to (= cached logo template likely broken)
+    #   -2 per very short block (< 30s) — likely a false positive
+    durations = [b - a for a, b in ads_sec]
+    very_short = sum(1 for d in durations if d < 30)
+    score = 100
+    if scan_mode in ("init", "init-deep") and len(window) >= 1500 \
+            and not ads_sec:
+        score -= 25
+    if tail_extended:
+        score -= 15
+    if logo_shifts == 0 and (bf_shifts + silence_shifts) > 0:
+        score -= 10
+    score -= 2 * very_short
+    score = max(0, min(100, score))
+    quality = {
+        "score": score,
+        "scan_mode": scan_mode,
+        "scan_dur_s": round(scan_dt, 1),
+        "ads_in_scan": len(ads_sec),
+        "logo_shifts": logo_shifts,
+        "silence_shifts": silence_shifts,
+        "bf_shifts": bf_shifts,
+        "tail_extended": tail_extended,
+        "very_short_blocks": very_short,
+    }
     state[slug] = {"generated": time.time(), "ads": merged_ads,
-                   "latest_seg": latest_name}
+                   "latest_seg": latest_name, "quality": quality}
     save_live_ads(state)
     log(f"[{slug}] {scan_mode} {len(window)} segs | "
         f"{len(ads_wall)} new, {len(retained)} retained, "

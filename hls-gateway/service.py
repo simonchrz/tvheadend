@@ -8099,11 +8099,14 @@ def api_health():
             d = json.loads(LIVE_ADS_FILE.read_text())
             for slug, v in d.items():
                 gen = v.get("generated", 0)
+                q = v.get("quality") or {}
                 chans.append({
                     "slug": slug,
                     "ad_count": len(v.get("ads", [])),
                     "scan_age_s": int(now - gen) if gen else None,
                     "latest_seg": v.get("latest_seg"),
+                    "quality_score": q.get("score"),
+                    "quality": q,
                 })
     except Exception:
         pass
@@ -8217,11 +8220,25 @@ async function load(){
   cells.push(card('Recordings',d.recs_completed+' fertig, '+d.recs_watched+' gesehen, '+d.recs_scheduled+' geplant'));
   cells.push(card('Warm streams',(d.warm.length?d.warm.join(', '):'—')));
   let html='<div class="grid">'+cells.join('')+'</div>';
-  html+='<h2>Channel Scanner</h2><table><tr><th>Channel</th><th>Letzter Scan</th><th>Ad-Blöcke</th><th>Latest Seg</th></tr>';
+  html+='<h2>Channel Scanner</h2><table><tr><th>Channel</th><th>Letzter Scan</th><th>Ad-Blöcke</th><th>Quality</th><th>Letzter Lauf</th></tr>';
   for(const c of d.channels){
     const age=c.scan_age_s;
     const cls=age==null?'err':age<900?'ok':age<1800?'warn':'err';
-    html+='<tr><td>'+c.slug+'</td><td class="'+cls+'">'+fmtAge(age)+'</td><td>'+c.ad_count+'</td><td>'+(c.latest_seg||'—')+'</td></tr>';
+    const q=c.quality||{};
+    const sc=c.quality_score;
+    const qcls=sc==null?'':sc>=80?'ok':sc>=50?'warn':'err';
+    const qcell=sc==null?'—':sc+' '
+      +'<small style="color:var(--muted);font-size:.8em">('
+      +'L'+q.logo_shifts+' B'+q.bf_shifts+' S'+q.silence_shifts
+      +(q.tail_extended?' ⏵':'')
+      +(q.very_short_blocks>0?' ⚠'+q.very_short_blocks:'')
+      +')</small>';
+    const det=q.scan_mode?(q.scan_mode+' · '+q.ads_in_scan+' ads · '+q.scan_dur_s+'s'):'—';
+    html+='<tr><td>'+c.slug+'</td>'
+      +'<td class="'+cls+'">'+fmtAge(age)+'</td>'
+      +'<td>'+c.ad_count+'</td>'
+      +'<td class="'+qcls+'">'+qcell+'</td>'
+      +'<td><small style="color:var(--muted)">'+det+'</small></td></tr>';
   }
   html+='</table>';
   document.getElementById('root').innerHTML=html;
