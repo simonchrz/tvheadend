@@ -5038,7 +5038,7 @@ def recordings_page():
         ar = e.get("autorec") or ""
         by_autorec.setdefault(ar, []).append(e)
 
-    def _render_row(e):
+    def _render_row(e, in_series=False):
         uuid = e.get("uuid", "")
         title = e.get("disp_title", "?")
         start = e.get("start", 0)
@@ -5129,18 +5129,21 @@ def recordings_page():
             f'title="Als {"un" if watched else ""}gesehen markieren">'
             f'{"✓" if watched else "○"}</a>'
         )
-        # TVmaze enrichment: small poster + rating badge inline.
-        # Lookup is by show title (episode-suffix stripped) so
-        # different episodes of one series share the same poster.
-        with _epg_meta_lock:
-            meta = _epg_meta.get(_normalize_title(title)) or {}
-        poster_html = (f'<img class="rec-poster" src="{meta["poster"]}" '
-                       f'alt="" loading="lazy">'
-                       if meta.get("poster") else '')
-        rating_html = (f' <span class="rec-rating" title="TVmaze rating">'
-                       f'★ {meta["rating"]}</span>'
-                       if meta.get("rating") else '')
-        title_cell = poster_html + title_cell + rating_html
+        # TVmaze enrichment: poster + rating attached to the series-
+        # head row (rendered separately below). Skip on individual
+        # episode rows inside a series — duplicating the same poster
+        # 5× per series turns the table into visual mush. Solo
+        # recordings (no autorec) keep them inline.
+        if not in_series:
+            with _epg_meta_lock:
+                meta = _epg_meta.get(_normalize_title(title)) or {}
+            poster_html = (f'<img class="rec-poster" src="{meta["poster"]}" '
+                           f'alt="" loading="lazy">'
+                           if meta.get("poster") else '')
+            rating_html = (f' <span class="rec-rating" title="TVmaze rating">'
+                           f'★ {meta["rating"]}</span>'
+                           if meta.get("rating") else '')
+            title_cell = poster_html + title_cell + rating_html
         return (f'<tr><td>{badge}</td>'
                 f'<td>{title_cell}</td>'
                 f'<td>{when}</td>'
@@ -5185,12 +5188,21 @@ def recordings_page():
             e.get("uuid") in _rec_hls_procs or e.get("uuid") in _rec_cskip_procs
             for e in eps)
         open_attr = " open" if any_active else ""
-        summary = (f'<tr class="series-head"><td colspan="7">'
+        with _epg_meta_lock:
+            meta = _epg_meta.get(_normalize_title(group_title)) or {}
+        poster_html = (f'<img class="rec-poster" src="{meta["poster"]}" '
+                       f'alt="" loading="lazy">'
+                       if meta.get("poster") else '')
+        rating_html = (f' <span class="rec-rating" title="TVmaze rating">'
+                       f'★ {meta["rating"]}</span>'
+                       if meta.get("rating") else '')
+        summary = (f'<tr class="series-head"><td colspan="8">'
                    f'<details data-ar="{ar_uuid}"{open_attr}>'
-                   f'<summary>{badge} {group_title} '
+                   f'<summary>{poster_html}{badge} {group_title}'
+                   f'{rating_html} '
                    f'<small>({len(eps)} Einträge)</small>{kill_btn}</summary>'
                    f'<table class="series-sub"><tbody>'
-                   + "".join(_render_row(e) for e in sorted(
+                   + "".join(_render_row(e, in_series=True) for e in sorted(
                        eps, key=lambda x: x.get("start", 0)))
                    + '</tbody></table></details></td></tr>')
         rows.append(summary)
