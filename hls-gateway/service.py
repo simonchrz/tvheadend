@@ -4657,13 +4657,16 @@ def record_series(event_id):
     # same channel doesn't get picked up alongside the prime-time
     # original. tvheadend autorec uses HH:MM strings and treats
     # start_window as the upper bound of the acceptable start time
-    # (not a duration). 15-min slack covers EPG drift / programme
-    # overrun on the channel before this slot.
+    # (not a duration). Bracket the seed by -5/+15 min — drift seen
+    # on kabel eins is typically forward (slot fills with promos) but
+    # can be backward by 1-2 min if a preceding programme finishes
+    # early. 20-min total window stays well clear of any rerun slot.
     seed_start = entry.get("start")
     if seed_start:
         lt = time.localtime(seed_start)
-        start_min = lt.tm_hour * 60 + lt.tm_min
-        end_min = (start_min + 15) % (24 * 60)
+        seed_min = lt.tm_hour * 60 + lt.tm_min
+        start_min = (seed_min - 5) % (24 * 60)
+        end_min = (seed_min + 15) % (24 * 60)
         conf["start"] = f"{start_min // 60:02d}:{start_min % 60:02d}"
         conf["start_window"] = f"{end_min // 60:02d}:{end_min % 60:02d}"
     body = urllib.parse.urlencode({"conf": json.dumps(conf)}).encode()
