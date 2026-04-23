@@ -3580,10 +3580,10 @@ let pauseState=null;
 function togglePlay(){{
   if(pauseState){{
     const ps=pauseState;pauseState=null;
-    if(ps.pausedMediathekUrl){{
-      switchToMediathek(ps.pausedMediathekUrl,ps.pausedWall);
-    }} else if(ps.pausedHlsLive){{
-      /* hls.js keeps playlist position across pause — just resume. */
+    if(ps.pausedHlsJs){{
+      /* hls.js (Mediathek or live DVB-C via hls.js) — restart loading
+         and resume; the existing buffer + last frame stay visible. */
+      try{{if(hlsInst)hlsInst.startLoad();}}catch(e){{}}
       v.play().catch(()=>{{}});
     }} else {{
       v.src=ps.pausedSrc;v.load();
@@ -3604,26 +3604,24 @@ function togglePlay(){{
     pp.textContent='\u23F8';
     return;
   }}
-  /* Three pause flavours:
-     - Mediathek (hls.js, non-live): destroy hls.js, resume rebuilds it.
-     - DVB-C via hls.js (Chrome/Firefox): regular v.pause() keeps position.
-     - DVB-C via native HLS (iOS Safari): pause() is ignored on live HLS,
-       so we strip v.src and seek back via wall-time on resume. */
-  const usingHlsLive=!!(hlsInst&&!onMediathek);
+  /* Two pause flavours:
+     - hls.js (Mediathek + DVB-C via hls.js): v.pause() + stopLoad
+       to halt new segments. Keeps the last decoded frame on screen.
+       Destroying hls.js or stripping v.src here used to blank the
+       <video> element on Safari + Chrome.
+     - Native HLS (iOS Safari live): pause() is ignored on live HLS,
+       so strip v.src and seek back via wall-time on resume. */
+  const usingHlsJs=!!hlsInst;
   pauseState={{
-    pausedSrc:(onMediathek||usingHlsLive)?null:v.src,
-    pausedMediathekUrl:onMediathek?hlsCurrentUrl:null,
-    pausedHlsLive:usingHlsLive,
+    pausedSrc:usingHlsJs?null:v.src,
+    pausedHlsJs:usingHlsJs,
     pausedWall:wallAt(v.currentTime),
     pausedCurrent:v.currentTime
   }};
   v.pause();
-  if(onMediathek&&hlsInst){{
-    try{{hlsInst.destroy();}}catch(e){{}}
-    hlsInst=null;hlsCurrentUrl=null;
-    v.removeAttribute('src');
-    v.load();
-  }} else if(!usingHlsLive){{
+  if(usingHlsJs){{
+    try{{hlsInst.stopLoad();}}catch(e){{}}
+  }} else {{
     v.removeAttribute('src');
     v.load();
   }}
