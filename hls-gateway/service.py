@@ -289,7 +289,7 @@ ul.channels li:has(.buffer-bar.running) {
 .now-title:empty { display: none; }
 ul.channels .logo {
     display: flex; align-items: center; justify-content: center;
-    background: var(--logo-bg); border-radius: 6px; overflow: hidden;
+    overflow: hidden;
 }
 ul.channels .logo img { max-width: 100%; max-height: 100%; }
 
