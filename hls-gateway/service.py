@@ -5051,6 +5051,13 @@ def recordings_page():
         when = time.strftime("%d.%m %H:%M", time.localtime(start))
         dur_min = max(0, (stop - start) // 60)
         play_url = f"{HOST_URL}/recording/{uuid}"
+        ch_icon = e.get("channel_icon") or ""
+        ch_name = (e.get("channelname") or "").replace('"', "&quot;")
+        ch_logo_html = (
+            f'<img class="ch-logo" src="{HOST_URL}/{ch_icon}" '
+            f'alt="{ch_name}" title="{ch_name}" loading="lazy">'
+            if ch_icon else ''
+        )
         if is_live or is_done:
             title_cell = f'<a href="{play_url}">{title}</a>'
         else:
@@ -5151,7 +5158,7 @@ def recordings_page():
             rating_html = (f' <span class="rec-rating" title="TVmaze rating">'
                            f'★ {meta["rating"]}</span>'
                            if meta.get("rating") else '')
-            title_cell = poster_html + title_cell + rating_html
+            title_cell = ch_logo_html + poster_html + title_cell + rating_html
         del_btn = (f'<a class="del-btn" href="{HOST_URL}/recording/{uuid}/delete" '
                    f'data-title="{title.replace(chr(34),"&quot;")}" '
                    f'data-when="{when}">🗑</a>')
@@ -5212,9 +5219,19 @@ def recordings_page():
         rating_html = (f' <span class="rec-rating" title="TVmaze rating">'
                        f'★ {meta["rating"]}</span>'
                        if meta.get("rating") else '')
+        # Channel logo from the first episode (autorec is channel-locked
+        # so all episodes share it).
+        first_ep = eps[0] if eps else {}
+        ep_ch_icon = first_ep.get("channel_icon") or ""
+        ep_ch_name = (first_ep.get("channelname") or "").replace('"', "&quot;")
+        ch_logo_html = (
+            f'<img class="ch-logo" src="{HOST_URL}/{ep_ch_icon}" '
+            f'alt="{ep_ch_name}" title="{ep_ch_name}" loading="lazy">'
+            if ep_ch_icon else ''
+        )
         summary = (f'<tr class="series-head"><td colspan="5">'
                    f'<details data-ar="{ar_uuid}"{open_attr}>'
-                   f'<summary>{poster_html}{badge}'
+                   f'<summary>{ch_logo_html}{poster_html}{badge}'
                    f'<span class="series-title">{group_title}'
                    f' <small>({len(eps)})</small></span>'
                    f'{rating_html}{kill_btn}</summary>'
@@ -5334,6 +5351,9 @@ def recordings_page():
             f".rec-poster{{width:24px;height:34px;object-fit:cover;border-radius:3px;"
             f"vertical-align:middle;margin-right:6px;background:var(--stripe);"
             f"flex-shrink:0}}"
+            f".ch-logo{{width:22px;height:22px;object-fit:contain;border-radius:3px;"
+            f"vertical-align:middle;margin-right:6px;background:#fff;"
+            f"padding:1px;flex-shrink:0}}"
             f".rec-rating{{display:inline-block;background:#f39c12;color:#000;"
             f"padding:1px 6px;border-radius:3px;font-size:.8em;font-weight:600;"
             f"margin-left:6px;vertical-align:middle;flex-shrink:0}}"
