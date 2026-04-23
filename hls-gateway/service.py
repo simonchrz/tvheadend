@@ -2460,6 +2460,12 @@ let _lastTapT=0,_lastTapX=0,_singleTapT=null,_lastTouchT=0;
 v.addEventListener('touchend',e=>{
   if(!e.changedTouches[0])return;
   _lastTouchT=Date.now();
+  /* Autoplay-muted recovery: first tap only unmutes, doesn't also
+     pause via togglePlay. Once audible, subsequent taps work
+     normally. */
+  if(v.muted&&!v.paused){
+    v.muted=false;show();return;
+  }
   const now=_lastTouchT;
   const x=e.changedTouches[0].clientX;
   if(now-_lastTapT<300&&Math.abs(x-_lastTapX)<60){
@@ -2486,6 +2492,7 @@ v.addEventListener('touchend',e=>{
    touchend on mobile. */
 v.addEventListener('click',()=>{
   if(Date.now()-_lastTouchT<500)return;
+  if(v.muted&&!v.paused){v.muted=false;show();return;}
   togglePlay();show();
 });
 /* --- Volume + mute control (persisted to localStorage) --------- */
@@ -7419,18 +7426,6 @@ def play_recording(uuid):
             f"  }};"
             f"  setTimeout(tryRestore,400);"
             f"}},{{once:true}});"
-            # Recording player autoplays muted (Safari/Chrome require
-            # muted for cross-page-load autoplay). First user gesture
-            # anywhere on the page unmutes — they came here to watch,
-            # so the silent first frame is just bridging the gap.
-            f"function _firstGestureUnmute(){{"
-            f"  v.muted=false;"
-            f"  document.removeEventListener('touchstart',_firstGestureUnmute);"
-            f"  document.removeEventListener('click',_firstGestureUnmute);"
-            f"}}"
-            f"document.addEventListener('touchstart',_firstGestureUnmute,"
-            f"  {{once:true,passive:true}});"
-            f"document.addEventListener('click',_firstGestureUnmute,{{once:true}});"
             f"let srcSet=false;"
             f"function tick(){{"
             f"  fetch('{HOST_URL}/recording/{uuid}/progress').then(r=>r.json())"
