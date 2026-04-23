@@ -2537,14 +2537,10 @@ body{{touch-action:pan-y}}
 #avail{{position:absolute;top:0;bottom:0;background:#fff4;
   border-radius:2px;width:0;left:0}}
 .chapter{{position:absolute;top:50%;transform:translate(-50%,-50%);
-  width:32px;height:40px;background:transparent;border:0;padding:0;
-  z-index:1;cursor:pointer}}
-.chapter::after{{content:'';position:absolute;left:50%;top:50%;
-  transform:translate(-50%,-50%);width:6px;height:16px;background:#fff;
-  border-radius:2px;opacity:.85;box-shadow:0 0 2px #000a;
+  width:6px;height:16px;background:#fff;border-radius:2px;
+  opacity:.85;box-shadow:0 0 2px #000a;z-index:1;
   pointer-events:none}}
-.chapter.current::after{{background:#ffd84d;height:18px}}
-.chapter:active::after{{opacity:.5}}
+.chapter.current{{background:#ffd84d;height:18px}}
 #skipad{{background:#e74c3c;color:#fff;padding:7px 12px;border:0;
   border-radius:16px;font-weight:600;font-size:.85em;cursor:pointer;
   display:none;flex:0 0 auto}}
@@ -2989,24 +2985,32 @@ function renderChapters(){{
     if(!isReachable(ev))continue;
     const pct=posForWall(ev.start);
     if(pct===null)continue;
-    const el=document.createElement('button');
+    const el=document.createElement('div');
     el.className='chapter';
-    el.type='button';
+    el.dataset.start=ev.start;
     if(ev.start<=nowWall&&nowWall<ev.stop)el.classList.add('current');
     el.style.left=pct+'%';
     const ts=new Date(ev.start*1000).toLocaleTimeString('de-DE',{{hour:'2-digit',minute:'2-digit'}});
     el.title=ev.title+' ('+ts+')';
-    el.addEventListener('touchstart',e=>e.stopPropagation(),{{passive:true}});
-    el.addEventListener('mousedown',e=>e.stopPropagation());
-    el.addEventListener('click',e=>{{
-      e.stopPropagation();e.preventDefault();
-      hint.textContent=ts+' · '+ev.title;
-      hint.classList.add('show');
-      setTimeout(()=>hint.classList.remove('show'),1200);
-      jumpToEvent(ev);
-    }});
     scrub.appendChild(el);
   }}
+}}
+/* Tap-routing: chapter ticks are visual-only (pointer-events:none).
+   On a tap, find the nearest chapter within CHAPTER_TAP_PX of the
+   pointer; if one's close enough, jump to that EPG event instead of
+   raw scrub seek. Solves the overlap problem on narrow mobile bars
+   where adjacent ticks would otherwise compete for the same hit
+   area — closest-to-pointer always wins, no DOM-order ambiguity. */
+const CHAPTER_TAP_PX=22;
+function nearestChapter(clientX){{
+  let best=null,bestDist=CHAPTER_TAP_PX;
+  document.querySelectorAll('.chapter').forEach(el=>{{
+    const r=el.getBoundingClientRect();
+    const cx=r.left+r.width/2;
+    const d=Math.abs(cx-clientX);
+    if(d<bestDist){{bestDist=d;best=el;}}
+  }});
+  return best;
 }}
 function loadMediathekAvail(slug){{
   return fetch(HOST+'/api/mediathek-live/'+slug).then(r=>r.json()).then(d=>{{
@@ -3023,7 +3027,7 @@ function loadMediathekAvail(slug){{
    KiKa has unusually long branding/trailer pre-rolls (~1:50) before
    each show — use a negative lead-in to skip past them. */
 function eventLeadIn(slug){{
-  if(slug==='kika-hd')return -100;
+  if(slug==='kika-hd')return 0;  /* land exactly at the EPG slot — user can scrub through KiKa's branding pre-roll */
   return slug.startsWith('zdf')||slug==='3sat-hd'?5:15;
 }}
 /* Per-channel offset added to the authoritative broadcast start. ZDFs
@@ -3502,7 +3506,25 @@ function seek(d){{
 }}
 function seekTo(ev){{
   const r=scrub.getBoundingClientRect();
-  const x=(ev.touches?ev.touches[0]:ev).clientX-r.left;
+  const clientX=(ev.touches?ev.touches[0]:ev).clientX;
+  /* Chapter-tap routing: if the pointer is within CHAPTER_TAP_PX of
+     a tick, treat the seek as a chapter jump instead of raw seek.
+     Picks the nearest chapter — eliminates DOM-order ambiguity when
+     two adjacent ticks would overlap on a narrow scrub bar. */
+  const ch=nearestChapter(clientX);
+  if(ch){{
+    const startTs=parseFloat(ch.dataset.start);
+    const evt=epgEvents.find(e=>Math.abs(e.start-startTs)<0.5);
+    if(evt){{
+      const ts=new Date(evt.start*1000).toLocaleTimeString('de-DE',{{hour:'2-digit',minute:'2-digit'}});
+      hint.textContent=ts+' · '+evt.title;
+      hint.classList.add('show');
+      setTimeout(()=>hint.classList.remove('show'),1200);
+      jumpToEvent(evt);
+      return;
+    }}
+  }}
+  const x=clientX-r.left;
   const p=Math.max(0,Math.min(1,x/r.width));
   const[ws,we]=scrubWindow();
   const targetWall=ws+p*(we-ws);
