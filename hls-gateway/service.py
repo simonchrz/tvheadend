@@ -5121,14 +5121,23 @@ def recordings_page():
                             'title="Mac comskip analysiert Werbeblöcke">🔍 Mac</span>')
         else:
             prewarm = ""
+        # Watched-button only makes sense for completed recordings —
+        # marking a scheduled (not-yet-recorded) episode as "watched"
+        # is nonsensical and the green-check next to a "—" size cell
+        # confused users who didn't know what it referred to.
         watched = (e.get("playcount") or 0) > 0
-        watch_cell = (
-            f'<a class="watch-btn{" on" if watched else ""}" '
-            f'href="#" data-uuid="{uuid}" '
-            f'data-watched="{1 if watched else 0}" '
-            f'title="Als {"un" if watched else ""}gesehen markieren">'
-            f'{"✓" if watched else "○"}</a>'
-        )
+        if is_done:
+            watch_cell = (
+                f'<a class="watch-btn{" on" if watched else ""}" '
+                f'href="#" data-uuid="{uuid}" '
+                f'data-watched="{1 if watched else 0}" '
+                f'title="Als {"un" if watched else ""}gesehen markieren '
+                f'(wird {WATCHED_AUTO_DELETE_DAYS} d nach Markierung '
+                f'auto-gelöscht)">'
+                f'{"✓" if watched else "○"}</a>'
+            )
+        else:
+            watch_cell = ''
         # TVmaze enrichment: poster + rating attached to the series-
         # head row (rendered separately below). Skip on individual
         # episode rows inside a series — duplicating the same poster
