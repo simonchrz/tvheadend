@@ -8081,6 +8081,114 @@ def _hb_age(filename):
         return None
 
 
+def _compute_feedback_stats():
+    """Walk every _rec_<uuid>/ads_user.json, diff against ads.json,
+    aggregate per channel-slug. Returns {slug: {n, mean_dstart,
+    mean_dend, added, deleted, sample_uuids[:3]}}.
+
+    Δstart = user_start - auto_start (negative → user pulled start
+    earlier, suggesting comskip detects the slot too late).
+    Δend   = user_end - auto_end (positive → user extended ad past
+    comskip's call, suggesting sponsor-card padding).
+
+    Match: each user block paired with the auto block it overlaps
+    most. Unpaired user blocks count as 'added' (comskip missed),
+    unpaired auto blocks as 'deleted' (comskip false positive)."""
+    stats = {}
+    if not HLS_DIR.exists():
+        return stats
+    for d in HLS_DIR.glob("_rec_*"):
+        uuid = d.name[5:]
+        user_p = d / "ads_user.json"
+        auto_p = d / "ads.json"
+        if not user_p.is_file():
+            continue
+        try:
+            user_ads = json.loads(user_p.read_text())
+            auto_ads = json.loads(auto_p.read_text()) if auto_p.is_file() else []
+        except Exception:
+            continue
+        slug = _rec_channel_slug(uuid) or "?"
+        s = stats.setdefault(slug, {
+            "n": 0, "dstart_sum": 0.0, "dend_sum": 0.0, "matched": 0,
+            "added": 0, "deleted": 0, "sample_uuids": [],
+        })
+        s["n"] += 1
+        if len(s["sample_uuids"]) < 3:
+            s["sample_uuids"].append(uuid)
+        # Pair user blocks with their best-overlapping auto block.
+        used = set()
+        for us, ue in user_ads:
+            best = None; best_overlap = 0.0
+            for i, (as_, ae) in enumerate(auto_ads):
+                if i in used:
+                    continue
+                ov = max(0.0, min(ue, ae) - max(us, as_))
+                if ov > best_overlap:
+                    best_overlap = ov; best = i
+            if best is not None and best_overlap > 5.0:
+                used.add(best)
+                as_, ae = auto_ads[best]
+                s["dstart_sum"] += us - as_
+                s["dend_sum"] += ue - ae
+                s["matched"] += 1
+            else:
+                s["added"] += 1
+        for i in range(len(auto_ads)):
+            if i not in used:
+                s["deleted"] += 1
+    # Finalise: compute means + suggestions.
+    out = {}
+    for slug, s in stats.items():
+        if s["matched"] > 0:
+            mean_ds = s["dstart_sum"] / s["matched"]
+            mean_de = s["dend_sum"] / s["matched"]
+        else:
+            mean_ds = mean_de = 0.0
+        suggestions = []
+        if s["matched"] >= 3 and mean_ds <= -8:
+            suggestions.append(
+                f"START_LAG_FALLBACK[{slug!r}] = {abs(mean_ds):.0f}")
+        if s["matched"] >= 3 and mean_de >= 8:
+            suggestions.append(
+                f"SPONSOR_DURATION_BY_CHANNEL[{slug!r}] += {mean_de:.0f}")
+        if s["n"] >= 3:
+            if s["added"] > s["deleted"] * 2:
+                suggestions.append("comskip too strict — lower logo_threshold")
+            elif s["deleted"] > s["added"] * 2:
+                suggestions.append("comskip too lax — raise logo_threshold")
+        out[slug] = {
+            "n": s["n"],
+            "matched": s["matched"],
+            "mean_dstart_s": round(mean_ds, 1),
+            "mean_dend_s": round(mean_de, 1),
+            "added": s["added"],
+            "deleted": s["deleted"],
+            "suggestions": suggestions,
+            "sample_uuids": s["sample_uuids"],
+        }
+    return out
+
+
+_feedback_cache = {"data": None, "computed_at": 0}
+_feedback_lock = threading.Lock()
+
+
+def _get_feedback_stats(max_age_s=300):
+    """Cached wrapper — recompute at most every 5 min."""
+    with _feedback_lock:
+        if _feedback_cache["data"] is None \
+                or time.time() - _feedback_cache["computed_at"] > max_age_s:
+            try:
+                _feedback_cache["data"] = _compute_feedback_stats()
+                _feedback_cache["computed_at"] = time.time()
+            except Exception as e:
+                print(f"[feedback-stats] {e}", flush=True)
+                if _feedback_cache["data"] is None:
+                    _feedback_cache["data"] = {}
+        return _feedback_cache["data"]
+
+
 @app.route("/api/health")
 def api_health():
     """Aggregate health snapshot for the dashboard. Reads heartbeats
@@ -8159,6 +8267,10 @@ def api_health():
                 recs_scheduled += 1
     except Exception:
         pass
+    feedback = _get_feedback_stats()
+    for c in chans:
+        if c["slug"] in feedback:
+            c["feedback"] = feedback[c["slug"]]
     return _cors(Response(json.dumps({
         "now": int(now),
         "mac_live_scanner_age_s": mac_live_age,
@@ -8241,6 +8353,25 @@ async function load(){
       +'<td><small style="color:var(--muted)">'+det+'</small></td></tr>';
   }
   html+='</table>';
+  /* Per-channel learning aggregated from user-edited recordings. */
+  const fbRows=[];
+  for(const c of d.channels){
+    const fb=c.feedback;if(!fb||fb.n===0)continue;
+    const sug=fb.suggestions.length
+      ?fb.suggestions.map(s=>'<code style="background:#0006;padding:2px 6px;border-radius:3px">'+s+'</code>').join('<br>')
+      :'<small style="color:var(--muted)">noch zu wenig Daten</small>';
+    fbRows.push('<tr><td>'+c.slug+'</td>'
+      +'<td>'+fb.n+' rec, '+fb.matched+' matched</td>'
+      +'<td>Δstart '+fb.mean_dstart_s+'s · Δend '+fb.mean_dend_s+'s</td>'
+      +'<td>+'+fb.added+' / -'+fb.deleted+'</td>'
+      +'<td>'+sug+'</td></tr>');
+  }
+  if(fbRows.length){
+    html+='<h2>User-Feedback Learning</h2><table>'
+      +'<tr><th>Channel</th><th>Sample</th><th>Boundary-Drift</th>'
+      +'<th>Add/Del</th><th>Vorschläge</th></tr>'
+      +fbRows.join('')+'</table>';
+  }
   document.getElementById('root').innerHTML=html;
   document.getElementById('refresh').textContent='aktualisiert '+new Date().toLocaleTimeString('de-DE');
 }
