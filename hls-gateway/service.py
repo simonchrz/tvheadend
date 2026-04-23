@@ -5180,8 +5180,15 @@ def _rec_parse_comskip(out_dir):
         return []
     fps = 25.0
     ads = []
+    # Comskip's .txt occasionally writes a long run of NUL bytes
+    # before the first frame-range line (witnessed on the Mac-side
+    # patched build, suspect ftell/fwrite ordering on the merged-ts
+    # input stream). After str.strip() those NULs stay in the line —
+    # find the LAST whitespace-separated frame pair via regex so the
+    # leading garbage doesn't break parsing.
+    line_re = re.compile(r"(\d+)\s+(\d+)\s*$")
     for line in lines:
-        line = line.strip()
+        line = line.strip().replace("\x00", "")
         if not line or line.startswith("-"):
             continue
         if "FRAMES AT" in line:
@@ -5192,12 +5199,12 @@ def _rec_parse_comskip(out_dir):
             except Exception:
                 pass
             continue
-        parts = line.split()
-        if len(parts) != 2:
+        m = line_re.search(line)
+        if not m:
             continue
         try:
-            a = float(parts[0]) / fps
-            b = float(parts[1]) / fps
+            a = float(m.group(1)) / fps
+            b = float(m.group(2)) / fps
             if b - a >= 60:   # ignore stub blocks shorter than 60 s
                               # — matches comskip.ini's
                               # min_commercialbreak=60, also serves as
