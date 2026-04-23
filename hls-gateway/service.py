@@ -5180,8 +5180,9 @@ def recordings_page():
         badge = (f'<span class="badge series">📺 Serie · '
                  f'{" · ".join(parts)}</span>')
         kill_btn = (f'<button class="series-kill" '
-                    f'onclick="cancelSeries(event,\'{ar_uuid}\',\'{group_title}\',{upcoming})">'
-                    f'🗑 Serie</button>')
+                    f'onclick="cancelSeries(event,\'{ar_uuid}\',\'{group_title}\',{upcoming})" '
+                    f'title="Serien-Aufzeichnungs-Regel löschen">'
+                    f'🗑</button>')
         # Keep group expanded if any episode needs attention (recording
         # right now, being remuxed, or comskip is running on it).
         any_active = bool(live) or any(
@@ -5342,10 +5343,7 @@ def recordings_page():
             f"<span class='arrow'>←</span><h1>Aufnahmen</h1></a>"
             f"</div>"
             f"<div class='rec-body'>"
-            f"<table><tr><th></th><th>Titel</th><th>Start</th>"
-            f"<th>Dauer</th><th>Größe</th><th>Cache</th>"
-            f"<th title='Gesehen — wird nach {WATCHED_AUTO_DELETE_DAYS} d auto-gelöscht'>👁</th>"
-            f"<th></th></tr>"
+            f"<table>"
             f"{''.join(rows) if rows else '<tr><td colspan=8>Keine Aufnahmen</td></tr>'}"
             f"</table>"
             f"</div>"
