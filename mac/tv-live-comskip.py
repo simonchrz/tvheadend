@@ -45,7 +45,24 @@ SEGMENT_TIME    = 1
 WINDOW_SECONDS  = 2 * 3600
 ACTIVE_MTIME_S  = 60
 MIN_BUFFER_SEGS = 120
-WINDOW_SIZE     = 1800
+# WINDOW_SIZE applies only to the initial scan per channel (or after a
+# state gap where prev's latest_seg expired from the buffer). 3600 ≈ 1 h
+# is a compromise between cold-start latency (~120 s fetch + ~30 s
+# comskip per channel) and useful immediate coverage when the user
+# scrubs backwards. Bump to 7200 for full 2 h coverage at the cost of
+# ~4 min cold-start per channel. Subsequent scans are incremental.
+WINDOW_SIZE     = 3600
+# Backward overlap on incremental scans — must be ≥ the longest expected
+# ad block (max_commercialbreak=900) so any block that crosses the seam
+# between scans is fully visible to comskip on the next pass and gets
+# re-detected with correct boundaries (otherwise we'd see a single block
+# split into "open block from prev scan" + "new block this scan").
+OVERLAP_SECONDS = 900
+# Minimum new segments required to trigger an incremental scan. Below
+# this, the scan would buy us nothing — comskip needs both endpoints of
+# an ad block visible to detect it, so a few seconds of new content
+# can't add a new block, only confirm the latest one.
+MIN_INCREMENTAL_NEW = 5
 RESCAN_SECONDS  = 720
 LOOP_SLEEP      = 30
 HTTP_TIMEOUT    = 30
@@ -358,14 +375,36 @@ def analyze(slug, state, window_end_seg=None, window_size=WINDOW_SIZE):
             end_idx = len(all_segs)
     else:
         end_idx = len(all_segs)
-    start_idx = max(0, end_idx - window_size)
-    window = all_segs[start_idx:end_idx]
-    latest_name = window[-1] if window else all_segs[-1]
 
-    if window_end_seg is None:
-        prev = state.get(slug) or {}
-        if prev.get("latest_seg") == latest_name:
-            return False
+    prev = state.get(slug) or {}
+    prev_latest_seg = prev.get("latest_seg")
+    latest_name = all_segs[end_idx - 1]
+
+    # Skip if nothing new — only meaningful for unbounded (live) scans.
+    if window_end_seg is None and prev_latest_seg == latest_name:
+        return False
+
+    # Sliding-window: re-scan only the tail since prev_latest_seg
+    # (plus OVERLAP_SECONDS backwards so ad-blocks crossing the seam
+    # get re-detected with correct boundaries). Older ads are kept
+    # via the `retained` array below — no reprocessing needed.
+    incr_start = None
+    if (window_end_seg is None
+            and prev_latest_seg
+            and prev_latest_seg in all_segs):
+        prev_idx = all_segs.index(prev_latest_seg)
+        new_segs = end_idx - prev_idx - 1
+        if new_segs >= MIN_INCREMENTAL_NEW:
+            overlap_segs = OVERLAP_SECONDS // SEGMENT_TIME
+            incr_start = max(0, prev_idx - overlap_segs + 1)
+
+    if incr_start is not None:
+        start_idx = incr_start
+        scan_mode = "incr"
+    else:
+        start_idx = max(0, end_idx - window_size)
+        scan_mode = "init"
+    window = all_segs[start_idx:end_idx]
 
     window_first_pdt = first_pdt + start_idx * SEGMENT_TIME
 
@@ -445,9 +484,12 @@ def analyze(slug, state, window_end_seg=None, window_size=WINDOW_SIZE):
     # Refresh the cached logo template if comskip wrote a fresh one and
     # the scan looked successful (≥2 ad blocks ≈ logo learning worked).
     # Avoids poisoning the cache from a degenerate scan with no ads.
+    # Only on initial scans — incremental scans see a small window and
+    # may legitimately have <2 ads, but the template they'd produce is
+    # trained on too little material to be reliable.
     fresh_logo = work / "merged.logo.txt"
-    if fresh_logo.is_file() and fresh_logo.stat().st_size > 0 \
-            and len(ads_sec) >= 2:
+    if scan_mode == "init" and fresh_logo.is_file() \
+            and fresh_logo.stat().st_size > 0 and len(ads_sec) >= 2:
         try:
             logo_cache_dir.mkdir(parents=True, exist_ok=True)
             shutil.copy2(fresh_logo, logo_cache)
@@ -471,8 +513,9 @@ def analyze(slug, state, window_end_seg=None, window_size=WINDOW_SIZE):
     state[slug] = {"generated": time.time(), "ads": merged_ads,
                    "latest_seg": latest_name}
     save_live_ads(state)
-    log(f"[{slug}] {len(ads_wall)} new, {len(retained)} retained, "
-        f"{len(merged_ads)} total | fetched {fetched_n}/{len(window)} segs "
+    log(f"[{slug}] {scan_mode} {len(window)} segs | "
+        f"{len(ads_wall)} new, {len(retained)} retained, "
+        f"{len(merged_ads)} total | fetched {fetched_n} "
         f"({fetched_bytes // (1024*1024)} MB in {fetch_dt:.1f}s), "
         f"scan {scan_dt:.1f}s")
     return True
