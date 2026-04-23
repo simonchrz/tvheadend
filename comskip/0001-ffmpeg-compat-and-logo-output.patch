@@ -1,3 +1,26 @@
+diff --git a/comskip.c b/comskip.c
+index dbdace6..ac7f83a 100644
+--- a/comskip.c
++++ b/comskip.c
+@@ -4672,6 +4672,18 @@ again:
+         }
+     }
+ 
++    /* Persist the logo template at end-of-analysis if a logo was
++       actually trained. Upstream only writes <basename>.logo.txt
++       during the first-pass save in two-pass mode AND only while
++       LOGO is still in commDetectMethod (gets cleared when
++       give_up_logo_search expires). And the deleteLogoFile cleanup
++       above wipes it again unconditionally. This hook fires AFTER
++       the cleanup so external callers can cache and reuse the
++       template via --logo on subsequent runs. */
++    if (clogoMaxX > clogoMinX && clogoMaxY > clogoMinY) {
++        SaveLogoMaskData();
++    }
++
+ //	free(frame);
+     return (foundCommercials);
+ }
 diff --git a/mpeg2dec.c b/mpeg2dec.c
 index ae9f0bb..4c9aaba 100755
 --- a/mpeg2dec.c
