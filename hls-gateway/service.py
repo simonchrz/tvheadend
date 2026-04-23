@@ -5052,7 +5052,12 @@ _rec_cskip_procs = {}  # uuid -> {"proc": Popen, "started": ts}
 
 def _rec_source_path(uuid):
     """Return the file path of the DVR recording inside this container
-    (via the /recordings read-only mount). None if not found."""
+    (via the /recordings read-only mount). None if not found.
+    tvheadend's API stores filenames mojibake-encoded on this host
+    (UTF-8 'ü' got round-tripped through Latin-9 → 'ÃŒ' →
+    \\xc3\\x83\\xc5\\x92). The actual file on disk is plain UTF-8.
+    Try the literal path first; if that misses, scan the parent dir
+    and find the file whose mojibake-reversed basename matches."""
     try:
         data = json.loads(urllib.request.urlopen(
             f"{TVH_BASE}/api/dvr/entry/grid?limit=400",
@@ -5060,8 +5065,22 @@ def _rec_source_path(uuid):
         for e in data.get("entries", []):
             if e.get("uuid") == uuid:
                 fn = e.get("filename") or ""
-                if fn:
+                if not fn:
+                    return None
+                if Path(fn).is_file():
                     return fn
+                parent = Path(fn).parent
+                if not parent.is_dir():
+                    return fn
+                base = Path(fn).name
+                try:
+                    fixed = base.encode("iso-8859-15").decode("utf-8")
+                except Exception:
+                    return fn
+                for entry in parent.iterdir():
+                    if entry.name == fixed:
+                        return str(entry)
+                return fn
     except Exception:
         pass
     return None
