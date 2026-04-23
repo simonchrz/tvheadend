@@ -145,6 +145,8 @@ CODEC_CACHE_FILE = HLS_DIR / ".codec_cache.json"
 STATS_FILE       = HLS_DIR / ".usage_stats.json"
 EPG_ARCHIVE_FILE = HLS_DIR / ".epg_archive.jsonl"
 ALWAYS_WARM_FILE = HLS_DIR / ".always_warm.json"
+EPG_META_FILE    = HLS_DIR / ".epg_meta.json"  # tvmaze poster + rating cache
+EPG_META_TTL_S   = 30 * 86400                  # re-fetch each title monthly
 PIN_HARD_MAX = 3   # tuner-driven upper bound; minus active/scheduled DVR jobs
 TUNER_TOTAL = int(os.environ.get("TUNER_TOTAL", "4"))   # FRITZ!Box DVB-C tuners
 EPG_SNAPSHOT_INTERVAL = 600   # 10 min
@@ -4808,6 +4810,96 @@ def cancel_series(autorec_uuid):
                            mimetype="application/json"))
 
 
+# --- EPG metadata enrichment via TVmaze (free, no API key) -----
+_epg_meta = {}
+_epg_meta_lock = threading.Lock()
+
+
+def _load_epg_meta():
+    global _epg_meta
+    if not EPG_META_FILE.exists():
+        return
+    try:
+        _epg_meta = json.loads(EPG_META_FILE.read_text())
+        print(f"Loaded EPG metadata for {len(_epg_meta)} titles", flush=True)
+    except Exception as e:
+        print(f"load epg meta: {e}", flush=True)
+
+
+def _save_epg_meta():
+    try:
+        tmp = EPG_META_FILE.with_suffix(".tmp")
+        tmp.write_text(json.dumps(_epg_meta))
+        tmp.replace(EPG_META_FILE)
+    except Exception as e:
+        print(f"save epg meta: {e}", flush=True)
+
+
+def _normalize_title(t):
+    """Strip episode-suffix variants so 'Show - Episode Title' looks up
+    the parent show. TVmaze indexes shows, not episodes."""
+    if not t:
+        return ""
+    # Common DE-EPG pattern: "Show - Episode Title" or "Show: Subtitle"
+    for sep in (" - ", ": "):
+        if sep in t:
+            return t.split(sep, 1)[0].strip()
+    return t.strip()
+
+
+def _fetch_tvmaze(title):
+    """Query TVmaze for one title. Returns dict with poster + rating
+    or {} if no match. Always touches `fetched_at` so we don't retry
+    failed lookups every minute."""
+    out = {"fetched_at": int(time.time())}
+    try:
+        url = ("https://api.tvmaze.com/singlesearch/shows?q="
+               + urllib.parse.quote(title))
+        with urllib.request.urlopen(url, timeout=8) as r:
+            d = json.loads(r.read())
+        img = d.get("image") or {}
+        out["poster"] = img.get("medium") or img.get("original")
+        out["rating"] = (d.get("rating") or {}).get("average")
+        out["tvmaze_id"] = d.get("id")
+    except urllib.error.HTTPError as e:
+        if e.code != 404:
+            print(f"[epg-enrich] {title}: {e}", flush=True)
+    except Exception as e:
+        print(f"[epg-enrich] {title}: {e}", flush=True)
+    return out
+
+
+def _enrich_recordings_loop():
+    """Hourly: scan recordings list, fetch TVmaze metadata for any
+    new (or stale) title. Rate-limited to ~2 lookups/sec to be polite
+    to TVmaze's free public API."""
+    time.sleep(60)
+    while True:
+        try:
+            data = json.loads(urllib.request.urlopen(
+                f"{TVH_BASE}/api/dvr/entry/grid?limit=500",
+                timeout=10).read())
+            now = time.time()
+            seen = set()
+            for e in data.get("entries", []):
+                key = _normalize_title(e.get("disp_title", ""))
+                if not key or key in seen:
+                    continue
+                seen.add(key)
+                with _epg_meta_lock:
+                    cached = _epg_meta.get(key)
+                if cached and now - cached.get("fetched_at", 0) < EPG_META_TTL_S:
+                    continue
+                meta = _fetch_tvmaze(key)
+                with _epg_meta_lock:
+                    _epg_meta[key] = meta
+                _save_epg_meta()
+                time.sleep(0.5)  # gentle on TVmaze API
+        except Exception as e:
+            print(f"[epg-enrich] loop: {e}", flush=True)
+        time.sleep(3600)
+
+
 @app.route("/api/recording/<uuid>/watched", methods=["POST"])
 def api_recording_watched(uuid):
     """Toggle the watched flag on a recording. tvheadend's `watched`
@@ -5037,6 +5129,18 @@ def recordings_page():
             f'title="Als {"un" if watched else ""}gesehen markieren">'
             f'{"✓" if watched else "○"}</a>'
         )
+        # TVmaze enrichment: small poster + rating badge inline.
+        # Lookup is by show title (episode-suffix stripped) so
+        # different episodes of one series share the same poster.
+        with _epg_meta_lock:
+            meta = _epg_meta.get(_normalize_title(title)) or {}
+        poster_html = (f'<img class="rec-poster" src="{meta["poster"]}" '
+                       f'alt="" loading="lazy">'
+                       if meta.get("poster") else '')
+        rating_html = (f' <span class="rec-rating" title="TVmaze rating">'
+                       f'★ {meta["rating"]}</span>'
+                       if meta.get("rating") else '')
+        title_cell = poster_html + title_cell + rating_html
         return (f'<tr><td>{badge}</td>'
                 f'<td>{title_cell}</td>'
                 f'<td>{when}</td>'
@@ -5197,6 +5301,11 @@ def recordings_page():
             f"text-align:center;border-radius:50%;border:1px solid var(--border);"
             f"color:var(--muted);text-decoration:none;font-size:.95em;cursor:pointer}}"
             f".watch-btn.on{{background:#27ae60;color:#fff;border-color:#27ae60}}"
+            f".rec-poster{{width:30px;height:42px;object-fit:cover;border-radius:3px;"
+            f"vertical-align:middle;margin-right:8px;background:var(--stripe)}}"
+            f".rec-rating{{display:inline-block;background:#f39c12;color:#000;"
+            f"padding:1px 6px;border-radius:3px;font-size:.8em;font-weight:600;"
+            f"margin-left:6px;vertical-align:middle}}"
             f".badge.series{{background:#8e44ad;color:#fff}}"
             f".badge.mediathek{{background:#2980b9;color:#fff}}"
             f".badge.mediathek.local{{background:#27ae60}}"
@@ -7826,6 +7935,8 @@ if __name__ == "__main__":
     threading.Thread(target=disk_cleanup_loop, daemon=True).start()
     threading.Thread(target=state_backup_loop, daemon=True).start()
     threading.Thread(target=_cleanup_watched_loop, daemon=True).start()
+    _load_epg_meta()
+    threading.Thread(target=_enrich_recordings_loop, daemon=True).start()
     # waitress in production; fall back to Flask's built-in only if
     # waitress somehow isn't importable (e.g. an older image).
     try:
