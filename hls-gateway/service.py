@@ -2353,6 +2353,28 @@ body.ctrl-min #skipad{background:#0006;color:#ddd;padding:4px 9px;
  background:repeating-linear-gradient(45deg,
  #ff8a65,#ff8a65 3px,#4d1c0f 3px,#4d1c0f 6px);
  box-shadow:0 0 0 1px #000a;z-index:1}
+.ad-block.editable{pointer-events:auto;cursor:pointer}
+.ad-block.editable:hover{height:11px}
+.ad-edit-modal{position:fixed;inset:0;background:#000c;z-index:2000;
+ display:flex;align-items:center;justify-content:center;padding:20px}
+.ad-edit-card{background:#222;color:#eee;border-radius:10px;
+ padding:18px 20px;min-width:260px;max-width:340px;
+ box-shadow:0 10px 30px #000c;font-family:-apple-system,sans-serif}
+.ad-edit-head{font-weight:700;font-size:1.05em;margin-bottom:14px}
+.ad-edit-card label{display:flex;flex-direction:column;font-size:.85em;
+ color:#aaa;margin-bottom:10px}
+.ad-edit-card input{margin-top:4px;padding:8px 10px;border-radius:6px;
+ border:1px solid #444;background:#111;color:#fff;font-size:1em;
+ font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
+.ad-edit-hint{font-size:.75em;color:#888;margin-bottom:14px}
+.ad-edit-btns{display:flex;gap:8px;align-items:center}
+.ad-edit-btns .spacer{flex:1}
+.ad-edit-btns button{padding:8px 14px;border-radius:6px;
+ border:1px solid #444;font-weight:600;cursor:pointer;
+ font-size:.95em;background:#2a2a2a;color:#fff}
+.ad-edit-del{background:#c0392b !important;border-color:#c0392b !important}
+.ad-edit-cancel{background:transparent !important;font-weight:400 !important}
+.ad-edit-save{background:#2980b9 !important;border-color:#2980b9 !important}
 .hidden{opacity:0;pointer-events:none}
 #ttlrow{margin-top:8px;font-size:.85em;padding-left:4px;
  white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
@@ -6924,38 +6946,97 @@ def recording_hls(uuid):
 
 @app.route("/recording/<uuid>/ads")
 def recording_ads(uuid):
-    """Commercial-block markers for the scrub bar. { ads: [[s,e], …] }."""
+    """Commercial-block markers for the scrub bar. { ads: [[s,e], …] }.
+    User-edited markers (saved via /api/recording/<uuid>/ads/edit)
+    take precedence over the auto-detected set so manual fixes
+    survive re-scans."""
     out_dir = HLS_DIR / f"_rec_{uuid}"
     cskip_info = _rec_cskip_procs.get(uuid)
     running = cskip_info is not None and cskip_info["proc"].poll() is None
     if not out_dir.exists():
         ads = []
+        edited = False
     else:
-        ads_cache = out_dir / "ads.json"
-        txts = list(out_dir.glob("*.txt"))
-        txt_mtime = max((t.stat().st_mtime for t in txts), default=0)
-        if (not running and txts
-                and ads_cache.exists()
-                and ads_cache.stat().st_mtime >= txt_mtime):
+        user_cache = out_dir / "ads_user.json"
+        edited = user_cache.exists()
+        if edited:
             try:
-                ads = json.loads(ads_cache.read_text())
+                ads = json.loads(user_cache.read_text())
             except Exception:
-                ads = _rec_parse_comskip(out_dir)
-        else:
-            ads = _rec_parse_comskip(out_dir)
-            if not running and ads:
-                src = _rec_source_path(uuid)
-                if src and Path(src).exists():
-                    ads = _blackframe_extend_ads(
-                        src, ads, channel_slug=_rec_channel_slug(uuid))
+                edited = False
+        if not edited:
+            ads_cache = out_dir / "ads.json"
+            txts = list(out_dir.glob("*.txt"))
+            txt_mtime = max((t.stat().st_mtime for t in txts), default=0)
+            if (not running and txts
+                    and ads_cache.exists()
+                    and ads_cache.stat().st_mtime >= txt_mtime):
                 try:
-                    ads_cache.write_text(json.dumps(ads))
+                    ads = json.loads(ads_cache.read_text())
                 except Exception:
-                    pass
-    resp = _cors(Response(json.dumps({"ads": ads, "running": running}),
+                    ads = _rec_parse_comskip(out_dir)
+            else:
+                ads = _rec_parse_comskip(out_dir)
+                if not running and ads:
+                    src = _rec_source_path(uuid)
+                    if src and Path(src).exists():
+                        ads = _blackframe_extend_ads(
+                            src, ads, channel_slug=_rec_channel_slug(uuid))
+                    try:
+                        ads_cache.write_text(json.dumps(ads))
+                    except Exception:
+                        pass
+    resp = _cors(Response(json.dumps({"ads": ads, "running": running,
+                                        "edited": edited}),
                             mimetype="application/json"))
     resp.headers["Cache-Control"] = "no-store"
     return resp
+
+
+@app.route("/api/recording/<uuid>/ads/edit", methods=["POST"])
+def api_recording_ads_edit(uuid):
+    """Persist a user-edited ad-block list. Body: {"ads": [[s,e], …]}.
+    Stored as ads_user.json next to the recording's HLS dir; takes
+    precedence over the auto-detected ads.json on subsequent reads
+    so manual fixes survive any re-scan. POST with body {"ads": []}
+    clears the override (auto-detection re-applies)."""
+    out_dir = HLS_DIR / f"_rec_{uuid}"
+    if not out_dir.exists():
+        return Response(json.dumps({"ok": False,
+                                      "error": "unknown recording"}),
+                        status=404, mimetype="application/json")
+    try:
+        body = request.get_json(silent=True) or {}
+        ads = body.get("ads")
+    except Exception:
+        ads = None
+    if not isinstance(ads, list):
+        return Response(json.dumps({"ok": False,
+                                      "error": "ads array required"}),
+                        status=400, mimetype="application/json")
+    # Normalise + sort + drop nonsense ranges.
+    cleaned = []
+    for blk in ads:
+        try:
+            s = float(blk[0]); e = float(blk[1])
+            if e > s and e - s >= 1:
+                cleaned.append([round(s, 2), round(e, 2)])
+        except Exception:
+            continue
+    cleaned.sort()
+    user_cache = out_dir / "ads_user.json"
+    try:
+        if not cleaned:
+            user_cache.unlink(missing_ok=True)
+        else:
+            tmp = user_cache.with_suffix(".tmp")
+            tmp.write_text(json.dumps(cleaned))
+            tmp.replace(user_cache)
+    except Exception as e:
+        return Response(json.dumps({"ok": False, "error": str(e)}),
+                        status=500, mimetype="application/json")
+    return _cors(Response(json.dumps({"ok": True, "ads": cleaned}),
+                           mimetype="application/json"))
 
 
 @app.route("/recording/<uuid>/thumbs.json")
@@ -7339,13 +7420,74 @@ def play_recording(uuid):
             f"  const D=isFinite(v.duration)?v.duration:0;"
             f"  document.querySelectorAll('.ad-block').forEach(e=>e.remove());"
             f"  if(D<=0)return;"
-            f"  for(const[s,e]of ads){{"
+            f"  ads.forEach((blk,idx)=>{{"
+            f"    const[s,e]=blk;"
             f"    const left=(s/D)*100,width=Math.max(0.3,((e-s)/D)*100);"
             f"    const el=document.createElement('div');"
-            f"    el.className='ad-block';"
+            f"    el.className='ad-block editable';"
             f"    el.style.left=left+'%';el.style.width=width+'%';"
+            f"    el.dataset.idx=String(idx);"
+            f"    el.title='Werbeblock bearbeiten ('+fmt(s)+' – '+fmt(e)+')';"
+            f"    el.addEventListener('click',ev=>{{"
+            f"      ev.stopPropagation();openAdEditor(idx);"
+            f"    }});"
             f"    scrub.appendChild(el);"
-            f"  }}"
+            f"  }});"
+            f"}}"
+            f"function saveAdsEdit(){{"
+            f"  fetch('{HOST_URL}/api/recording/{uuid}/ads/edit',"
+            f"    {{method:'POST',headers:{{'Content-Type':'application/json'}},"
+            f"     body:JSON.stringify({{ads:ads}})}}).catch(()=>{{}});"
+            f"}}"
+            f"/* Parse 'mm:ss' / 'hh:mm:ss' / 'ss' → seconds. */"
+            f"function parseTimeToSec(s){{"
+            f"  s=String(s||'').trim();if(!s)return null;"
+            f"  const parts=s.split(':').map(p=>parseFloat(p));"
+            f"  if(parts.some(isNaN))return null;"
+            f"  let t=0;for(const p of parts)t=t*60+p;"
+            f"  return t;"
+            f"}}"
+            f"function openAdEditor(idx){{"
+            f"  const blk=ads[idx];if(!blk)return;"
+            f"  const D=isFinite(v.duration)?v.duration:0;"
+            f"  const m=document.createElement('div');"
+            f"  m.className='ad-edit-modal';"
+            f"  m.innerHTML="
+            f"    '<div class=\"ad-edit-card\">'"
+            f"   +'<div class=\"ad-edit-head\">Werbeblock bearbeiten</div>'"
+            f"   +'<label>Start <input id=\"adEditS\" type=\"text\" "
+            f"           inputmode=\"numeric\" autocomplete=\"off\"></label>'"
+            f"   +'<label>Ende <input id=\"adEditE\" type=\"text\" "
+            f"           inputmode=\"numeric\" autocomplete=\"off\"></label>'"
+            f"   +'<div class=\"ad-edit-hint\">Format: mm:ss oder hh:mm:ss</div>'"
+            f"   +'<div class=\"ad-edit-btns\">'"
+            f"   +'<button class=\"ad-edit-del\">Löschen</button>'"
+            f"   +'<span class=\"spacer\"></span>'"
+            f"   +'<button class=\"ad-edit-cancel\">Abbrechen</button>'"
+            f"   +'<button class=\"ad-edit-save\">Speichern</button>'"
+            f"   +'</div></div>';"
+            f"  document.body.appendChild(m);"
+            f"  const sIn=m.querySelector('#adEditS');"
+            f"  const eIn=m.querySelector('#adEditE');"
+            f"  sIn.value=fmt(blk[0]);eIn.value=fmt(blk[1]);"
+            f"  setTimeout(()=>sIn.focus(),50);"
+            f"  const close=()=>m.remove();"
+            f"  m.addEventListener('click',ev=>{{if(ev.target===m)close();}});"
+            f"  m.querySelector('.ad-edit-cancel').addEventListener('click',close);"
+            f"  m.querySelector('.ad-edit-del').addEventListener('click',()=>{{"
+            f"    ads.splice(idx,1);renderAds();saveAdsEdit();close();"
+            f"  }});"
+            f"  m.querySelector('.ad-edit-save').addEventListener('click',()=>{{"
+            f"    const s=parseTimeToSec(sIn.value);"
+            f"    const e=parseTimeToSec(eIn.value);"
+            f"    if(s==null||e==null||e<=s){{"
+            f"      sIn.style.borderColor='#e74c3c';"
+            f"      eIn.style.borderColor='#e74c3c';return;"
+            f"    }}"
+            f"    ads[idx]=[Math.max(0,s),D>0?Math.min(D,e):e];"
+            f"    ads.sort((a,b)=>a[0]-b[0]);"
+            f"    renderAds();saveAdsEdit();close();"
+            f"  }});"
             f"}}"
             f"function refresh(){{"
             f"  const D=isFinite(v.duration)?v.duration:0;"
