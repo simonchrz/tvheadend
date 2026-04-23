@@ -2528,6 +2528,11 @@ def watch_player(slug):
         info = channel_map.get(slug)
     if not info:
         abort(404, "unknown channel")
+    logo_url = _channel_logo_url(slug, "")  # only the local override, no fallback
+    chname_inner = (f'<img src="{logo_url}" alt="" '
+                    f'onerror="this.outerHTML=&quot;&quot;">'
+                    if logo_url else '')
+    chname_inner += f'<span class="chname-text">{info["name"]}</span>'
     return f"""<!doctype html>
 <html><head>{PLAYER_HEAD_META}<title>{info['name']}</title>
 <script src="https://cdn.jsdelivr.net/npm/hls.js@1/dist/hls.min.js"></script>
@@ -2548,7 +2553,9 @@ body{{touch-action:pan-y}}
   border-radius:16px;font-weight:600;font-size:.85em;cursor:pointer;
   display:none;flex:0 0 auto}}
 #skipad.on{{display:inline-flex}}
-.chname{{font-weight:600;color:#fff;margin-right:8px}}
+.chname{{font-weight:600;color:#fff;margin-right:8px;display:inline-flex;align-items:center;gap:8px;vertical-align:middle}}
+.chname img{{height:24px;width:auto;max-width:80px;object-fit:contain;display:block}}
+.chname img+.chname-text{{display:none}}
 .epg{{color:#bbb;margin-left:8px}}
 #srcbadge{{display:inline-block;font-size:.75em;font-weight:600;
   padding:2px 8px;border-radius:10px;background:#7a7a7a;color:#fff;
@@ -2597,7 +2604,7 @@ body{{touch-action:pan-y}}
   <span id='cur' class='time'>0:00</span>
  </div>
  <div id='ttlrow'>
-  <span class='chname' id='chname'>{info['name']}</span>
+  <span class='chname' id='chname'>{chname_inner}</span>
   <span id='srcbadge'>Live</span>
   <span class='epg' id='epg'>…</span>
  </div>
@@ -3741,7 +3748,11 @@ async function loadSrc(slug){{
   saveLastPos(current);   /* preserve previous channel position */
   current=slug;onMediathek=false;
   const ch=channels[idx];
-  if(ch)chname.textContent=ch.name;
+  if(ch){{
+    const img=ch.icon&&ch.icon.includes('/static/ch-logos/')
+      ?`<img src="${{ch.icon}}" alt="" onerror="this.outerHTML=''">`:'';
+    chname.innerHTML=img+`<span class="chname-text">${{ch.name}}</span>`;
+  }}
   history.replaceState(null,'','/watch/'+slug);
   loadEpg(slug);
   loadEvents(slug);
