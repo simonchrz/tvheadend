@@ -434,6 +434,78 @@ def blackframe_extend_ads(video_path, ads, channel_slug=None,
     return merged
 
 
+def silence_extend_ads(video_path, ads, channel_slug=None,
+                        max_shift_sec=75.0, noise_db=-30, min_dur=0.5):
+    """ffmpeg silencedetect post-processor — analog zu blackframe_extend
+    aber für Audio. Snappt Block-Grenzen an die nächste Stille im
+    [start - max_shift, start - 1] / [end + 1, end + max_shift] window.
+    Nützlich für Channels mit harten Cuts ohne Schwarzbild — die
+    Audio-Stille zwischen Show-Ende und Werbung ist meist da auch wenn
+    visuell kein blackframe existiert.
+
+    Returns (refined_ads, moved_flags). Mover-Logik analog zu
+    refine_ads_by_logo / blackframe_extend_ads."""
+    if not ads or not video_path:
+        return ads, [(False, False)] * len(ads)
+    out = []
+    moved = []
+    for start, end in ads:
+        new_start, new_end = start, end
+        # Backward window
+        ss_b = max(0, start - max_shift_sec - 4)
+        try:
+            proc = subprocess.run(
+                [FFMPEG, "-hide_banner", "-nostats",
+                 "-ss", str(ss_b), "-i", str(video_path),
+                 "-t", str(max_shift_sec + 6),
+                 "-vn",
+                 "-af", f"silencedetect=n={noise_db}dB:d={min_dur}",
+                 "-f", "null", "-"],
+                capture_output=True, text=True, timeout=25)
+            silences = []
+            for line in proc.stderr.splitlines():
+                if "silence_start:" in line:
+                    try:
+                        rel = float(line.split("silence_start:")[1].split()[0])
+                        abs_t = ss_b + rel
+                        if start - max_shift_sec <= abs_t < start - 1:
+                            silences.append(abs_t)
+                    except Exception:
+                        pass
+            if silences:
+                new_start = min(silences)  # earliest silence in window
+        except Exception:
+            pass
+        # Forward window
+        ss_f = max(0, end - 1)
+        try:
+            proc = subprocess.run(
+                [FFMPEG, "-hide_banner", "-nostats",
+                 "-ss", str(ss_f), "-i", str(video_path),
+                 "-t", str(max_shift_sec + 4),
+                 "-vn",
+                 "-af", f"silencedetect=n={noise_db}dB:d={min_dur}",
+                 "-f", "null", "-"],
+                capture_output=True, text=True, timeout=25)
+            silences = []
+            for line in proc.stderr.splitlines():
+                if "silence_end:" in line:
+                    try:
+                        rel = float(line.split("silence_end:")[1].split()[0])
+                        abs_t = ss_f + rel
+                        if end + 1 < abs_t <= end + max_shift_sec:
+                            silences.append(abs_t)
+                    except Exception:
+                        pass
+            if silences:
+                new_end = max(end, min(silences))
+        except Exception:
+            pass
+        out.append([round(new_start, 2), round(new_end, 2)])
+        moved.append((new_start != start, new_end != end))
+    return out, moved
+
+
 def channel_is_active(slug):
     """Cheap activity check: m3u8 mtime via SMB stat. No content read."""
     m3u = HLS_DIR / slug / "index.m3u8"
@@ -635,9 +707,20 @@ def analyze(slug, state, window_end_seg=None, window_size=WINDOW_SIZE):
     # visible during sponsor cards). For boundaries that logo-refine
     # actually moved, trust those over blackframe-extend.
     ads_bf = blackframe_extend_ads(str(merged), ads_raw, channel_slug=slug)
+    # Silence-based snap: third evidence source (after logo + blackframe).
+    # Helps for hard-cut channels with no blackframe at the show↔ad
+    # transition but a clean audio dip — common on RTL group / private
+    # broadcasters.
+    ads_si, moved_si = silence_extend_ads(str(merged), ads_raw,
+                                            channel_slug=slug)
+    # Combine: logo wins where it moved (most precise). Else fall back
+    # to silence; else blackframe; else raw comskip.
     ads_sec = []
-    for (ls, le), (bs, be), (sm, em) in zip(ads_logo, ads_bf, moved):
-        ads_sec.append([ls if sm else bs, le if em else be])
+    for (rs, re_), (ls, le), (bs, be), (ss, se), (sm, em), (ssi, esi) in zip(
+            ads_raw, ads_logo, ads_bf, ads_si, moved, moved_si):
+        new_s = ls if sm else (ss if ssi else bs)
+        new_e = le if em else (se if esi else be)
+        ads_sec.append([new_s, new_e])
     # If the last block runs through the end of the scan window, comskip
     # can't see where it actually ends — neither logo-refine nor
     # blackframe-extend can extend past the available frames. Without
