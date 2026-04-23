@@ -34,3 +34,7 @@ services:
       # bypass of Flask) with a local segment cache, so each scan
       # transfers ~15 MB after warmup instead of 900 MB.
       - LIVE_ADS_OFFLOAD=mac
+      # Optional: TMDB v4 Bearer token for recordings-page EPG
+      # enrichment (poster + rating). Picked up from .env next to
+      # this file; falls back to TVmaze when unset.
+      - TMDB_API_KEY=${TMDB_API_KEY:-}

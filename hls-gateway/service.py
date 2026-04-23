@@ -4850,29 +4850,43 @@ def _normalize_title(t):
 
 
 def _fetch_tmdb(title):
-    """Query TMDB for a show. Needs TMDB_API_KEY env var set.
-    Returns dict or None on miss. TMDB has much better DE-TV coverage
-    than TVmaze — Das perfekte Dinner, Galileo, Die Geissens etc. all
-    have ratings on TMDB that TVmaze is missing."""
+    """Query TMDB /search/tv. Accepts both v4 bearer tokens (JWT,
+    starts with "eyJ") and v3 api_key values (32-char hex). TMDB has
+    much richer DE-TV coverage than TVmaze (Galileo, Geissens, Das
+    perfekte Dinner all indexed with posters). Returns None on miss.
+    TMDB reports vote_average=0.0 when a show has no user ratings —
+    treat that as "no rating" rather than a literal zero."""
     try:
+        params = {"query": title, "language": "de-DE"}
+        headers = {"Accept": "application/json"}
+        if TMDB_API_KEY.startswith("eyJ"):
+            headers["Authorization"] = f"Bearer {TMDB_API_KEY}"
+        else:
+            params["api_key"] = TMDB_API_KEY
         url = ("https://api.themoviedb.org/3/search/tv?"
-               + urllib.parse.urlencode({
-                   "api_key": TMDB_API_KEY,
-                   "query": title,
-                   "language": "de-DE",
-                 }))
-        with urllib.request.urlopen(url, timeout=8) as r:
+               + urllib.parse.urlencode(params))
+        req = urllib.request.Request(url, headers=headers)
+        with urllib.request.urlopen(req, timeout=8) as r:
             d = json.loads(r.read())
         results = d.get("results") or []
         if not results:
             return None
-        top = results[0]
-        poster = top.get("poster_path")
+        # Prefer an exact-or-prefix title match over TMDB's default
+        # popularity ordering — "Das perfekte Dinner" should win over
+        # spin-offs like "Das perfekte Promi-Dinner".
+        lc = title.lower()
+        best = next(
+            (r for r in results if (r.get("name") or "").lower() == lc),
+            None) or next(
+            (r for r in results if (r.get("name") or "").lower().startswith(lc)),
+            results[0])
+        poster = best.get("poster_path")
+        rating = best.get("vote_average") or 0.0
         return {
             "poster": (f"https://image.tmdb.org/t/p/w185{poster}"
                          if poster else None),
-            "rating": round(top["vote_average"], 1) if top.get("vote_average") else None,
-            "tmdb_id": top.get("id"),
+            "rating": round(rating, 1) if rating > 0 else None,
+            "tmdb_id": best.get("id"),
         }
     except Exception as e:
         print(f"[epg-enrich tmdb] {title}: {e}", flush=True)
