@@ -51,6 +51,36 @@ SAFE_VIDEO = {"h264", "hevc"}
 
 LOGO_CACHE = os.path.join(MOUNT, "hls", ".logos")
 
+def resolve_mac_path(p):
+    """tvheadend's API returns filenames mojibake-encoded (UTF-8 'ü'
+    that got round-tripped through Latin-9 → 'ÃŒ' → \\xc3\\x83\\xc5\\x92)
+    on this host. The actual file on disk is in plain UTF-8 (NFC on
+    Pi, NFD when surfaced through macOS SMB). Match the literal API
+    path first; if that misses, scan the parent dir and compare each
+    entry's NFC-normalised name against (a) the literal API basename
+    and (b) the mojibake-reversed basename."""
+    if os.path.isfile(p):
+        return p
+    import unicodedata
+    parent = os.path.dirname(p)
+    if not os.path.isdir(parent):
+        return p
+    base = os.path.basename(p)
+    candidates = {unicodedata.normalize("NFC", base)}
+    try:
+        # Mojibake reversal: encode-as-latin-9 → decode-as-utf-8.
+        candidates.add(unicodedata.normalize(
+            "NFC", base.encode("iso-8859-15").decode("utf-8")))
+    except Exception:
+        pass
+    try:
+        for entry in os.listdir(parent):
+            if unicodedata.normalize("NFC", entry) in candidates:
+                return os.path.join(parent, entry)
+    except Exception:
+        pass
+    return p
+
 # tvheadend DVR entries carry channelname (e.g. "VOX"); the live
 # scanner caches per channel slug (e.g. "vox"). Build name→slug from
 # hls-gateway once per script run.
@@ -204,9 +234,20 @@ def remux(uuid, src, out_dir):
     return True
 
 def comskip(uuid, src, out_dir, slug=None):
-    ini_path = os.path.join(MOUNT, "hls", ".comskip.ini")
+    # Per-channel ini lives next to the base ini on the Pi (written by
+    # hls-gateway's comskip_ini_for()); fall back to the base if the
+    # channel has no overrides.
+    ini_path = None
+    if slug:
+        per = os.path.join(MOUNT, "hls", f".comskip-{slug}.ini")
+        if os.path.isfile(per):
+            ini_path = per
+    if not ini_path:
+        base = os.path.join(MOUNT, "hls", ".comskip.ini")
+        if os.path.isfile(base):
+            ini_path = base
     cmd = [COMSKIP, "--quiet"]
-    if os.path.isfile(ini_path):
+    if ini_path:
         cmd += ["--ini", ini_path]
     # Use the per-channel cached logo template if we have one. Speeds
     # up + tightens detection (no per-run learning phase).
@@ -262,6 +303,7 @@ for e in data.get("entries", []):
     uuid = e.get("uuid", "")
     if not fn or not uuid: continue
     mac_ts = fn.replace("/recordings/", MOUNT + "/", 1)
+    mac_ts = resolve_mac_path(mac_ts)
     out_dir = os.path.join(MOUNT, "hls", f"_rec_{uuid}")
     if not os.path.isfile(mac_ts):
         continue

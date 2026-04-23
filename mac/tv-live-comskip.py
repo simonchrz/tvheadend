@@ -419,7 +419,9 @@ def analyze(slug, state, window_end_seg=None, window_size=WINDOW_SIZE):
     # Use the Pi-written .comskip.ini on the SMB share so detection
     # uses the same DE-private-TV tuning the Pi container does
     # (min_commercialbreak=60, validate_silence=1, drop AR, etc.).
-    ini_path = HLS_DIR / ".comskip.ini"
+    # Prefer per-channel ini if hls-gateway has written one for this slug.
+    per_channel_ini = HLS_DIR / f".comskip-{slug}.ini"
+    ini_path = per_channel_ini if per_channel_ini.is_file() else HLS_DIR / ".comskip.ini"
     # Persistent per-channel logo template. comskip otherwise re-learns
     # the logo on every 25-min scan window — quality varies per scan
     # depending on how much logo-only material falls inside, and the

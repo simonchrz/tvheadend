@@ -49,7 +49,54 @@ outro_max_seconds=60
 ; false-positives; the .scanning + min_commercialbreak=60 pipelines
 ; on top filter those out anyway.
 logo_threshold=0.60
+
+; --- Logo search area ---
+; Constrain logo training to the TOP HALF of the frame. Without this,
+; comskip's stable-edge-detection can latch onto a news ticker /
+; sponsor strip at the bottom (witnessed on rtlzwei: cached template
+; was y=475-553 on a 576-tall frame = bottom-of-screen banner, not
+; the actual channel logo). Every DE private/public TV logo is in a
+; top corner — the bottom-half scan is pure false-positive surface.
+subtitles=1
 """
+
+
+# Per-channel ini overrides, merged on top of COMSKIP_INI_TEXT at
+# comskip invocation time. Comskip's ini parser is first-match-wins,
+# so per-channel values are PREPENDED to the base ini (not appended).
+# Add entries here when a channel needs a tighter threshold, a
+# different logo position, etc.
+COMSKIP_INI_PER_CHANNEL = {
+    # rtlzwei: soft logo fade makes even 0.60 occasionally late.
+    # aggressive_logo_rejection=1 catches logo-loss faster at slight
+    # false-positive cost.
+    "rtlzwei": {
+        "logo_threshold": "0.50",
+        "aggressive_logo_rejection": "1",
+    },
+}
+
+
+def comskip_ini_for(slug):
+    """Return path to a comskip ini for this channel. Writes a
+    per-channel temp ini if there are overrides, otherwise returns
+    the base. Base is written at service startup by main()."""
+    overrides = COMSKIP_INI_PER_CHANNEL.get(slug or "", {})
+    base_path = HLS_DIR / ".comskip.ini"
+    if not overrides:
+        return base_path
+    out_path = HLS_DIR / f".comskip-{slug}.ini"
+    if (not out_path.exists()
+            or out_path.stat().st_mtime < base_path.stat().st_mtime):
+        try:
+            header = f"; --- per-channel overrides: {slug} ---\n"
+            for k, v in overrides.items():
+                header += f"{k}={v}\n"
+            out_path.write_text(header + "\n" + base_path.read_text())
+        except Exception as e:
+            print(f"comskip-{slug}.ini write: {e}", flush=True)
+            return base_path
+    return out_path
 TVH_BASE       = os.environ.get("TVH_BASE", "http://localhost:9981")
 HOST_URL       = os.environ.get("HOST_URL", "http://raspberrypi5lan:8080")
 IDLE_TIMEOUT   = int(os.environ.get("IDLE_TIMEOUT", "120"))
@@ -5134,7 +5181,10 @@ def _rec_cskip_spawn(uuid):
         for old in out_dir.glob("*.txt"):
             try: old.unlink()
             except Exception: pass
+        slug = _rec_channel_slug(uuid)
+        ini = comskip_ini_for(slug)
         cmd = ["nice", "-n", "15", "comskip",
+               "--ini", str(ini),
                "--output", str(out_dir),
                "--quiet", src]
         # Cooperative lock-file so the Mac-side tv-comskip.sh skips
@@ -5951,10 +6001,11 @@ def _live_ads_analyze(slug, window_end_seg=None, window_size=1800):
         return False
     # comskip — maximum niceness and tight ionice so it loses to
     # every live-TV ffmpeg whenever there's contention.
+    ini = comskip_ini_for(slug)
     try:
         subprocess.run(
             ["nice", "-n", "19", "ionice", "-c", "3",
-             "comskip", "--quiet",
+             "comskip", "--ini", str(ini), "--quiet",
              "--output", str(work), str(merged)],
             timeout=600, check=False)
     except Exception as e:
