@@ -326,7 +326,6 @@ ul.channels .logo img { max-width: 100%; max-height: 100%; }
 }
 .ch-cell:last-child { border-bottom: none; }
 .ch-cell img { width: 48px; height: 36px; object-fit: contain;
-               background: var(--logo-bg); border-radius: 4px; padding: 2px;
                flex: 0 0 48px; }
 .ch-cell .name { font-weight: 600; font-size: .75em;
                  white-space: nowrap; overflow: hidden;
