@@ -208,7 +208,7 @@ def blackframe_extend_ads(video_path, ads, channel_slug=None,
                 ["ffmpeg", "-hide_banner", "-nostats",
                  "-ss", str(ss), "-i", str(video_path),
                  "-t", str(scan_window + 2),
-                 "-vf", "blackdetect=d=0.04:pix_th=0.20:pic_th=0.90",
+                 "-vf", "blackdetect=d=0.04:pix_th=0.30:pic_th=0.80",
                  "-an", "-f", "null", "-"],
                 capture_output=True, text=True, timeout=25)
             for line in proc.stderr.splitlines():
@@ -239,7 +239,7 @@ def blackframe_extend_ads(video_path, ads, channel_slug=None,
                 ["ffmpeg", "-hide_banner", "-nostats",
                  "-ss", str(ss2), "-i", str(video_path),
                  "-t", str(START_SCAN + 2),
-                 "-vf", "blackdetect=d=0.04:pix_th=0.20:pic_th=0.90",
+                 "-vf", "blackdetect=d=0.04:pix_th=0.30:pic_th=0.80",
                  "-an", "-f", "null", "-"],
                 capture_output=True, text=True, timeout=20)
             for line in proc.stderr.splitlines():
