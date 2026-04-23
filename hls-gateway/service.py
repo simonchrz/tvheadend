@@ -2191,14 +2191,12 @@ html,body{height:100%;background:#000;color:#eee;
  background:linear-gradient(#000d,transparent);transition:opacity .3s}
 .row{display:flex;align-items:center;gap:6px;margin-top:8px;
  flex-wrap:wrap;row-gap:8px}
-/* Minimal-controls mode: hide every button in the row except
-   #liveBtn (⏭), keep the #cur timer + scrubbar + title visible.
-   Toggle via #ctrlMin in the topbar; state persisted in
-   localStorage('player-ctrl-min'). #liveBtn stays so the user has
-   a one-tap path to live edge — dragging the thumb to the very
-   right works (snap-to-live at p>=0.98) but a button is more
-   reliable on small thumbs. */
-body.ctrl-min .row > button:not(#liveBtn),
+/* Minimal-controls mode: hide every button in the row, keep the
+   #cur timer + scrubbar + title visible. Toggle via #ctrlMin in
+   the topbar; state persisted in localStorage('player-ctrl-min').
+   Live-edge is reachable by dragging the scrub thumb to the
+   rightmost 2 % (seekTo snaps to goLive() in that range). */
+body.ctrl-min .row > button,
 body.ctrl-min .row > #skipad,
 body.ctrl-min .row > #volume-wrap{display:none}
 .spacer{flex:1 1 auto}
