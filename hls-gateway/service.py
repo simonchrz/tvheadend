@@ -7052,6 +7052,12 @@ def api_warm_status():
     for s in ALWAYS_WARM:
         out.setdefault(s, {"running": False, "always_warm": True,
                             "idle_seconds": 0, "buffer_seconds": 0})
+        # setdefault only inserts the always_warm flag when the key is
+        # NEW. If the channel was already in `out` (because it had a
+        # 'now' title or an active session), the flag never got set —
+        # the frontend then thought it wasn't pinned, hid the pin
+        # icon, and wouldn't let the user toggle it. Set it explicitly.
+        out[s]["always_warm"] = True
         out[s]["dormant"] = s in dormant_snapshot
     dvr_busy = active_dvr_count()
     pins_used = len(ALWAYS_WARM)
