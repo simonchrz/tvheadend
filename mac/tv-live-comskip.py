@@ -162,6 +162,108 @@ def save_live_ads(state):
             log(f"save live-ads: {e}")
 
 
+def parse_logo_csv(out_dir):
+    """Read comskip's --csvout per-frame dump → (ge_array, fps).
+    ge_array[i] = goodEdge logo confidence at frame i (1-indexed; index 0
+    is unused). Missing frames default to 0.0. The CSV is ~150 KB/min of
+    content so a 30-min scan window holds ~4 MB — fits comfortably in
+    memory and parses in <100 ms.
+    Format (from OutputFrameArray in comskip.c:13858):
+      sep=,
+      frame,brightness,scene_change,logo,uniform,sound,minY,MaxY,ar_ratio,goodEdge,...,FPS
+      1,10,0,0,0,1522,10,566,1.81,0.0,0,0,...
+    The header's last token is the fps as float."""
+    csvs = list(out_dir.glob("*.csv"))
+    if not csvs:
+        return [], 25.0
+    fps = 25.0
+    ge = {}
+    try:
+        with open(csvs[0]) as f:
+            for line in f:
+                parts = line.rstrip("\n").split(",")
+                if len(parts) < 10:
+                    continue
+                head = parts[0]
+                if head in ("sep=", ""):
+                    continue
+                if head == "frame":
+                    # Header line; last field is fps
+                    try:
+                        v = float(parts[-1])
+                        if v > 0:
+                            fps = v
+                    except ValueError:
+                        pass
+                    continue
+                try:
+                    fn = int(head)
+                    ge[fn] = float(parts[9])
+                except (ValueError, IndexError):
+                    continue
+    except Exception:
+        return [], fps
+    if not ge:
+        return [], fps
+    n = max(ge) + 1
+    return [ge.get(i, 0.0) for i in range(n)], fps
+
+
+def refine_ads_by_logo(ads_sec, ge_array, fps,
+                        threshold=0.10, hysteresis=10, max_shift_sec=120.0):
+    """Snap each ad boundary to the actual logo loss / return frame using
+    the per-frame goodEdge confidence from --csvout. Cleaner than
+    blackdetect-based extension because it works on hard cuts (no black
+    transition) and naturally swallows logo-less sponsor cards into the
+    ad block.
+
+    For each [start_s, end_s]:
+      - Walk backward from start_f up to max_shift_sec frames. The latest
+        frame with ge >= threshold is the last show frame; ad starts at
+        the next frame.
+      - Walk forward from end_f. The first run of `hysteresis` consecutive
+        frames with ge >= threshold is the show return; ad ends at the
+        first frame of that run. Hysteresis filters single-frame logo
+        flashes that occasionally appear during ads.
+    Returns (refined_ads, moved_flags). moved_flags[i] = (start_moved,
+    end_moved) — True iff the boundary was actually shifted, so callers
+    can skip blackframe-extend on that side."""
+    if not ge_array or fps <= 0:
+        return ads_sec, [(False, False)] * len(ads_sec)
+    n = len(ge_array)
+    max_shift_f = int(max_shift_sec * fps)
+    refined = []
+    moved = []
+    for start_s, end_s in ads_sec:
+        start_f = int(round(start_s * fps))
+        end_f = int(round(end_s * fps))
+        new_start_f = start_f
+        new_end_f = end_f
+        # Backward scan for ad-start. We want the last "show" frame in
+        # the window — first one going backward where ge >= threshold.
+        scan_min = max(1, start_f - max_shift_f)
+        for f in range(min(start_f - 1, n - 1), scan_min - 1, -1):
+            if ge_array[f] >= threshold:
+                new_start_f = f + 1
+                break
+        # Forward scan for ad-end. First sustained run of `hysteresis`
+        # logo-present frames marks show return.
+        scan_max = min(n - 1, end_f + max_shift_f)
+        run = 0
+        for f in range(max(end_f + 1, 1), scan_max + 1):
+            if ge_array[f] >= threshold:
+                run += 1
+                if run >= hysteresis:
+                    new_end_f = f - hysteresis + 1
+                    break
+            else:
+                run = 0
+        refined.append([round(new_start_f / fps, 2),
+                        round(new_end_f / fps, 2)])
+        moved.append((new_start_f != start_f, new_end_f != end_f))
+    return refined, moved
+
+
 def parse_comskip(out_dir):
     """Parse comskip's default .txt output → list of [start_s, stop_s].
     Adjacent blocks separated by a short sponsor card (≤25 s of "show")
@@ -458,7 +560,7 @@ def analyze(slug, state, window_end_seg=None, window_size=WINDOW_SIZE):
 
     # ---- concat from local cache ----
     work = WORK_DIR / slug
-    for f in work.glob("*.txt"):
+    for f in list(work.glob("*.txt")) + list(work.glob("*.csv")):
         try:
             f.unlink()
         except Exception:
@@ -492,7 +594,7 @@ def analyze(slug, state, window_end_seg=None, window_size=WINDOW_SIZE):
     logo_cache_dir = HLS_DIR / ".logos"
     logo_cache = logo_cache_dir / f"{slug}.logo.txt"
     scan_t0 = time.time()
-    cmd = [str(COMSKIP), "--quiet"]
+    cmd = [str(COMSKIP), "--quiet", "--csvout"]
     if ini_path.is_file():
         cmd += ["--ini", str(ini_path)]
     if logo_cache.is_file() and logo_cache.stat().st_size > 0:
@@ -502,8 +604,25 @@ def analyze(slug, state, window_end_seg=None, window_size=WINDOW_SIZE):
         subprocess.run(cmd, timeout=600, check=False, capture_output=True)
     except Exception as e:
         log(f"[{slug}] comskip: {e}")
-    ads_sec = parse_comskip(work)
-    ads_sec = blackframe_extend_ads(str(merged), ads_sec, channel_slug=slug)
+    ads_raw = parse_comskip(work)
+    # Logo-confidence refinement: snap each block boundary to the actual
+    # logo-loss / logo-return frame in the per-frame CSV. More precise
+    # than blackframe-based extend because it works on hard cuts and
+    # naturally swallows logo-less sponsor cards into the ad.
+    ge_array, csv_fps = parse_logo_csv(work)
+    if ge_array:
+        ads_logo, moved = refine_ads_by_logo(ads_raw, ge_array, csv_fps)
+    else:
+        ads_logo = ads_raw
+        moved = [(False, False)] * len(ads_raw)
+    # blackframe-extend covers the cases where logo data couldn't help
+    # (no logo template trained, ambiguous fades, channels with logo
+    # visible during sponsor cards). For boundaries that logo-refine
+    # actually moved, trust those over blackframe-extend.
+    ads_bf = blackframe_extend_ads(str(merged), ads_raw, channel_slug=slug)
+    ads_sec = []
+    for (ls, le), (bs, be), (sm, em) in zip(ads_logo, ads_bf, moved):
+        ads_sec.append([ls if sm else bs, le if em else be])
     # Refresh the cached logo template if comskip wrote a fresh one and
     # the scan looked successful (≥2 ad blocks ≈ logo learning worked).
     # Avoids poisoning the cache from a degenerate scan with no ads.
