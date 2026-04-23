@@ -2537,13 +2537,14 @@ body{{touch-action:pan-y}}
 #avail{{position:absolute;top:0;bottom:0;background:#fff4;
   border-radius:2px;width:0;left:0}}
 .chapter{{position:absolute;top:50%;transform:translate(-50%,-50%);
-  width:6px;height:16px;background:#fff;border-radius:2px;
-  opacity:.85;box-shadow:0 0 2px #000a;z-index:1;cursor:pointer;
-  border:0;padding:0}}
-.chapter::before{{content:'';position:absolute;left:-14px;right:-14px;
-  top:-12px;bottom:-12px}}
-.chapter.current{{background:#ffd84d;width:6px;height:18px}}
-.chapter:active{{opacity:.6}}
+  width:32px;height:40px;background:transparent;border:0;padding:0;
+  z-index:1;cursor:pointer}}
+.chapter::after{{content:'';position:absolute;left:50%;top:50%;
+  transform:translate(-50%,-50%);width:6px;height:16px;background:#fff;
+  border-radius:2px;opacity:.85;box-shadow:0 0 2px #000a;
+  pointer-events:none}}
+.chapter.current::after{{background:#ffd84d;height:18px}}
+.chapter:active::after{{opacity:.5}}
 #skipad{{background:#e74c3c;color:#fff;padding:7px 12px;border:0;
   border-radius:16px;font-weight:600;font-size:.85em;cursor:pointer;
   display:none;flex:0 0 auto}}
@@ -3018,8 +3019,11 @@ function loadMediathekAvail(slug){{
 /* EPG start times are when the broadcast SLOT begins, but actual
    content (after station ID / trailers) often starts 10-30 s later.
    Seek a bit before the EPG start so we never miss the opener. ZDF
-   tends to have longer slot-padding than ARD, so give it more room. */
+   tends to have longer slot-padding than ARD, so give it more room.
+   KiKa has unusually long branding/trailer pre-rolls (~1:50) before
+   each show — use a negative lead-in to skip past them. */
 function eventLeadIn(slug){{
+  if(slug==='kika-hd')return -100;
   return slug.startsWith('zdf')||slug==='3sat-hd'?5:15;
 }}
 /* Per-channel offset added to the authoritative broadcast start. ZDFs
