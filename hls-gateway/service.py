@@ -2621,7 +2621,12 @@ v.addEventListener('loadedmetadata',()=>{{
   refresh();renderChapters();renderLiveAds();
 }});
 setInterval(()=>{{if(!v.paused){{renderChapters();renderLiveAds();}}}},5000);
-setInterval(()=>{{if(current)loadLiveAds(current);}},300000);
+/* Re-fetch ad-block JSON every 30 s — was 5 min, which made the
+   "Werbung ⏭" button show up to 5 min after a freshly-detected ad
+   block landed in .live_ads.json. The Mac handler scans roughly
+   every 30 s per channel, so this cadence keeps us at most one
+   detection cycle behind. The endpoint reads a small JSON file. */
+setInterval(()=>{{if(current)loadLiveAds(current);}},30000);
 function goLive(){{
   /* Mediathek-live channel: stay inside the Mediathek HLS and just
      seek to its live edge — avoids spawning a DVB-C tuner. hls.js
