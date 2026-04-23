@@ -623,6 +623,20 @@ def analyze(slug, state, window_end_seg=None, window_size=WINDOW_SIZE):
     ads_sec = []
     for (ls, le), (bs, be), (sm, em) in zip(ads_logo, ads_bf, moved):
         ads_sec.append([ls if sm else bs, le if em else be])
+    # If the last block runs through the end of the scan window, comskip
+    # can't see where it actually ends — neither logo-refine nor
+    # blackframe-extend can extend past the available frames. Without
+    # any extension the saved ad-end equals scan-end, which makes the
+    # player show "ads finished" while the real ad is still running for
+    # several more minutes. Extend optimistically by 10 min so the skip
+    # button stays visible until the next scan re-detects the block
+    # with proper boundaries (the retained-ads merge will overwrite
+    # this entry in-place).
+    if ads_sec:
+        win_end_sec = len(window) * SEGMENT_TIME
+        last_start, last_end = ads_sec[-1]
+        if win_end_sec - last_end < 1.0:
+            ads_sec[-1] = [last_start, last_end + 600.0]
     # Refresh the cached logo template if comskip wrote a fresh one and
     # the scan looked successful (≥2 ad blocks ≈ logo learning worked).
     # Avoids poisoning the cache from a degenerate scan with no ads.
