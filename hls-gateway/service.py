@@ -5144,6 +5144,19 @@ def recordings_page():
                            f'★ {meta["rating"]}</span>'
                            if meta.get("rating") else '')
             title_cell = poster_html + title_cell + rating_html
+        if in_series:
+            # Inside a series group the title is redundant (already in
+            # the purple group header). Drop the column to free up
+            # horizontal space for the date/duration/size on mobile.
+            return (f'<tr><td>{badge}</td>'
+                    f'<td>{when}</td>'
+                    f'<td>{dur_min} min</td>'
+                    f'<td>{size_str}</td>'
+                    f'<td>{prewarm}</td>'
+                    f'<td>{watch_cell}</td>'
+                    f'<td><a class="del-btn" href="{HOST_URL}/recording/{uuid}/delete" '
+                    f'data-title="{title.replace(chr(34),"&quot;")}" '
+                    f'data-when="{when}">🗑</a></td></tr>')
         return (f'<tr><td>{badge}</td>'
                 f'<td>{title_cell}</td>'
                 f'<td>{when}</td>'
@@ -5333,7 +5346,7 @@ def recordings_page():
             f"overflow:hidden;text-overflow:ellipsis;white-space:nowrap}}"
             f"tr.series-head .series-kill{{margin-left:auto;background:none;"
             f"border:0;color:var(--muted);cursor:pointer;font-size:.9em;"
-            f"padding:2px 6px}}"
+            f"padding:2px 0 2px 6px}}"
             f"tr.series-head .series-kill:hover{{color:#e74c3c}}"
             f"table.series-sub{{width:100%;border-collapse:collapse}}"
             f"table.series-sub td{{padding:4px 8px}}"
