@@ -40,6 +40,15 @@ validate_silence=1
 ; intros (Vorspann) often contain blackframes that look ad-like.
 intro_max_seconds=60
 outro_max_seconds=60
+
+; --- Logo sensitivity ---
+; Default 0.80 = block boundary needs 80 % logo-absence confidence.
+; That confidence builds slowly when the logo fades out gradually
+; (rtlzwei does this), pushing detected ad-start 15-20 s past the
+; visual logo-disappear. 0.60 is more responsive at slight cost in
+; false-positives; the .scanning + min_commercialbreak=60 pipelines
+; on top filter those out anyway.
+logo_threshold=0.60
 """
 TVH_BASE       = os.environ.get("TVH_BASE", "http://localhost:9981")
 HOST_URL       = os.environ.get("HOST_URL", "http://raspberrypi5lan:8080")
