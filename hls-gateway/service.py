@@ -2513,7 +2513,12 @@ if(volWrap){
       JSON.stringify({volume:v.volume,muted:v.muted}));}catch(e){}
   }
   v.volume=storedVol;
-  v.muted=storedMuted;
+  /* Only restore an explicit muted=true preference. If storedMuted is
+     false we leave v.muted whatever the HTML attribute set (typically
+     true for autoplay) so the browser actually starts playback —
+     restoring muted=false on a freshly-loaded page would override the
+     autoplay-muted attribute and trigger the autoplay-policy block. */
+  if(storedMuted)v.muted=true;
   volIcon.addEventListener('click',e=>{
     e.stopPropagation();
     v.muted=!v.muted;
