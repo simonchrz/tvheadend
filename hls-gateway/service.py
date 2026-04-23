@@ -5048,18 +5048,10 @@ def recordings_page():
         size = e.get("filesize", 0) or 0
         is_live = start <= now_ts < stop and sched == "recording"
         is_done = now_ts >= stop or "Completed" in status
-        if is_live:
-            badge = '<span class="badge live">● REC</span>'
-        elif is_done:
-            badge = '<span class="badge done">✓ fertig</span>'
-        else:
-            badge = '<span class="badge scheduled">⏱ geplant</span>'
         when = time.strftime("%d.%m %H:%M", time.localtime(start))
         dur_min = max(0, (stop - start) // 60)
-        size_mb = size / (1024 * 1024) if size else 0
-        size_str = f"{size_mb:.0f} MB" if size_mb > 0 else "—"
+        play_url = f"{HOST_URL}/recording/{uuid}"
         if is_live or is_done:
-            play_url = f"{HOST_URL}/recording/{uuid}"
             title_cell = f'<a href="{play_url}">{title}</a>'
         else:
             title_cell = f'<span>{title}</span>'
@@ -5098,7 +5090,9 @@ def recordings_page():
                             and has_endlist and not has_txt)
 
             if playlist.exists() and not pi_remux_running and not mac_remuxing:
-                prewarm = '<span class="badge ready" title="sofort abspielbar">▶ bereit</span>'
+                # Ready to stream → play button.
+                status_cell = (f'<a class="badge play-btn" href="{play_url}" '
+                               f'title="Abspielen">▶ abspielen</a>')
             elif pi_remux_running:
                 total = (proc_info or {}).get("total_segs", 0)
                 segs = 0
@@ -5106,21 +5100,26 @@ def recordings_page():
                     try: segs = playlist.read_text().count(".ts")
                     except Exception: pass
                 pct = (int(segs * 100 / total) if total > 0 else 0)
-                prewarm = (f'<span class="badge warming" '
-                           f'title="Remux läuft">⏳ {pct}%</span>')
+                status_cell = (f'<span class="badge warming" '
+                               f'title="Remux läuft">⏳ {pct}%</span>')
             elif mac_remuxing:
-                prewarm = ('<span class="badge warming" '
-                           'title="Mac remuxt">⏳ Mac</span>')
+                status_cell = ('<span class="badge warming" '
+                               'title="Mac remuxt">⏳ Mac</span>')
             else:
-                prewarm = '<span class="badge pending" title="noch nicht remuxt">◌ ausstehend</span>'
+                status_cell = ('<span class="badge pending" '
+                               'title="noch nicht remuxt">◌ ausstehend</span>')
             if pi_cskip_running:
-                prewarm += (' <span class="badge scanning" '
-                            'title="comskip analysiert Werbeblöcke">🔍 scan</span>')
+                status_cell += (' <span class="badge scanning" '
+                                'title="comskip analysiert Werbeblöcke">🔍</span>')
             elif mac_scanning:
-                prewarm += (' <span class="badge scanning" '
-                            'title="Mac comskip analysiert Werbeblöcke">🔍 Mac</span>')
+                status_cell += (' <span class="badge scanning" '
+                                'title="Mac comskip analysiert Werbeblöcke">🔍</span>')
+        elif is_live:
+            status_cell = (f'<a class="badge live" href="{play_url}" '
+                           f'title="Live ansehen">● live</a>')
         else:
-            prewarm = ""
+            status_cell = ('<span class="badge scheduled" '
+                           'title="Sendung wird zur geplanten Zeit aufgenommen">⏱ geplant</span>')
         # Watched-button only makes sense for completed recordings —
         # marking a scheduled (not-yet-recorded) episode as "watched"
         # is nonsensical and the green-check next to a "—" size cell
@@ -5159,20 +5158,16 @@ def recordings_page():
         tools_cell = f'<td class="row-tools">{watch_cell}{del_btn}</td>'
         if in_series:
             # Inside a series group the title is redundant (already in
-            # the purple group header). Drop the column to free up
-            # horizontal space for the date/duration on mobile. File-
-            # size column also dropped — without a header users had
-            # no way to interpret the bare "650 MB" / "—" placeholder.
-            return (f'<tr><td>{badge}</td>'
+            # the purple group header). Status badge doubles as the
+            # play button when the recording is ready.
+            return (f'<tr><td>{status_cell}</td>'
                     f'<td>{when}</td>'
                     f'<td>{dur_min} min</td>'
-                    f'<td>{prewarm}</td>'
                     f'{tools_cell}</tr>')
-        return (f'<tr><td>{badge}</td>'
+        return (f'<tr><td>{status_cell}</td>'
                 f'<td>{title_cell}</td>'
                 f'<td>{when}</td>'
                 f'<td>{dur_min} min</td>'
-                f'<td>{prewarm}</td>'
                 f'{tools_cell}</tr>')
 
     rows = []
@@ -5217,7 +5212,7 @@ def recordings_page():
         rating_html = (f' <span class="rec-rating" title="TVmaze rating">'
                        f'★ {meta["rating"]}</span>'
                        if meta.get("rating") else '')
-        summary = (f'<tr class="series-head"><td colspan="6">'
+        summary = (f'<tr class="series-head"><td colspan="5">'
                    f'<details data-ar="{ar_uuid}"{open_attr}>'
                    f'<summary>{poster_html}{badge}'
                    f'<span class="series-title">{group_title}'
@@ -5273,12 +5268,13 @@ def recordings_page():
             title_cell = f'<span>{mt_title}</span>'
         else:
             title_cell = f'<a href="{HOST_URL}/recording/{vuuid}">{mt_title}</a>'
+        if avail_cell:
+            title_cell += f'<br>{avail_cell}'
         rows.append(
             f'<tr><td>{mt_badge}</td>'
             f'<td>{title_cell}</td>'
             f'<td>{when}</td>'
             f'<td>{dur_min} min</td>'
-            f'<td>{avail_cell}</td>'
             f'<td class="row-tools">'
             f'<a class="del-btn" href="{HOST_URL}/mediathek-rec/{vuuid}/delete" '
             f'data-title="{mt_title.replace(chr(34),"&quot;")}" '
@@ -5344,6 +5340,10 @@ def recordings_page():
             f".row-tools{{text-align:right;white-space:nowrap;width:1%}}"
             f".row-tools .watch-btn{{margin-right:6px}}"
             f".badge.series{{background:#8e44ad;color:#fff;flex-shrink:0}}"
+            f"a.badge.play-btn{{background:#2980b9;color:#fff;text-decoration:none;"
+            f"font-weight:600;cursor:pointer}}"
+            f"a.badge.live{{background:#e74c3c;color:#fff;text-decoration:none;"
+            f"font-weight:600;cursor:pointer}}"
             f".badge.mediathek{{background:#2980b9;color:#fff}}"
             f".badge.mediathek.local{{background:#27ae60}}"
             f".badge.expired{{background:#7f8c8d;color:#fff}}"
@@ -5366,7 +5366,7 @@ def recordings_page():
             f"</div>"
             f"<div class='rec-body'>"
             f"<table>"
-            f"{''.join(rows) if rows else '<tr><td colspan=6>Keine Aufnahmen</td></tr>'}"
+            f"{''.join(rows) if rows else '<tr><td colspan=5>Keine Aufnahmen</td></tr>'}"
             f"</table>"
             f"</div>"
             f"<script>"
