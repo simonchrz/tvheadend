@@ -2420,7 +2420,7 @@ function closePlayer(ev){
 // behind `if(!_dragging)` so the playback ticker doesn't fight the
 // drag position mid-gesture.
 let _dragging=false;
-function _dragVisual(ev){{
+function _dragVisual(ev){
   const r=scrub.getBoundingClientRect();
   const cx=(ev.touches?ev.touches[0]:ev).clientX;
   const x=Math.max(0,Math.min(r.width,cx-r.left));
@@ -2431,21 +2431,21 @@ function _dragVisual(ev){{
   const[ws,we]=scrubWindow();
   const w=ws+(pct/100)*(we-ws);
   if(isFinite(w)&&w>0)cur.textContent=new Date(w*1000).toLocaleTimeString(
-    'de-DE',{{hour:'2-digit',minute:'2-digit',second:'2-digit'}});
-}}
-scrub.addEventListener('mousedown',e=>{{_dragging=true;_dragVisual(e);show();}});
-window.addEventListener('mousemove',e=>{{if(_dragging){{_dragVisual(e);show();}}}});
-window.addEventListener('mouseup',e=>{{if(_dragging){{_dragging=false;seekTo(e);}}}});
-scrub.addEventListener('touchstart',e=>{{_dragging=true;_dragVisual(e);show();}},{{passive:true}});
-scrub.addEventListener('touchmove',e=>{{if(_dragging){{_dragVisual(e);show();}}}},{{passive:true}});
-scrub.addEventListener('touchend',e=>{{
+    'de-DE',{hour:'2-digit',minute:'2-digit',second:'2-digit'});
+}
+scrub.addEventListener('mousedown',e=>{_dragging=true;_dragVisual(e);show();});
+window.addEventListener('mousemove',e=>{if(_dragging){_dragVisual(e);show();}});
+window.addEventListener('mouseup',e=>{if(_dragging){_dragging=false;seekTo(e);}});
+scrub.addEventListener('touchstart',e=>{_dragging=true;_dragVisual(e);show();},{passive:true});
+scrub.addEventListener('touchmove',e=>{if(_dragging){_dragVisual(e);show();}},{passive:true});
+scrub.addEventListener('touchend',e=>{
   if(!_dragging)return;
   _dragging=false;
   /* touchend's .touches is empty — synthesize from changedTouches so
      seekTo() can pull a clientX out of it. */
   const t=e.changedTouches&&e.changedTouches[0];
-  if(t)seekTo({{touches:[t],clientX:t.clientX}});
-}},{{passive:true}});
+  if(t)seekTo({touches:[t],clientX:t.clientX});
+},{passive:true});
 let _lastTapT=0,_lastTapX=0;
 v.addEventListener('touchend',e=>{
   if(!e.changedTouches[0])return;
@@ -6221,11 +6221,10 @@ def api_live_ads_scan(slug):
                            mimetype="application/json"))
 
 
-@app.route("/api/live-ads/<slug>")
-def api_live_ads(slug):
-    # Under LIVE_ADS_OFFLOAD, the authoritative state is the JSON on
-    # disk (another host writes it) — our in-memory cache is stale.
-    # Re-read each call; the file is only a few kB.
+def _live_ads_payload(slug):
+    """Snapshot of {ads, generated} for a channel. Reads the JSON file
+    under LIVE_ADS_OFFLOAD (the authoritative writer is another host),
+    or the in-memory cache otherwise."""
     if os.environ.get("LIVE_ADS_OFFLOAD") and LIVE_ADS_FILE.exists():
         try:
             data = json.loads(LIVE_ADS_FILE.read_text())
@@ -6236,12 +6235,67 @@ def api_live_ads(slug):
         with _live_ads_lock:
             v = _live_ads.get(slug)
     if not v:
-        return _cors(Response(json.dumps({"ads": [], "generated": 0}),
-                               mimetype="application/json"))
-    return _cors(Response(json.dumps({
-        "ads": v["ads"],
-        "generated": int(v["generated"]),
-    }), mimetype="application/json"))
+        return {"ads": [], "generated": 0}
+    return {"ads": v["ads"], "generated": int(v["generated"])}
+
+
+@app.route("/api/live-ads/<slug>")
+def api_live_ads(slug):
+    return _cors(Response(json.dumps(_live_ads_payload(slug)),
+                           mimetype="application/json"))
+
+
+@app.route("/api/live-ads-stream/<slug>")
+def api_live_ads_stream(slug):
+    """SSE push: emit a fresh ad payload whenever .live_ads.json
+    changes on disk (= the Mac scanner just saved a new scan result).
+    Replaces the player's 30 s polling loop so the skip button shows
+    up the moment a new ad is detected, not 0-30 s later. Heartbeat
+    every 20 s keeps long-lived connections alive through Caddy /
+    cellular proxies. mtime-poll cadence 1 s — file is a few kB, OS
+    caches it, the cost is negligible.
+    Each connection holds a waitress worker thread for its lifetime;
+    with the default pool of 4 we can hold 4 concurrent player tabs
+    before /api/* requests start queuing. Plenty for home use."""
+    def gen():
+        last_mtime = -1
+        last_payload = None
+        last_heartbeat = time.time()
+        # Send the current state immediately on connect so the client
+        # doesn't wait for the first file change to render.
+        try:
+            if LIVE_ADS_FILE.exists():
+                last_mtime = LIVE_ADS_FILE.stat().st_mtime
+            payload = _live_ads_payload(slug)
+            last_payload = json.dumps(payload)
+            yield f"data: {last_payload}\n\n"
+        except Exception:
+            pass
+        while True:
+            time.sleep(1)
+            try:
+                if LIVE_ADS_FILE.exists():
+                    mt = LIVE_ADS_FILE.stat().st_mtime
+                    if mt != last_mtime:
+                        last_mtime = mt
+                        payload = _live_ads_payload(slug)
+                        msg = json.dumps(payload)
+                        if msg != last_payload:
+                            last_payload = msg
+                            yield f"data: {msg}\n\n"
+                            last_heartbeat = time.time()
+                            continue
+            except Exception:
+                pass
+            now = time.time()
+            if now - last_heartbeat > 20:
+                yield ":hb\n\n"
+                last_heartbeat = now
+    return Response(gen(),
+                     mimetype="text/event-stream",
+                     headers={"Cache-Control": "no-cache",
+                              "X-Accel-Buffering": "no",
+                              "Access-Control-Allow-Origin": "*"})
 
 
 def _rec_prewarm_loop():
