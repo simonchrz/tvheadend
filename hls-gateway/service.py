@@ -5706,9 +5706,21 @@ def _rec_channel_slug(uuid):
     return ""
 
 
+_TVD_LOGO_DIR = HLS_DIR / ".tvd-logos"
+
 def _rec_cskip_spawn(uuid):
-    """Run comskip on the original TS so we can mark commercial blocks
-    on the scrub bar. Fire-and-forget; result is polled via files."""
+    """Run tv-detect on the original TS so we can mark commercial blocks
+    on the scrub bar. Fire-and-forget; result is polled via files.
+    Function name kept for grep history; the underlying tool is
+    tv-detect now (formerly comskip — see PHASE6.md in tv-detect repo).
+
+    Logo resolution mirrors the Mac-side tv-comskip.sh:
+      1. per-channel cached at /data/hls/.tvd-logos/<slug>.logo.txt
+      2. fallback --auto-train 5 (samples first 5 min of THIS recording,
+         caches as <basename>.trained.logo.txt next to the source)
+    Empty cutlist marker on training failure (typical for ad-free
+    public broadcasters).
+    """
     with _rec_cskip_lock:
         info = _rec_cskip_procs.get(uuid)
         if info and info["proc"].poll() is None:
@@ -5718,16 +5730,31 @@ def _rec_cskip_spawn(uuid):
         src = _rec_source_path(uuid)
         if not src or not Path(src).exists():
             return
-        # Clear any prior output txt files so we can detect new ones
+        slug = _rec_channel_slug(uuid)
+        # Output filename matches what comskip would have written —
+        # existing parsers (_rec_parse_comskip below) consume it as-is.
+        base = Path(src).stem
+        out_txt = out_dir / f"{base}.txt"
+        # Clear any prior NON-archived txt files so we can detect new ones.
         for old in out_dir.glob("*.txt"):
+            n = old.name
+            if n.endswith(".logo.txt") or n.endswith(".cskp.txt") \
+                    or n.endswith(".tvd.txt") or n.endswith(".trained.logo.txt"):
+                continue
             try: old.unlink()
             except Exception: pass
-        slug = _rec_channel_slug(uuid)
-        ini = comskip_ini_for(slug)
-        cmd = ["nice", "-n", "15", "comskip",
-               "--ini", str(ini),
-               "--output", str(out_dir),
-               "--quiet", src]
+
+        cached_logo = _TVD_LOGO_DIR / f"{slug}.logo.txt" if slug else None
+        if cached_logo and cached_logo.is_file() and cached_logo.stat().st_size > 0:
+            cmd = ["tv-detect", "--quiet", "--workers", "4",
+                   "--logo", str(cached_logo),
+                   "--output", "cutlist", src]
+            mode = f"cached/{slug}"
+        else:
+            cmd = ["tv-detect", "--quiet", "--workers", "4",
+                   "--auto-train", "5", "--output", "cutlist", src]
+            mode = f"auto-train{'/'+slug if slug else ''}"
+
         # Cooperative lock-file so the Mac-side tv-comskip.sh skips
         # this recording while we're working on it (and vice versa —
         # tv-comskip.sh writes the same file before spawning). Stale
@@ -5737,17 +5764,25 @@ def _rec_cskip_spawn(uuid):
             scanning.write_text(f"pi {os.getpid()} {int(time.time())}")
         except Exception:
             pass
+        # Redirect tv-detect's cutlist stdout into the .txt file.
+        try:
+            out_fh = open(out_txt, "wb")
+        except Exception as ex:
+            print(f"[rec-cskip {uuid[:8]}] open out_txt: {ex}", flush=True)
+            return
         proc = subprocess.Popen(cmd,
-                                 stdout=subprocess.DEVNULL,
+                                 stdout=out_fh,
                                  stderr=subprocess.DEVNULL)
         _rec_cskip_procs[uuid] = {"proc": proc, "started": time.time()}
-        print(f"[rec-cskip {uuid[:8]}] spawned", flush=True)
-        def _cleanup_lock(p, lock):
+        print(f"[rec-cskip {uuid[:8]}] tv-detect spawned ({mode})", flush=True)
+        def _cleanup(p, lock, fh):
             try: p.wait()
+            except Exception: pass
+            try: fh.close()
             except Exception: pass
             try: lock.unlink(missing_ok=True)
             except Exception: pass
-        threading.Thread(target=_cleanup_lock, args=(proc, scanning),
+        threading.Thread(target=_cleanup, args=(proc, scanning, out_fh),
                          daemon=True).start()
 
 
