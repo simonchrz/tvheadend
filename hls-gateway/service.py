@@ -5834,11 +5834,15 @@ def _rec_parse_comskip(out_dir):
     Adjacent blocks separated by a short sponsor card (≤25 s of "show")
     are merged — typical pattern on VOX/RTL/Pro7: Werbung · 15 s
     Präsentation-Einblendung · Werbung · Sendungsstart."""
-    # Exclude *.logo.txt — comskip writes that file alongside the
-    # cutlist (since the SaveLogoMaskData patch in mpeg2dec.c) and
-    # filesystem ordering can put it ahead of the actual cutlist.
+    # Exclude sidecar .txt files. .logo.txt is the trained edge mask,
+    # .trained.logo.txt is its tv-detect-side equivalent, .cskp.txt is
+    # archived comskip output kept as historical reference for diffs,
+    # .tvd.txt is a leftover shadow-mode artifact from the comskip-→-
+    # tv-detect transition. Filesystem ordering can put any of those
+    # ahead of the actual cutlist if we don't filter them out.
+    SIDECAR = (".logo.txt", ".trained.logo.txt", ".cskp.txt", ".tvd.txt")
     txts = [p for p in out_dir.glob("*.txt")
-            if not p.name.endswith(".logo.txt")]
+            if not any(p.name.endswith(s) for s in SIDECAR)]
     if not txts:
         return []
     try:
@@ -7006,7 +7010,11 @@ def recording_ads(uuid):
                 edited = False
         if not edited:
             ads_cache = out_dir / "ads.json"
-            txts = list(out_dir.glob("*.txt"))
+            # Same sidecar-exclusion as _rec_parse_comskip — a stale
+            # .cskp.txt mtime would otherwise force endless re-parses.
+            SIDECAR = (".logo.txt", ".trained.logo.txt", ".cskp.txt", ".tvd.txt")
+            txts = [p for p in out_dir.glob("*.txt")
+                    if not any(p.name.endswith(s) for s in SIDECAR)]
             txt_mtime = max((t.stat().st_mtime for t in txts), default=0)
             if (not running and txts
                     and ads_cache.exists()
