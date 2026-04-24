@@ -151,7 +151,7 @@ CH_LOGO_DIR      = Path(__file__).parent / "static" / "ch-logos"
 TMDB_API_KEY     = os.environ.get("TMDB_API_KEY", "").strip()  # optional: better DE show coverage
 PIN_HARD_MAX = 3   # tuner-driven upper bound; minus active/scheduled DVR jobs
 TUNER_TOTAL = int(os.environ.get("TUNER_TOTAL", "4"))   # FRITZ!Box DVB-C tuners
-EPG_SNAPSHOT_INTERVAL = 600   # 10 min
+EPG_SNAPSHOT_INTERVAL = 1800  # 30 min — fan-out hits all ~24 channels via /api/epg/events/grid in parallel; tvheadend's table parser overflowed at 10 min when it overlapped with active recordings + DVR API queries
 EPG_ARCHIVE_KEEP_DAYS = 14
 
 # How long the sponsor/"Präsentiert von ..."-Einblendung typically is
@@ -6772,14 +6772,19 @@ def api_live_ads_stream(slug):
 def _rec_prewarm_loop():
     """Background: remux finished DVR recordings to HLS so the player
     doesn't have to wait. Serial, low priority, skipped while live
-    streams are active so we never starve live TV of CPU."""
+    streams are active so we never starve live TV of CPU.
+    300 s cadence (was 60 s) — the tvh dvr/grid_finished poll was a
+    major contributor to the table-parser overload incident; on-demand
+    remux still triggers via /recording/<uuid>/ads when a player
+    opens an unprepared recording, so the proactive prewarm is just a
+    nice-to-have."""
     time.sleep(20)  # give the service a moment to settle on startup
     while True:
         try:
             _rec_prewarm_once()
         except Exception as e:
             print(f"[rec-prewarm] error: {e}", flush=True)
-        time.sleep(60)
+        time.sleep(300)
 
 
 def _mac_comskip_alive():
