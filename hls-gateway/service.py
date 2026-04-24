@@ -7085,7 +7085,7 @@ def recording_hls_progress(uuid):
     if out_dir.exists():
         usable = [t for t in out_dir.glob("*.txt")
                   if t.stat().st_size > 0]
-        if not usable:
+        if not usable and not _mac_comskip_alive():
             _rec_cskip_spawn(uuid)
         if not (out_dir / "thumbs" / ".done").exists():
             _rec_thumbs_spawn(uuid)
