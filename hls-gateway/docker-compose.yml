@@ -17,6 +17,7 @@ services:
       - ./static:/app/static:ro
       - ./state-backup:/state-backup
       - /mnt/tv:/recordings:ro
+      - ./tv-detect:/usr/local/bin/tv-detect:ro
     environment:
       - TVH_BASE=http://raspberrypi5lan:9981
       - HOST_URL=https://raspberrypi5lan:8443
