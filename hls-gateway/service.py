@@ -10754,10 +10754,16 @@ if __name__ == "__main__":
     # waitress somehow isn't importable (e.g. an older image).
     try:
         from waitress import serve
-        # threads=16 handles our iOS polling load comfortably; ident
+        # threads=64 — was 16, but the Mac-offload daemon's HLS PUT
+        # uploads + .ts downloads + simultaneous page-loads from
+        # iOS browser overran the pool, causing /recordings + /learning
+        # to take 5-10 s through Caddy while the in-process handler
+        # itself returned in <1.5 s. With 64 threads, page handlers
+        # always have a free slot even when several daemon transfers
+        # are in flight.
         # removed so server banner doesn't leak the version.
         print("serving via waitress on 0.0.0.0:8080", flush=True)
-        serve(app, host="0.0.0.0", port=8080, threads=16, ident=None)
+        serve(app, host="0.0.0.0", port=8080, threads=64, ident=None)
     except ImportError:
         print("waitress not installed, falling back to flask dev server",
               flush=True)
