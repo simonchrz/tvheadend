@@ -8124,6 +8124,94 @@ def recording_source(uuid):
     return send_file(src, mimetype="video/mp2t", conditional=True)
 
 
+@app.route("/api/internal/active-channels")
+def api_internal_active_channels():
+    """List of channel slugs whose live HLS playlist has been touched
+    in the last ACTIVE_MTIME_S=60 s — i.e. someone is currently
+    watching them. Used by the Mac live-detect daemon to decide which
+    channels need a rolling-window ad scan.
+
+    Replaces the old `channel_is_active(slug)` SMB-stat lookup in
+    tv-live-detect.py — Pi reads its own local disk (no SMB on Mac
+    side, no TCC trap)."""
+    global _live_scanner_last_poll
+    _live_scanner_last_poll = time.time()
+    active = []
+    now = time.time()
+    for d in HLS_DIR.iterdir():
+        if not d.is_dir() or d.name.startswith("_") or d.name.startswith("."):
+            continue
+        m3u = d / "index.m3u8"
+        if not m3u.is_file():
+            continue
+        try:
+            if now - m3u.stat().st_mtime < 60:
+                active.append(d.name)
+        except Exception:
+            continue
+    return _cors(Response(json.dumps({"active": sorted(active)}),
+                            mimetype="application/json"))
+
+
+@app.route("/api/internal/live-config/<slug>")
+def api_internal_live_config(slug):
+    """Combined per-channel live-detect config — replaces 4 separate
+    SMB reads in tv-live-detect.py (channel_logo_smooth_s,
+    effective_start_lag, effective_sponsor_duration, logo template
+    path). Mac script uses these to build the tv-detect command line."""
+    cfg = {"slug": slug, "logo_smooth_s": 0.0,
+           "start_lag_s": 0.0, "sponsor_duration_s": 0.0,
+           "cached_logo_url": ""}
+    try:
+        ch_cfg = json.loads(
+            (HLS_DIR / ".channel-config.json").read_text()
+        ).get("channels", {}).get(slug, {})
+        cfg["logo_smooth_s"] = float(ch_cfg.get("logo_smooth_s", 0))
+    except Exception: pass
+    try:
+        learned = json.loads(
+            (HLS_DIR / ".detection_learning.json").read_text()
+        ).get(slug, {})
+        cfg["start_lag_s"] = float(learned.get("start_lag", 0))
+        cfg["sponsor_duration_s"] = float(learned.get("sponsor_duration", 0))
+    except Exception: pass
+    if (_TVD_LOGO_DIR / f"{slug}.logo.txt").is_file():
+        cfg["cached_logo_url"] = f"/api/internal/detect-logo/{slug}"
+    return _cors(Response(json.dumps(cfg), mimetype="application/json"))
+
+
+@app.route("/api/internal/live-ads", methods=["GET", "POST"])
+def api_internal_live_ads():
+    """GET: return current `.live_ads.json` content (Mac daemon loads
+    state at startup). POST: accept updated full state, write atomically.
+    Replaces SMB read+write of the same file with HTTP — no Mac-side
+    SMB needed for live-detect."""
+    if request.method == "GET":
+        global _daemon_last_poll
+        _daemon_last_poll = time.time()
+        try:
+            body = LIVE_ADS_FILE.read_text() if LIVE_ADS_FILE.exists() else "{}"
+        except Exception:
+            body = "{}"
+        return _cors(Response(body, mimetype="application/json"))
+    # POST — accept full state replacement (Mac is the sole writer
+    # when LIVE_ADS_OFFLOAD=mac, atomic-rename via .tmp)
+    body = request.get_data()
+    if len(body) > 5 << 20:  # 5 MB sanity cap
+        abort(413)
+    try:
+        json.loads(body)  # validate
+    except Exception:
+        abort(400)
+    tmp = LIVE_ADS_FILE.with_suffix(".tmp")
+    tmp.write_bytes(body)
+    tmp.rename(LIVE_ADS_FILE)
+    # Trigger in-memory reload (load_live_ads picks up next access
+    # via mtime-check; nothing more to do here).
+    return _cors(Response(json.dumps({"ok": True, "bytes": len(body)}),
+                            mimetype="application/json"))
+
+
 @app.route("/api/internal/detect-pending")
 def api_internal_detect_pending():
     """Recordings with `.detect-requested` marker. Filters out
@@ -9985,21 +10073,27 @@ def api_warm_status():
     }), mimetype="application/json"))
 
 
-# Mac-daemon heartbeat — set whenever the daemon polls any of the
-# /api/internal/*-pending endpoints. Replaces the old SMB-written
-# .mac-comskip-alive file (tv-detect-rec.sh launchd, now disabled).
-_daemon_last_poll = 0.0
+# Mac-daemon heartbeats — synthesised from /api/internal/* endpoint
+# hits. Replace the old SMB-written .mac-{comskip,live-comskip}-alive
+# files (tv-detect-rec.sh + tv-live-detect.py launchd jobs) which
+# break under macOS TCC for launchd Aqua agents accessing network mounts.
+_daemon_last_poll = 0.0          # rec-side daemon (thumbs/hls/detect)
+_live_scanner_last_poll = 0.0    # live-detect script (active-channels)
 
 
 def _hb_age(filename):
     """Seconds since the named heartbeat file was last touched, or None.
-    For `.mac-comskip-alive` we synthesise the value from the in-memory
-    daemon-poll timestamp instead of reading a file — the daemon
-    pulls jobs over HTTP, doesn't write to the SMB share."""
+    For .mac-{comskip,live-comskip}-alive we synthesise the value from
+    the in-memory daemon-poll timestamps instead of reading a file —
+    daemons pull jobs over HTTP, don't write to the SMB share."""
     if filename == ".mac-comskip-alive":
         if _daemon_last_poll == 0:
             return None
         return int(time.time() - _daemon_last_poll)
+    if filename == ".mac-live-comskip-alive":
+        if _live_scanner_last_poll == 0:
+            return None
+        return int(time.time() - _live_scanner_last_poll)
     try:
         return int(time.time() - (HLS_DIR / filename).stat().st_mtime)
     except Exception:
