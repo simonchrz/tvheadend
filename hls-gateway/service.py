@@ -7943,6 +7943,147 @@ def api_recording_ads_edit(uuid):
                            mimetype="application/json"))
 
 
+@app.route("/api/learning/summary")
+def api_learning_summary():
+    """Single-JSON snapshot of every metric the daily-summary email
+    needs. Replaces the `tv-detect-daily-summary.sh` script's direct
+    SMB reads — Mac wrapper just GETs this and templates the
+    plaintext output.
+
+    Computed from gateway-local files: head.history.json, head.
+    uncertain.txt, _rec_*/ads_user.json, _rec_*/pseudo_labels.json,
+    _rec_*/ads.json, .tvd-models/head.bin mtime."""
+    import statistics
+    now_ts = int(time.time())
+    day_ago = now_ts - 24 * 3600
+    out = {"generated_at": now_ts}
+
+    # ── Model history ────────────────────────────────────────
+    models_dir = HLS_DIR / ".tvd-models"
+    history = []
+    try:
+        history = json.loads((models_dir / "head.history.json").read_text())
+    except Exception:
+        pass
+    runs_24h = [e for e in history
+                if e.get("ts") and time.mktime(
+                    time.strptime(e["ts"], "%Y%m%dT%H%M%S")) > day_ago]
+    last_dep = next((e for e in reversed(history) if e.get("deployed")), None)
+    deployed_iou = [e["test_iou"] for e in history
+                    if e.get("deployed") and e.get("test_iou") is not None]
+    median7 = (statistics.median(deployed_iou[-7:])
+               if len(deployed_iou) >= 7 else None)
+    out["model"] = {
+        "test_iou":   last_dep.get("test_iou") if last_dep else None,
+        "test_acc":   last_dep.get("test_acc") if last_dep else None,
+        "drift_vs_7d_median":
+            (last_dep["test_iou"] - median7) if (last_dep and median7) else None,
+        "runs_24h":     len(runs_24h),
+        "deployed_24h": sum(1 for e in runs_24h if e.get("deployed")),
+        "rejected_24h": sum(1 for e in runs_24h if not e.get("deployed")),
+    }
+
+    # ── Recordings ───────────────────────────────────────────
+    rec_dirs = list(HLS_DIR.glob("_rec_*"))
+    new_recs_24h = sum(1 for d in rec_dirs if d.stat().st_mtime > day_ago)
+    user_files = list(HLS_DIR.glob("_rec_*/ads_user.json"))
+    new_user_24h = sum(1 for p in user_files if p.stat().st_mtime > day_ago)
+    reviewed = 0
+    skip_signals = 0
+    for p in user_files:
+        try:
+            d = json.loads(p.read_text())
+            if isinstance(d, dict):
+                if d.get("reviewed_at"):
+                    reviewed += 1
+                skip_signals += len(d.get("confirmed_ad_skips", []))
+        except Exception:
+            pass
+    out["recordings"] = {
+        "total":         len(rec_dirs),
+        "new_24h":       new_recs_24h,
+        "with_user":     len(user_files),
+        "reviewed":      reviewed,
+        "user_edits_24h": new_user_24h,
+        "skip_signals":  skip_signals,
+    }
+
+    # ── Active-learning queue ────────────────────────────────
+    unc_open = unc_total = 0
+    try:
+        for ln in (models_dir / "head.uncertain.txt").read_text().splitlines():
+            if not ln or ln.startswith("#"): continue
+            parts = ln.split("\t")
+            if len(parts) < 4: continue
+            unc_total += 1
+            uuid = parts[0].strip()
+            user_p = HLS_DIR / f"_rec_{uuid}" / "ads_user.json"
+            if user_p.exists():
+                try:
+                    d = json.loads(user_p.read_text())
+                    if isinstance(d, dict) and d.get("reviewed_at"):
+                        continue
+                except Exception:
+                    pass
+            unc_open += 1
+    except Exception:
+        pass
+    out["labelling_queue"] = {
+        "open":             unc_open,
+        "reviewed_skipped": unc_total - unc_open,
+    }
+
+    # ── Self-training pseudo-labels ──────────────────────────
+    pl_files = list(HLS_DIR.glob("_rec_*/pseudo_labels.json"))
+    pl_total = pl_ad = pl_show = 0
+    for p in pl_files:
+        try:
+            d = json.loads(p.read_text())
+            pl_total += int(d.get("n_frames", 0))
+            for L in d.get("labels", []):
+                if L: pl_ad += 1
+                else: pl_show += 1
+        except Exception:
+            pass
+    out["self_training"] = {
+        "recordings_with_pseudo": len(pl_files),
+        "frames_total":           pl_total,
+        "frames_ad":              pl_ad,
+        "frames_show":            pl_show,
+    }
+
+    # ── Channel-health (broken-template detector) ────────────
+    # Last 5 ads.json per channel slug; if all are 0-block → suspect.
+    by_chan = {}
+    for d in rec_dirs:
+        slug = _rec_channel_slug(d.name[5:]) or ""
+        if not slug: continue
+        ads_p = d / "ads.json"
+        if not ads_p.is_file(): continue
+        try:
+            ads = json.loads(ads_p.read_text())
+            n = len(ads) if isinstance(ads, list) else 0
+            by_chan.setdefault(slug, []).append((ads_p.stat().st_mtime, n))
+        except Exception:
+            pass
+    broken = []
+    for slug, recs in by_chan.items():
+        recs.sort(key=lambda r: -r[0])
+        if len(recs) >= 5 and all(n == 0 for _, n in recs[:5]):
+            broken.append(slug)
+    out["channel_health"] = {"broken": broken}
+
+    # ── Show-fingerprint count (for completeness) ────────────
+    try:
+        out["fingerprints"] = {
+            "active": len(_compute_show_fingerprints())}
+    except Exception:
+        out["fingerprints"] = {"active": 0}
+
+    return _cors(Response(json.dumps(out),
+                            mimetype="application/json"))
+
+
 @app.route("/api/learning/plan", methods=["POST"])
 def api_learning_plan():
     """Schedule N upcoming EPG events that match a learning recommendation.
