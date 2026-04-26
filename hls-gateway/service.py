@@ -8081,6 +8081,8 @@ def api_internal_thumbs_pending():
 
     Skips recordings still being recorded — same reasoning as
     api_internal_hls_pending."""
+    global _daemon_last_poll
+    _daemon_last_poll = time.time()
     in_progress = set()
     try:
         data = json.loads(urllib.request.urlopen(
@@ -8127,6 +8129,8 @@ def api_internal_detect_pending():
     """Recordings with `.detect-requested` marker. Filters out
     in-progress recordings (partial .ts) and ones whose cutlist
     .txt already exists."""
+    global _daemon_last_poll
+    _daemon_last_poll = time.time()
     in_progress = set()
     try:
         data = json.loads(urllib.request.urlopen(
@@ -8283,6 +8287,8 @@ def api_internal_hls_pending():
         so the Mac doesn't remux a partial .ts and produce a
         truncated HLS bundle. Once the recording finishes, the next
         prewarm cycle creates a fresh marker."""
+    global _daemon_last_poll
+    _daemon_last_poll = time.time()
     # Cache the current "still recording" set per-call (cheap; only one
     # tvh API hit per Mac poll cycle = ~12/min)
     in_progress = set()
@@ -9979,8 +9985,21 @@ def api_warm_status():
     }), mimetype="application/json"))
 
 
+# Mac-daemon heartbeat — set whenever the daemon polls any of the
+# /api/internal/*-pending endpoints. Replaces the old SMB-written
+# .mac-comskip-alive file (tv-detect-rec.sh launchd, now disabled).
+_daemon_last_poll = 0.0
+
+
 def _hb_age(filename):
-    """Seconds since the named heartbeat file was last touched, or None."""
+    """Seconds since the named heartbeat file was last touched, or None.
+    For `.mac-comskip-alive` we synthesise the value from the in-memory
+    daemon-poll timestamp instead of reading a file — the daemon
+    pulls jobs over HTTP, doesn't write to the SMB share."""
+    if filename == ".mac-comskip-alive":
+        if _daemon_last_poll == 0:
+            return None
+        return int(time.time() - _daemon_last_poll)
     try:
         return int(time.time() - (HLS_DIR / filename).stat().st_mtime)
     except Exception:
