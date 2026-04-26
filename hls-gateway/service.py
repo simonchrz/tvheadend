@@ -5,7 +5,7 @@ import os, re, sys, signal, json, time, shutil, subprocess, threading, urllib.re
 import urllib.parse
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from flask import Flask, send_from_directory, abort, Response, request
+from flask import Flask, send_from_directory, send_file, abort, Response, request
 
 HLS_DIR        = Path("/data/hls")
 COMSKIP_INI    = HLS_DIR / ".comskip.ini"
@@ -6541,6 +6541,25 @@ def _rec_cskip_spawn(uuid):
             except Exception: pass
 
         cached_logo = _TVD_LOGO_DIR / f"{slug}.logo.txt" if slug else None
+        # Mac offload: write a marker for the daemon to pick up over
+        # HTTP. Daemon downloads .ts via HTTP, runs tv-detect locally
+        # WITH NN flags (which the Pi-local path below omits), POSTs
+        # cutlist back. Falls back to local tv-detect after
+        # DETECT_FALLBACK_S if Mac silent.
+        if DETECT_OFFLOAD == "mac":
+            marker = out_dir / ".detect-requested"
+            marker.write_text(json.dumps({"ts": time.time()}))
+            print(f"[rec-cskip {uuid[:8]}] marker for Mac", flush=True)
+            def _detect_fallback():
+                time.sleep(DETECT_FALLBACK_S)
+                if not out_txt.exists() and marker.exists():
+                    print(f"[rec-cskip {uuid[:8]}] Mac timeout, fallback",
+                          flush=True)
+                    try: marker.unlink()
+                    except Exception: pass
+                    _rec_cskip_spawn(uuid)
+            threading.Thread(target=_detect_fallback, daemon=True).start()
+            return
         if cached_logo and cached_logo.is_file() and cached_logo.stat().st_size > 0:
             cmd = ["tv-detect", "--quiet", "--workers", "4",
                    "--logo", str(cached_logo),
@@ -6583,6 +6602,11 @@ def _rec_cskip_spawn(uuid):
 
 
 THUMB_INTERVAL = 30   # seconds between thumbnails
+THUMBS_OFFLOAD = os.environ.get("THUMBS_OFFLOAD", "")  # "mac" → marker file
+HLS_OFFLOAD    = os.environ.get("HLS_OFFLOAD", "")     # "mac" → marker file
+HLS_FALLBACK_S = int(os.environ.get("HLS_FALLBACK_S", "60"))  # Pi takes over if Mac silent for this long
+DETECT_OFFLOAD = os.environ.get("DETECT_OFFLOAD", "")  # "mac" → marker file
+DETECT_FALLBACK_S = int(os.environ.get("DETECT_FALLBACK_S", "120"))
 _rec_thumbs_lock = threading.Lock()
 _rec_thumbs_running = set()   # uuids currently being processed
 
@@ -6590,7 +6614,14 @@ def _rec_thumbs_spawn(uuid):
     """Generate scrub-bar thumbnails (1 per THUMB_INTERVAL s, scaled to
     160 px wide) once per recording. Writes to _rec_<uuid>/thumbs/
     and a sentinel `.done` file when finished. Idempotent — safe to
-    call on every /progress poll without spawning duplicates."""
+    call on every /progress poll without spawning duplicates.
+
+    When THUMBS_OFFLOAD=mac, drop a `.requested` marker file
+    containing the source .ts path and let the Mac-side daemon
+    (~/bin/tv-thumbs-daemon.py) do the ffmpeg work. The daemon
+    writes JPGs back to the SMB-shared directory and removes the
+    marker. If the daemon is offline, no thumbs appear — degraded
+    UX but not broken (player handles missing thumbs)."""
     out_dir = HLS_DIR / f"_rec_{uuid}" / "thumbs"
     if (out_dir / ".done").exists():
         return
@@ -6604,6 +6635,15 @@ def _rec_thumbs_spawn(uuid):
             _rec_thumbs_running.discard(uuid)
         return
     out_dir.mkdir(parents=True, exist_ok=True)
+    if THUMBS_OFFLOAD == "mac":
+        try:
+            (out_dir / ".requested").write_text(src)
+            print(f"[rec-thumbs {uuid[:8]}] marker for Mac → {src}",
+                  flush=True)
+        finally:
+            with _rec_thumbs_lock:
+                _rec_thumbs_running.discard(uuid)
+        return
     def run():
         try:
             subprocess.run(
@@ -6835,7 +6875,16 @@ def _rec_probe_total_segments(src_url):
 
 
 def _rec_hls_spawn(uuid):
-    """Spawn ffmpeg to remux TS recording into HLS VOD (copy-video, aac-audio)."""
+    """Trigger HLS remux. With HLS_OFFLOAD=mac, drops a `.hls-requested`
+    marker for the Mac daemon to pick up over HTTP and POST back the
+    HLS bundle as a tar (~10s on M5 Pro vs ~30-60s on Pi 5 + 326% Pi
+    CPU saved). Falls back to local ffmpeg after HLS_FALLBACK_S if the
+    Mac doesn't deliver, so a Mac-down outage doesn't strand viewers.
+
+    Without HLS_OFFLOAD, this is the same in-process ffmpeg spawn as
+    before — the actual local-spawn implementation is in
+    `_rec_hls_spawn_local`, separated only for the offload-path
+    fallback re-call."""
     out_dir = HLS_DIR / f"_rec_{uuid}"
     playlist = out_dir / "index.m3u8"
     with _rec_hls_lock:
@@ -6843,8 +6892,42 @@ def _rec_hls_spawn(uuid):
         if existing and existing["proc"].poll() is None:
             return playlist
         out_dir.mkdir(parents=True, exist_ok=True)
-        # Wipe any stale partial playlist so the "wait" loop can't
-        # return a truncated one from a prior crashed run.
+        try: playlist.unlink()
+        except FileNotFoundError: pass
+
+    if HLS_OFFLOAD == "mac":
+        marker = out_dir / ".hls-requested"
+        marker.write_text(json.dumps({
+            "src": _rec_source_path(uuid) or "",
+            "ts": time.time()}))
+        print(f"[rec-hls {uuid[:8]}] marker for Mac", flush=True)
+        # Fallback timer: if Mac doesn't deliver a playlist within
+        # HLS_FALLBACK_S, take over locally so the user isn't stuck
+        # waiting on a silent Mac.
+        def _fallback():
+            time.sleep(HLS_FALLBACK_S)
+            if not playlist.exists() and marker.exists():
+                print(f"[rec-hls {uuid[:8]}] Mac timeout {HLS_FALLBACK_S}s "
+                      f"— falling back to Pi-local remux", flush=True)
+                try: marker.unlink()
+                except Exception: pass
+                _rec_hls_spawn_local(uuid)
+        threading.Thread(target=_fallback, daemon=True).start()
+        return playlist
+
+    return _rec_hls_spawn_local(uuid)
+
+
+def _rec_hls_spawn_local(uuid):
+    """Pi-local ffmpeg HLS-remux. Original `_rec_hls_spawn` body — same
+    behaviour, separated only so the offload path can fall back to it."""
+    out_dir = HLS_DIR / f"_rec_{uuid}"
+    playlist = out_dir / "index.m3u8"
+    with _rec_hls_lock:
+        existing = _rec_hls_procs.get(uuid)
+        if existing and existing["proc"].poll() is None:
+            return playlist
+        out_dir.mkdir(parents=True, exist_ok=True)
         try: playlist.unlink()
         except FileNotFoundError: pass
         # Prefer the on-disk file over tvheadend's /dvrfile HTTP endpoint
@@ -7400,18 +7483,18 @@ def _rec_prewarm_loop():
     """Background: remux finished DVR recordings to HLS so the player
     doesn't have to wait. Serial, low priority, skipped while live
     streams are active so we never starve live TV of CPU.
-    300 s cadence (was 60 s) — the tvh dvr/grid_finished poll was a
-    major contributor to the table-parser overload incident; on-demand
-    remux still triggers via /recording/<uuid>/ads when a player
-    opens an unprepared recording, so the proactive prewarm is just a
-    nice-to-have."""
+    120 s cadence (was 300 s — tightened back up now that the prewarm
+    is the actual eager-remux path, not a nice-to-have). The
+    previously-suspect tvh poll is fine at this rate; the table
+    parser overload was a separate code path. On-demand remux still
+    triggers via /recording/<uuid>/ads as a safety net."""
     time.sleep(20)  # give the service a moment to settle on startup
     while True:
         try:
             _rec_prewarm_once()
         except Exception as e:
             print(f"[rec-prewarm] error: {e}", flush=True)
-        time.sleep(300)
+        time.sleep(120)
 
 
 def _mac_comskip_alive():
@@ -7419,7 +7502,14 @@ def _mac_comskip_alive():
     the heartbeat file in the last 5 min. Default-skip the Pi's
     rec-comskip path while the Mac is alive — both can do the work
     but Mac's M-series CPU is much faster and the Pi has live-stream
-    ffmpeg + remuxing to keep up with."""
+    ffmpeg + remuxing to keep up with.
+
+    Always returns False when DETECT_OFFLOAD=mac — that path uses
+    the new HTTP daemon (which gets fed via `.detect-requested`
+    markers from `_rec_cskip_spawn`) and would deadlock if we
+    deferred-and-then-skipped the marker creation."""
+    if DETECT_OFFLOAD == "mac":
+        return False
     try:
         hb = HLS_DIR / ".mac-comskip-alive"
         return hb.exists() and time.time() - hb.stat().st_mtime < 300
@@ -7428,6 +7518,44 @@ def _mac_comskip_alive():
 
 
 def _rec_prewarm_once():
+    # Head.bin mtime tracking — when nightly retrain produces a new
+    # head, we want every existing recording's ads.json to be
+    # re-generated so the new model's predictions propagate. Drop
+    # all non-sidecar .txt cutlists + write .detect-requested
+    # markers; daemon serially re-detects via DETECT_OFFLOAD path.
+    if DETECT_OFFLOAD == "mac":
+        head_path = HLS_DIR / ".tvd-models" / "head.bin"
+        marker = HLS_DIR / ".tvd-models" / ".last-head-mtime"
+        try:
+            cur_mt = int(head_path.stat().st_mtime) if head_path.exists() else 0
+            last_mt = int(marker.read_text()) if marker.exists() else 0
+        except Exception:
+            cur_mt = last_mt = 0
+        if cur_mt and cur_mt != last_mt:
+            print(f"[rec-prewarm] head.bin changed "
+                  f"({last_mt} → {cur_mt}) — invalidating all cutlists",
+                  flush=True)
+            n = 0
+            for d in HLS_DIR.glob("_rec_*"):
+                # Drop non-sidecar .txt + ads.json so re-detection
+                # produces fresh ones; sidecar files (logo/cskp/tvd
+                # caches) stay
+                for t in d.glob("*.txt"):
+                    if any(t.name.endswith(s) for s in
+                           (".logo.txt", ".cskp.txt", ".tvd.txt",
+                            ".trained.logo.txt")):
+                        continue
+                    try: t.unlink()
+                    except Exception: pass
+                ads_p = d / "ads.json"
+                if ads_p.exists():
+                    try: ads_p.unlink()
+                    except Exception: pass
+                n += 1
+            try: marker.write_text(str(cur_mt))
+            except Exception: pass
+            print(f"[rec-prewarm] invalidated {n} recording(s) — "
+                  f"daemon will re-detect serially", flush=True)
     # Load-based gate. The dominant cost in this loop is the
     # MPEG-2 -> H.264 transcode for VOD playback (libx264 ultrafast
     # eats 1.5-2.5 cores on its own). nice 15 helps prevent it from
@@ -7483,18 +7611,25 @@ def _rec_prewarm_once():
         out_dir = HLS_DIR / f"_rec_{uuid}"
         playlist = out_dir / "index.m3u8"
         if not playlist.exists():
-            # Hand off to the Mac if its handler is alive — its CPU
-            # remuxes MPEG-2 -> H.264 5-10x faster and the Pi has
-            # ffmpeg + live transcodes already saturating its cores.
-            # Lazy fallback in recording_hls() (= user actually opened
-            # this recording) is unaffected — that path always spawns
-            # so the user isn't stuck waiting on the Mac.
-            if _mac_comskip_alive():
-                continue
+            # Pi-side eager remux. Earlier this branch deferred to a
+            # Mac handler when alive, but the Mac launchd job has been
+            # silently broken by macOS TCC restrictions (network mounts
+            # not enumerable from launchd Aqua agents). Net result was:
+            # recordings sat unremuxed until the user clicked, then Pi
+            # spawned a CPU-intensive transcode synchronously. Just do
+            # it eagerly here; load + concurrency gates above prevent
+            # this from interfering with live streams.
             print(f"[rec-prewarm] remuxing {uuid[:8]} "
                   f"({e.get('disp_title', '?')[:40]})", flush=True)
             _rec_hls_spawn(uuid)
+            # Also kick off thumbs (writes .requested marker; Mac
+            # daemon over HTTP picks it up — no SMB dependency)
+            _rec_thumbs_spawn(uuid)
             return  # one per cycle
+        # Playlist exists — ensure thumbs got triggered too
+        if not (out_dir / "thumbs" / ".done").exists() and \
+           not (out_dir / "thumbs" / ".requested").exists():
+            _rec_thumbs_spawn(uuid)
         # HLS already present — fill in the ad markers if missing.
         # Hand off to the Mac entirely if its launchd agent is alive
         # (heartbeat < 5 min); only run our own comskip if the Mac is
@@ -7903,6 +8038,340 @@ def api_learning_plan():
         "ok": True, "planned": planned, "skipped": skipped,
         "found": len(candidates)}),
         mimetype="application/json"))
+
+
+@app.route("/api/internal/thumbs-pending")
+def api_internal_thumbs_pending():
+    """List recordings with a `.requested` thumbnail marker, written
+    by `_rec_thumbs_spawn` when THUMBS_OFFLOAD=mac. Pi reads its own
+    local disk (no SMB), Mac daemon polls this endpoint over HTTP
+    (no SMB on the Mac side either — sidesteps macOS TCC restrictions
+    on launchd Aqua agents accessing network mounts).
+
+    Skips recordings still being recorded — same reasoning as
+    api_internal_hls_pending."""
+    in_progress = set()
+    try:
+        data = json.loads(urllib.request.urlopen(
+            f"{TVH_BASE}/api/dvr/entry/grid?limit=500",
+            timeout=5).read())
+        for e in data.get("entries", []):
+            if e.get("sched_status") in ("recording", "scheduled"):
+                if e.get("uuid"):
+                    in_progress.add(e["uuid"])
+    except Exception:
+        pass
+    out = []
+    for marker in sorted(HLS_DIR.glob("_rec_*/thumbs/.requested")):
+        rec_dir = marker.parent.parent
+        if not rec_dir.name.startswith("_rec_"):
+            continue
+        if (rec_dir / "thumbs" / ".done").exists():
+            try: marker.unlink()
+            except Exception: pass
+            continue
+        uuid = rec_dir.name[5:]
+        if uuid in in_progress:
+            continue
+        out.append({"uuid": uuid})
+    return _cors(Response(json.dumps({"pending": out}),
+                            mimetype="application/json"))
+
+
+@app.route("/recording/<uuid>/source")
+def recording_source(uuid):
+    """Serve the original .ts file for HTTP-based decode by the
+    Mac-side thumbs daemon (and potentially future offload paths).
+    Range support via send_file conditional=True so ffmpeg can
+    seek when needed. Sequential reads typically saturate gigabit
+    (~110 MB/s) vs SMB's ~40 MB/s — 2-3× speedup on Mac decode."""
+    src = _rec_source_path(uuid)
+    if not src or not Path(src).exists():
+        abort(404)
+    return send_file(src, mimetype="video/mp2t", conditional=True)
+
+
+@app.route("/api/internal/detect-pending")
+def api_internal_detect_pending():
+    """Recordings with `.detect-requested` marker. Filters out
+    in-progress recordings (partial .ts) and ones whose cutlist
+    .txt already exists."""
+    in_progress = set()
+    try:
+        data = json.loads(urllib.request.urlopen(
+            f"{TVH_BASE}/api/dvr/entry/grid?limit=500", timeout=5).read())
+        for e in data.get("entries", []):
+            if e.get("sched_status") in ("recording", "scheduled"):
+                if e.get("uuid"):
+                    in_progress.add(e["uuid"])
+    except Exception:
+        pass
+    out = []
+    for marker in sorted(HLS_DIR.glob("_rec_*/.detect-requested")):
+        rec_dir = marker.parent
+        uuid = rec_dir.name[5:]
+        if uuid in in_progress:
+            continue
+        # Existing non-sidecar .txt = cutlist already produced
+        existing = [t for t in rec_dir.glob("*.txt")
+                    if not any(t.name.endswith(s) for s in
+                                (".logo.txt", ".cskp.txt", ".tvd.txt",
+                                 ".trained.logo.txt"))]
+        if existing:
+            try: marker.unlink()
+            except Exception: pass
+            continue
+        out.append({"uuid": uuid})
+    return _cors(Response(json.dumps({"pending": out}),
+                            mimetype="application/json"))
+
+
+@app.route("/api/internal/detect-config/<uuid>")
+def api_internal_detect_config(uuid):
+    """Everything the Mac daemon needs to run tv-detect on a recording:
+    channel slug, cached logo URL (or null = needs auto-train), per-
+    channel config knobs (smoothing + boundary extends), block-length
+    prior. One JSON per job; daemon downloads logo separately if URL
+    present."""
+    slug = _rec_channel_slug(uuid) or ""
+    show_title = ""
+    rec_dir = HLS_DIR / f"_rec_{uuid}"
+    # Show title from .txt basename (= existing _show_title_for_rec)
+    try:
+        show_title = _show_title_for_rec(rec_dir)
+    except Exception:
+        pass
+    cached_logo_url = ""
+    if slug:
+        if (_TVD_LOGO_DIR / f"{slug}.logo.txt").is_file():
+            cached_logo_url = f"/api/internal/detect-logo/{slug}"
+    smooth_s = 0.0
+    start_ext = end_ext = 0.0
+    min_block_s = max_block_s = None
+    try:
+        ch_cfg = json.loads(
+            (HLS_DIR / ".channel-config.json").read_text()
+        ).get("channels", {}).get(slug, {})
+        smooth_s = float(ch_cfg.get("logo_smooth_s", 0))
+    except Exception: pass
+    try:
+        learned = json.loads(
+            (HLS_DIR / ".detection_learning.json").read_text()
+        ).get(slug, {})
+        start_ext = float(learned.get("start_lag", 0))
+        end_ext   = float(learned.get("sponsor_duration", 0))
+    except Exception: pass
+    # Per-show prior wins over per-channel
+    p = {}
+    if show_title:
+        try:
+            p = json.loads(
+                (HLS_DIR / ".block_length_prior_by_show.json").read_text()
+            ).get(show_title, {})
+        except Exception: pass
+    if not p and slug:
+        try:
+            p = json.loads(
+                (HLS_DIR / ".block_length_prior.json").read_text()
+            ).get(slug, {})
+        except Exception: pass
+    if "min_block_s" in p and "max_block_s" in p:
+        min_block_s = p["min_block_s"]
+        max_block_s = p["max_block_s"]
+    return _cors(Response(json.dumps({
+        "uuid": uuid,
+        "src_url": f"/recording/{uuid}/source",
+        "channel_slug": slug,
+        "show_title": show_title,
+        "cached_logo_url": cached_logo_url,
+        "logo_smooth_s": smooth_s,
+        "start_extend_s": start_ext,
+        "end_extend_s": end_ext,
+        "min_block_s": min_block_s,
+        "max_block_s": max_block_s,
+        "head_url":     "/api/internal/detect-models/head.bin",
+        "backbone_url": "/api/internal/detect-models/backbone.onnx",
+    }), mimetype="application/json"))
+
+
+@app.route("/api/internal/detect-logo/<slug>")
+def api_internal_detect_logo(slug):
+    p = _TVD_LOGO_DIR / f"{slug}.logo.txt"
+    if not p.is_file():
+        abort(404)
+    return send_file(p, mimetype="text/plain")
+
+
+@app.route("/api/internal/detect-models/<fname>")
+def api_internal_detect_models(fname):
+    """Serves head.bin + backbone.onnx so the Mac daemon doesn't need
+    SMB. Daemon caches locally and only re-fetches on size/mtime
+    change — head.bin updates nightly (~5 KB), backbone is static."""
+    if fname not in ("head.bin", "backbone.onnx"):
+        abort(404)
+    p = HLS_DIR / ".tvd-models" / fname
+    if not p.is_file():
+        abort(404)
+    return send_file(p, conditional=True)
+
+
+@app.route("/api/internal/cutlist-uploaded/<uuid>", methods=["POST"])
+def api_internal_cutlist_uploaded(uuid):
+    """Mac daemon POSTs the raw tv-detect cutlist .txt body here.
+    Pi writes it to <rec_dir>/<basename>.txt, removes the marker."""
+    rec_dir = HLS_DIR / f"_rec_{uuid}"
+    if not rec_dir.exists():
+        abort(404)
+    src = _rec_source_path(uuid)
+    if not src:
+        abort(404)
+    base = Path(src).stem
+    out_txt = rec_dir / f"{base}.txt"
+    body = request.get_data()  # cutlists are ~100 bytes, in-RAM is fine
+    out_txt.write_bytes(body)
+    marker = rec_dir / ".detect-requested"
+    if marker.exists():
+        try: marker.unlink()
+        except Exception: pass
+    print(f"[rec-cskip {uuid[:8]}] Mac delivered cutlist "
+          f"({len(body)} B)", flush=True)
+    return _cors(Response(json.dumps({"ok": True, "bytes": len(body)}),
+                            mimetype="application/json"))
+
+
+@app.route("/api/internal/hls-pending")
+def api_internal_hls_pending():
+    """Recordings with `.hls-requested` marker — Mac daemon polls
+    this, runs ffmpeg HLS-remux locally on the .ts (fetched via
+    /recording/<uuid>/source), POSTs the resulting bundle as a
+    tar to /api/internal/hls-uploaded/<uuid>.
+
+    Filters out:
+      - Stale markers where the playlist already exists.
+      - Recordings still being recorded (`sched_status != completed`)
+        so the Mac doesn't remux a partial .ts and produce a
+        truncated HLS bundle. Once the recording finishes, the next
+        prewarm cycle creates a fresh marker."""
+    # Cache the current "still recording" set per-call (cheap; only one
+    # tvh API hit per Mac poll cycle = ~12/min)
+    in_progress = set()
+    try:
+        data = json.loads(urllib.request.urlopen(
+            f"{TVH_BASE}/api/dvr/entry/grid?limit=500",
+            timeout=5).read())
+        for e in data.get("entries", []):
+            if e.get("sched_status") in ("recording", "scheduled"):
+                if e.get("uuid"):
+                    in_progress.add(e["uuid"])
+    except Exception:
+        pass
+    out = []
+    for marker in sorted(HLS_DIR.glob("_rec_*/.hls-requested")):
+        rec_dir = marker.parent
+        if not rec_dir.name.startswith("_rec_"):
+            continue
+        uuid = rec_dir.name[5:]
+        if (rec_dir / "index.m3u8").exists():
+            try: marker.unlink()  # cleanup stale
+            except Exception: pass
+            continue
+        if uuid in in_progress:
+            continue  # still recording — wait for completion
+        out.append({"uuid": uuid})
+    return _cors(Response(json.dumps({"pending": out}),
+                            mimetype="application/json"))
+
+
+@app.route("/api/internal/hls-uploaded/<uuid>", methods=["POST"])
+def api_internal_hls_uploaded(uuid):
+    """Mac daemon POSTs a tar of the full HLS bundle (index.m3u8 +
+    seg_*.ts) here. We stream-extract directly from request.stream
+    into _rec_<uuid>/ — never holds the whole tar in RAM, so 2-3 GB
+    bundles are fine on the Pi's 8 GB. Atomic-ish: extract to staging
+    then rename, so a partial upload doesn't show a half-built
+    playlist to the player.
+
+    Hardening: refuses non-.ts/.m3u8 names, no path traversal."""
+    import tarfile
+    out_dir = HLS_DIR / f"_rec_{uuid}"
+    if not out_dir.exists():
+        return Response(json.dumps({"ok": False,
+                                      "error": "rec dir missing"}),
+                        status=404, mimetype="application/json")
+    written = 0
+    try:
+        # Stream mode "r|" reads sequentially — perfect for large tars.
+        with tarfile.open(fileobj=request.stream, mode="r|") as tf:
+            for m in tf:
+                if not m.isfile():
+                    continue
+                name = Path(m.name).name
+                if not (name.endswith(".ts") or name.endswith(".m3u8")):
+                    continue
+                if name.startswith("."):
+                    continue
+                src = tf.extractfile(m)
+                if src is None:
+                    continue
+                # Atomic rename via .tmp suffix — never expose a
+                # half-written segment to the player.
+                tmp = out_dir / (name + ".tmp")
+                with open(tmp, "wb") as f:
+                    while True:
+                        buf = src.read(1 << 20)  # 1 MB chunks
+                        if not buf: break
+                        f.write(buf)
+                tmp.rename(out_dir / name)
+                written += 1
+        # Marker cleanup — also signals "Pi-side fallback timer should
+        # not kick in for this uuid"
+        marker = out_dir / ".hls-requested"
+        if marker.exists():
+            try: marker.unlink()
+            except Exception: pass
+    except Exception as e:
+        return Response(json.dumps({"ok": False,
+                                      "error": str(e)[:200]}),
+                        status=500, mimetype="application/json")
+    print(f"[rec-hls {uuid[:8]}] Mac delivered {written} files",
+          flush=True)
+    return _cors(Response(json.dumps({"ok": True, "files": written}),
+                            mimetype="application/json"))
+
+
+@app.route("/api/internal/thumbs-uploaded/<uuid>", methods=["POST"])
+def api_internal_thumbs_uploaded(uuid):
+    """Mac daemon POSTs a tar of generated JPGs here. We extract them
+    into _rec_<uuid>/thumbs/, write the .done sentinel, and remove
+    the .requested marker. Idempotent — safe to retry."""
+    import tarfile, io
+    out_dir = HLS_DIR / f"_rec_{uuid}" / "thumbs"
+    if not out_dir.exists():
+        return Response(json.dumps({"ok": False, "error": "no thumbs dir"}),
+                        status=404, mimetype="application/json")
+    try:
+        body = request.get_data()
+        with tarfile.open(fileobj=io.BytesIO(body), mode="r") as tf:
+            for m in tf.getmembers():
+                if not m.isfile():
+                    continue
+                # Hardening: refuse path traversal + only .jpg names
+                name = Path(m.name).name
+                if not name.endswith(".jpg") or name.startswith("."):
+                    continue
+                with tf.extractfile(m) as f:
+                    (out_dir / name).write_bytes(f.read())
+        (out_dir / ".done").write_text("")
+        marker = out_dir / ".requested"
+        if marker.exists():
+            try: marker.unlink()
+            except Exception: pass
+    except Exception as e:
+        return Response(json.dumps({"ok": False, "error": str(e)[:200]}),
+                        status=500, mimetype="application/json")
+    n = len(list(out_dir.glob("t*.jpg")))
+    return _cors(Response(json.dumps({"ok": True, "n": n}),
+                            mimetype="application/json"))
 
 
 @app.route("/api/learning/fingerprint-scan", methods=["POST"])
