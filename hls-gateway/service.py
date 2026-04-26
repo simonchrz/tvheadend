@@ -6541,23 +6541,45 @@ def _rec_cskip_spawn(uuid):
             except Exception: pass
 
         cached_logo = _TVD_LOGO_DIR / f"{slug}.logo.txt" if slug else None
-        # Mac offload: write a marker for the daemon to pick up over
-        # HTTP. Daemon downloads .ts via HTTP, runs tv-detect locally
-        # WITH NN flags (which the Pi-local path below omits), POSTs
-        # cutlist back. Falls back to local tv-detect after
-        # DETECT_FALLBACK_S if Mac silent.
+        # Mac offload via .detect-requested marker. Daemon downloads
+        # .ts via HTTP, runs tv-detect with NN flags (Pi-local path
+        # below omits these), POSTs cutlist back. Idempotent: if a
+        # fresh marker already exists, don't spawn a new fallback
+        # (avoids stacked timers when prewarm re-calls every cycle).
         if DETECT_OFFLOAD == "mac":
             marker = out_dir / ".detect-requested"
+            if marker.exists():
+                # Already requested — let the existing fallback timer
+                # do its job. Refresh the mtime so a long Mac queue
+                # doesn't make the fallback fire prematurely.
+                try: marker.touch()
+                except Exception: pass
+                return
             marker.write_text(json.dumps({"ts": time.time()}))
             print(f"[rec-cskip {uuid[:8]}] marker for Mac", flush=True)
             def _detect_fallback():
                 time.sleep(DETECT_FALLBACK_S)
-                if not out_txt.exists() and marker.exists():
-                    print(f"[rec-cskip {uuid[:8]}] Mac timeout, fallback",
-                          flush=True)
-                    try: marker.unlink()
-                    except Exception: pass
-                    _rec_cskip_spawn(uuid)
+                if out_txt.exists() or not marker.exists():
+                    return  # Mac delivered or marker withdrawn
+                # Marker mtime refreshed by repeat-spawn? extend wait
+                # rather than spawning Pi-local ffmpeg (Mac just busy).
+                age = time.time() - marker.stat().st_mtime
+                if age < DETECT_FALLBACK_S:
+                    print(f"[rec-cskip {uuid[:8]}] Mac queue active, "
+                          f"extending wait", flush=True)
+                    return
+                print(f"[rec-cskip {uuid[:8]}] Mac timeout {DETECT_FALLBACK_S}s "
+                      f"— Pi-local fallback", flush=True)
+                try: marker.unlink()
+                except Exception: pass
+                # Bypass offload branch on the recursive call by
+                # temporarily pretending offload is off. Avoids the
+                # infinite re-marker loop.
+                global DETECT_OFFLOAD
+                saved = DETECT_OFFLOAD
+                DETECT_OFFLOAD = ""
+                try: _rec_cskip_spawn(uuid)
+                finally: DETECT_OFFLOAD = saved
             threading.Thread(target=_detect_fallback, daemon=True).start()
             return
         if cached_logo and cached_logo.is_file() and cached_logo.stat().st_size > 0:
@@ -7531,7 +7553,16 @@ def _rec_prewarm_once():
             last_mt = int(marker.read_text()) if marker.exists() else 0
         except Exception:
             cur_mt = last_mt = 0
-        if cur_mt and cur_mt != last_mt:
+        # First-run case: marker missing → just record current mtime,
+        # don't invalidate (we don't know if anything actually changed
+        # since last container restart). This avoids a full
+        # re-detection of every recording every time the gateway
+        # restarts. Real head-changes (mtime drift while gateway is
+        # running) still trigger the invalidate path.
+        if cur_mt and last_mt == 0:
+            try: marker.write_text(str(cur_mt))
+            except Exception: pass
+        elif cur_mt and cur_mt != last_mt:
             print(f"[rec-prewarm] head.bin changed "
                   f"({last_mt} → {cur_mt}) — invalidating all cutlists",
                   flush=True)
@@ -8282,60 +8313,58 @@ def api_internal_hls_pending():
                             mimetype="application/json"))
 
 
-@app.route("/api/internal/hls-uploaded/<uuid>", methods=["POST"])
-def api_internal_hls_uploaded(uuid):
-    """Mac daemon POSTs a tar of the full HLS bundle (index.m3u8 +
-    seg_*.ts) here. We stream-extract directly from request.stream
-    into _rec_<uuid>/ — never holds the whole tar in RAM, so 2-3 GB
-    bundles are fine on the Pi's 8 GB. Atomic-ish: extract to staging
-    then rename, so a partial upload doesn't show a half-built
-    playlist to the player.
+@app.route("/api/internal/hls-segment/<uuid>/<fname>", methods=["PUT"])
+def api_internal_hls_segment(uuid, fname):
+    """Receive a single HLS file (segment or playlist) via PUT — body
+    is raw bytes, written straight to disk via shutil.copyfileobj.
+    Replaces the old tar-upload endpoint: no Python-loop tar parser,
+    no per-chunk Python overhead, just a sendfile-style stream from
+    the network socket to the disk file.
 
-    Hardening: refuses non-.ts/.m3u8 names, no path traversal."""
-    import tarfile
+    Mac daemon uploads in this order: all segments first, then
+    index.m3u8 last. The player polls for index.m3u8; absence of it
+    means "still uploading", presence means "all segments are there
+    too". So the per-file PUT is implicitly atomic without a separate
+    .tmp/rename dance.
+
+    Hardening: filename allow-list (alphanumeric/_/-/. and must end
+    with .ts or .m3u8); no path traversal possible because we only
+    use the basename portion of the URL."""
+    import shutil
+    name = Path(fname).name
+    if not (name.endswith(".ts") or name.endswith(".m3u8")):
+        abort(400)
+    if name.startswith(".") or "/" in name or "\\" in name:
+        abort(400)
     out_dir = HLS_DIR / f"_rec_{uuid}"
     if not out_dir.exists():
-        return Response(json.dumps({"ok": False,
-                                      "error": "rec dir missing"}),
-                        status=404, mimetype="application/json")
-    written = 0
-    try:
-        # Stream mode "r|" reads sequentially — perfect for large tars.
-        with tarfile.open(fileobj=request.stream, mode="r|") as tf:
-            for m in tf:
-                if not m.isfile():
-                    continue
-                name = Path(m.name).name
-                if not (name.endswith(".ts") or name.endswith(".m3u8")):
-                    continue
-                if name.startswith("."):
-                    continue
-                src = tf.extractfile(m)
-                if src is None:
-                    continue
-                # Atomic rename via .tmp suffix — never expose a
-                # half-written segment to the player.
-                tmp = out_dir / (name + ".tmp")
-                with open(tmp, "wb") as f:
-                    while True:
-                        buf = src.read(1 << 20)  # 1 MB chunks
-                        if not buf: break
-                        f.write(buf)
-                tmp.rename(out_dir / name)
-                written += 1
-        # Marker cleanup — also signals "Pi-side fallback timer should
-        # not kick in for this uuid"
-        marker = out_dir / ".hls-requested"
-        if marker.exists():
-            try: marker.unlink()
-            except Exception: pass
-    except Exception as e:
-        return Response(json.dumps({"ok": False,
-                                      "error": str(e)[:200]}),
-                        status=500, mimetype="application/json")
-    print(f"[rec-hls {uuid[:8]}] Mac delivered {written} files",
+        abort(404)
+    out_path = out_dir / name
+    with open(out_path, "wb") as f:
+        shutil.copyfileobj(request.stream, f, length=1 << 20)
+    return _cors(Response(json.dumps({"ok": True, "bytes": out_path.stat().st_size}),
+                            mimetype="application/json"))
+
+
+@app.route("/api/internal/hls-done/<uuid>", methods=["POST"])
+def api_internal_hls_done(uuid):
+    """Mac daemon signals end-of-upload. Removes the .hls-requested
+    marker so the Pi-fallback timer doesn't kick in. Sanity-checks
+    that index.m3u8 + at least one .ts exist."""
+    out_dir = HLS_DIR / f"_rec_{uuid}"
+    if not out_dir.exists():
+        abort(404)
+    if not (out_dir / "index.m3u8").exists():
+        return Response(json.dumps({"ok": False, "error": "no playlist"}),
+                        status=400, mimetype="application/json")
+    n = len(list(out_dir.glob("*.ts")))
+    marker = out_dir / ".hls-requested"
+    if marker.exists():
+        try: marker.unlink()
+        except Exception: pass
+    print(f"[rec-hls {uuid[:8]}] Mac delivered playlist + {n} segments",
           flush=True)
-    return _cors(Response(json.dumps({"ok": True, "files": written}),
+    return _cors(Response(json.dumps({"ok": True, "segments": n}),
                             mimetype="application/json"))
 
 

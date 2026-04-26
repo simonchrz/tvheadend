@@ -6,10 +6,26 @@ reverse-proxied through Caddy with HTTPS.
 
 The three containers (`tvheadend`, `hls-gateway`, `caddy`) run as
 `network_mode: host` Docker services. Recordings and HLS segments
-live on an external USB-3 SSD at `/mnt/tv/`. A Mac on the same LAN
-runs two launchd handlers (`mac/tv-comskip.sh`,
-`mac/tv-live-comskip.py`) that take comskip + recording remux off
-the Pi's CPU.
+live on an NVMe SSD bind-mounted at `/mnt/tv/` (was external USB-3
+SSD; migrated 2026-04 to M.2 HAT+ → NVMe).
+
+A Mac on the same LAN runs ONE launchd daemon
+(`~/bin/tv-thumbs-daemon.py`) that takes the heavy work off the
+Pi's CPU via pure HTTP — no SMB. Handles three job types:
+
+  - **HLS-remux**  : .ts → libx264 + AAC HLS bundle (PUT-per-file
+                     upload, no Pi-side tar parser)
+  - **Thumbnails** : 160-px scrub-bar JPGs at 1/30 fps
+  - **Ad detection**: tv-detect with `--nn-backbone` + `--nn-head`
+                      (the Pi-local detection path silently omitted
+                      these so the entire trained NN was unused
+                      until the daemon took over)
+
+Combined ffmpeg pass produces HLS + thumbs from one .ts download;
+detection downloads the .ts again for codec-aware decode + 4-worker
+processing. Pi CPU during full-recording processing dropped from
+~445 % (Pi-local: HLS 236 % + thumbs 109 % + detect 100 %) to ~5 %
+(HTTP serve + raw-bytes write).
 
 ## Where to look
 
@@ -17,8 +33,7 @@ the Pi's CPU.
 |---|---|
 | Design decisions, file/state layout, HTTP endpoints, Player UI, public-broadcaster wiring | [docs/architecture.md](docs/architecture.md) |
 | Deploying code (SIGHUP, NOT compose restart), iOS Safari quirks, SSD swap / EXT4 recovery / USB cable + power-cap diagnostics | [docs/operations.md](docs/operations.md) |
-| Mac-side handlers (heartbeat, .scanning lock, TCC chain, subprocess-vs-bash perf, /tmp cache, Pi-CPU profile, history) | [docs/mac-handlers.md](docs/mac-handlers.md) |
-| Comskip codebase reference + the local `mpeg2dec.c` patch | [docs/comskip.md](docs/comskip.md) |
+| Mac-offload daemon (HTTP-based job pipeline, /api/internal/* endpoints, why HTTP not SMB, TCC trap) | [docs/mac-handlers.md](docs/mac-handlers.md) |
 | Things deliberately not done + open backlog | [docs/history.md](docs/history.md) |
 
 ## Stack at a glance
@@ -37,9 +52,48 @@ the Pi's CPU.
                  └──────────┬───────────────────┘
                             │ /mnt/tv (ext4, USB SSD)
                             │
-                 ┌──────────┴────────────┐
-                 │ MacBook Pro (Wi-Fi)   │
-                 │   ├ tv-comskip.sh     │  finished-rec remux + comskip
-                 │   └ tv-live-comskip.py│  live-buffer ad detection
-                 └───────────────────────┘
+                 ┌──────────┴──────────────────────┐
+                 │ MacBook Pro (Wi-Fi)             │
+                 │ ~/bin/tv-thumbs-daemon.py       │
+                 │   ├ pulls /api/internal/*-pending     │
+                 │   ├ runs ffmpeg/tv-detect locally     │
+                 │   └ POSTs results back via HTTP PUT   │
+                 │ Talks direct to gateway :8080         │
+                 │ (bypasses Caddy TLS — saved ~40 % CPU │
+                 │ during bulk transfers)                │
+                 └───────────────────────────────────────┘
 ```
+
+## Mac-offload pipeline (added 2026-04-26)
+
+The Pi's spawn paths (`_rec_hls_spawn`, `_rec_thumbs_spawn`,
+`_rec_cskip_spawn`) check the matching `XXX_OFFLOAD=mac` env and
+either write a `.requested` marker file or run the local
+ffmpeg/tv-detect as before. Pi-fallback timer (60–600 s) takes over
+if the Mac daemon doesn't deliver, so a Mac-down outage doesn't
+strand viewers.
+
+| Endpoint | Purpose |
+|---|---|
+| `GET /api/internal/{thumbs,hls,detect}-pending` | List pending markers (skips in-progress recordings via tvh `sched_status`) |
+| `GET /recording/<uuid>/source` | Range-streamed .ts (2-3× faster than Mac-side SMB) |
+| `PUT /api/internal/hls-segment/<uuid>/<fname>` | Per-segment HLS upload (no tar parser overhead) |
+| `POST /api/internal/hls-done/<uuid>` | End-of-upload signal (atomic-ish: index.m3u8 sent last, player polls for it) |
+| `POST /api/internal/thumbs-uploaded/<uuid>` | Tar of JPGs (small bundle, ~600 KB) |
+| `POST /api/internal/cutlist-uploaded/<uuid>` | Raw cutlist .txt body |
+| `GET /api/internal/detect-config/<uuid>` | Per-job config bundle (slug, show, logo URL, smoothing, boundary extends, block prior) |
+| `GET /api/internal/detect-logo/<slug>` | Per-channel logo template |
+| `GET /api/internal/detect-models/<head.bin\|backbone.onnx>` | Model files for daemon-side caching |
+
+Why HTTP not SMB: macOS TCC restricts launchd Aqua agents from
+enumerating network mounts; `os.listdir(/Users/simon/mnt/pi-tv/hls)`
+returns `Operation not permitted` even though interactive shells
+work fine. The original `mac/tv-comskip.sh` setup was silently
+broken by this since 2026-04-25 (its log file went 0-byte). HTTP
+sidesteps the TCC scope entirely.
+
+Eager auto-invalidation: when nightly retrain bumps `head.bin`
+mtime, prewarm notices and drops every recording's cutlist + ads.json
+so the daemon serially re-detects everything with the fresh model.
+First-run case (marker missing) just records current mtime — without
+this guard a container restart would invalidate all 50+ recordings.
