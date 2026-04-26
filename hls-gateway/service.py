@@ -99,26 +99,6 @@ COMSKIP_INI_PER_CHANNEL = {
 }
 
 
-def comskip_ini_for(slug):
-    """Return path to a comskip ini for this channel. Writes a
-    per-channel temp ini if there are overrides, otherwise returns
-    the base. Base is written at service startup by main()."""
-    overrides = COMSKIP_INI_PER_CHANNEL.get(slug or "", {})
-    base_path = HLS_DIR / ".comskip.ini"
-    if not overrides:
-        return base_path
-    out_path = HLS_DIR / f".comskip-{slug}.ini"
-    if (not out_path.exists()
-            or out_path.stat().st_mtime < base_path.stat().st_mtime):
-        try:
-            header = f"; --- per-channel overrides: {slug} ---\n"
-            for k, v in overrides.items():
-                header += f"{k}={v}\n"
-            out_path.write_text(header + "\n" + base_path.read_text())
-        except Exception as e:
-            print(f"comskip-{slug}.ini write: {e}", flush=True)
-            return base_path
-    return out_path
 TVH_BASE       = os.environ.get("TVH_BASE", "http://localhost:9981")
 HOST_URL       = os.environ.get("HOST_URL", "http://raspberrypi5lan:8080")
 IDLE_TIMEOUT   = int(os.environ.get("IDLE_TIMEOUT", "120"))
@@ -1123,6 +1103,7 @@ def index():
         ("Alle Kanäle als M3U (für IPTV-Apps)", f"{HOST_URL}/playlist.m3u"),
         ("Nutzungsstatistik / Top-Sender",      f"{HOST_URL}/stats"),
         ("Status (gerade aktive Streams)",      f"{HOST_URL}/status"),
+        ("System-Health (Pi + Container)",      f"{HOST_URL}/health"),
         ("Kanal-Liste neu laden",              f"{HOST_URL}/reload"),
     ]
     tool_rows = "".join(
@@ -1523,6 +1504,7 @@ def index():
             f"<div class='quick-links'>"
             f"<a href='{HOST_URL}/epg'><span>📅</span>Programm<small>EPG-Guide + Chapter-Ticks</small></a>"
             f"<a href='{HOST_URL}/recordings'><span>📼</span>Aufnahmen<small>DVR + Mediathek-Recordings</small></a>"
+            f"<a href='{HOST_URL}/learning'><span>🧠</span>Lernfortschritt<small>Modell-Historie + Per-Channel-Tuning</small></a>"
             f"</div>"
             f"<h2 class='channels-head'>Kanäle"
             f" <button id='tile-size' class='tile-size-btn' "
@@ -2248,6 +2230,701 @@ def usage_stats():
     return {"ranking": rows}
 
 
+def _render_history_chart(history, width=860, height=280):
+    """Inline SVG line-chart of train_acc / test_acc / test_iou over
+    the run history. No external deps — scales sharp at any size,
+    works offline, no JS. Rejected runs get an open ring instead of
+    a filled dot so the eye picks them out without a legend."""
+    if not history:
+        return ""
+    # Take the last 60 runs max — older drowns the chart visually
+    runs = history[-60:]
+    n = len(runs)
+    pad_l, pad_r, pad_t, pad_b = 38, 12, 14, 26
+    plot_w = width - pad_l - pad_r
+    plot_h = height - pad_t - pad_b
+
+    def x_at(i): return pad_l + (i / max(1, n - 1)) * plot_w
+    def y_at(v): return pad_t + (1 - v) * plot_h  # v in [0,1]
+
+    series = [
+        ("test_iou",  "#3498db", "Block-IoU"),
+        ("test_acc",  "#27ae60", "Test Acc"),
+        ("train_acc", "#9b59b6", "Train Acc"),
+    ]
+    parts = [f"<svg viewBox='0 0 {width} {height}' "
+             f"style='display:block;width:100%;max-width:{width}px;"
+             f"background:#1a1a1a;border-radius:6px;margin-top:6px'>"]
+    # Y-axis grid + labels (0/25/50/75/100)
+    for pct in (0, 25, 50, 75, 100):
+        y = y_at(pct / 100)
+        parts.append(f"<line x1='{pad_l}' y1='{y:.1f}' x2='{width-pad_r}' "
+                     f"y2='{y:.1f}' stroke='#333' stroke-width='0.5'/>")
+        parts.append(f"<text x='{pad_l-5}' y='{y+3:.1f}' fill='#666' "
+                     f"font-size='10' text-anchor='end'>{pct}%</text>")
+    # X-axis: tick every ~10 runs with date label
+    step = max(1, n // 6)
+    for i in range(0, n, step):
+        ts = runs[i].get("ts", "")
+        label = ts[4:8] if len(ts) >= 8 else ts  # MMDD slice from YYYYMMDD
+        x = x_at(i)
+        parts.append(f"<line x1='{x:.1f}' y1='{pad_t}' x2='{x:.1f}' "
+                     f"y2='{height-pad_b}' stroke='#2a2a2a' stroke-width='0.5'/>")
+        parts.append(f"<text x='{x:.1f}' y='{height-8}' fill='#666' "
+                     f"font-size='10' text-anchor='middle'>{label}</text>")
+    # Series lines + dots
+    for key, color, label in series:
+        pts = [(x_at(i), y_at(r.get(key) or 0))
+               for i, r in enumerate(runs) if r.get(key) is not None]
+        if len(pts) >= 2:
+            d = "M " + " L ".join(f"{x:.1f},{y:.1f}" for x, y in pts)
+            parts.append(f"<path d='{d}' fill='none' stroke='{color}' "
+                         f"stroke-width='1.6' opacity='0.85'/>")
+        for i, r in enumerate(runs):
+            v = r.get(key)
+            if v is None:
+                continue
+            x, y = x_at(i), y_at(v)
+            deployed = r.get("deployed", False)
+            if deployed:
+                parts.append(f"<circle cx='{x:.1f}' cy='{y:.1f}' r='2.6' "
+                             f"fill='{color}'/>")
+            else:
+                # Open ring for rejected runs (visual flag without
+                # needing a separate legend entry)
+                parts.append(f"<circle cx='{x:.1f}' cy='{y:.1f}' r='3.4' "
+                             f"fill='none' stroke='{color}' stroke-width='1.4'/>")
+    parts.append("</svg>")
+    # Legend rendered as HTML ABOVE the SVG so it can never overlap
+    # data points (Train Acc lives in the 90-99% band where any
+    # in-plot legend always collides). Footnote BELOW the SVG so it
+    # can't collide with the X-axis date labels at the right edge.
+    legend = ["<div style='display:flex;gap:14px;font-size:.8em;"
+              "margin-top:6px;color:#aaa;align-items:center'>"]
+    for key, color, label in series:
+        legend.append(f"<span><span style='display:inline-block;"
+                      f"width:10px;height:10px;border-radius:5px;"
+                      f"background:{color};vertical-align:middle;"
+                      f"margin-right:4px'></span>{label}</span>")
+    legend.append(f"<span style='margin-left:auto;color:#777;font-size:.85em'>"
+                  f"○ rejected · ● deployed · {n} runs</span>")
+    legend.append("</div>")
+    return "".join(legend) + "".join(parts)
+
+
+def _learning_health_banner():
+    """Inline HTML banner shown atop /recordings when nightly retrain
+    has been failing or stuck. Empty string when healthy — quiet by
+    default, only nags on real problems."""
+    h = _learning_health()
+    if h["status"] == "ok":
+        return ""
+    color = "#f39c12" if h["status"] == "warn" else "#e74c3c"
+    msg = (f"<b>NN-Training stockt</b> — letzter erfolgreicher Deploy vor "
+           f"{h['last_age_h']} h. Reject-Grund: "
+           f"{(h['last_reject'] or '')[:120]}"
+           if h["status"] == "fail"
+           else f"<b>NN-Training warnt</b> — letzter Deploy vor {h['last_age_h']} h")
+    return (f"<div style='background:{color}22;border-left:4px solid {color};"
+            f"padding:10px 14px;margin:8px 14px;border-radius:4px;font-size:.9em'>"
+            f"⚠ {msg} · <a href='{HOST_URL}/learning' style='color:#fff'>"
+            f"Details</a></div>")
+
+
+def _learning_health():
+    """Inspect the recent head.history.json runs and return a status
+    summary used by both /learning and the /recordings banner.
+
+    Returns dict with:
+      status:       "ok" | "warn" | "fail"
+      last_deploy:  ISO-ish timestamp of the most recent deployed run, or None
+      last_age_h:   hours since last deploy, or None
+      last_reject:  most recent rejected run's reason, or None
+      trend:        list of (ts, iou, deployed) for last 10 runs"""
+    history_path = HLS_DIR / ".tvd-models" / "head.history.json"
+    out = {"status": "ok", "last_deploy": None, "last_age_h": None,
+           "last_reject": None, "trend": []}
+    try:
+        h = json.loads(history_path.read_text())
+    except Exception:
+        return {**out, "status": "ok"}  # no history yet = healthy first-run state
+    if not h:
+        return out
+    out["trend"] = [(e.get("ts"), e.get("test_iou"), e.get("deployed", False))
+                    for e in h[-10:]]
+    last_dep = next((e for e in reversed(h) if e.get("deployed")), None)
+    if last_dep:
+        out["last_deploy"] = last_dep["ts"]
+        try:
+            ts = time.mktime(time.strptime(last_dep["ts"], "%Y%m%dT%H%M%S"))
+            out["last_age_h"] = round((time.time() - ts) / 3600, 1)
+        except Exception:
+            pass
+    # Look for consecutive rejections at the tail.
+    consec_rej = 0
+    for e in reversed(h):
+        if e.get("deployed"):
+            break
+        consec_rej += 1
+    if consec_rej > 0:
+        out["last_reject"] = h[-1].get("reason", "?")
+    if consec_rej >= 3 or (out["last_age_h"] is not None and out["last_age_h"] > 48):
+        out["status"] = "fail"
+    elif consec_rej >= 1 or (out["last_age_h"] is not None and out["last_age_h"] > 30):
+        out["status"] = "warn"
+
+    # ── B: broken-template check ────────────────────────────────
+    # Walk recordings grouped by channel slug; flag channels where
+    # the most recent N detections are all 0-block or all >60% ad-rate
+    # (= cached logo template silently broken — same failure mode we
+    # had for RTL/Sat.1 the first day).
+    out["broken_channels"] = []
+    by_chan = {}  # slug -> list of (mtime, n_blocks, ad_rate)
+    if HLS_DIR.exists():
+        for d in HLS_DIR.glob("_rec_*"):
+            uuid = d.name[5:]
+            slug = _rec_channel_slug(uuid) or ""
+            if not slug:
+                continue
+            ads_p = d / "ads.json"
+            if not ads_p.is_file():
+                continue
+            try:
+                ads = json.loads(ads_p.read_text())
+                pl = d / "index.m3u8"
+                dur = 0.0
+                if pl.is_file():
+                    for ln in pl.read_text().splitlines():
+                        if ln.startswith("#EXTINF:"):
+                            try:
+                                dur += float(ln.split(":",1)[1].rstrip(","))
+                            except Exception:
+                                pass
+            except Exception:
+                continue
+            n_blocks = len(ads) if isinstance(ads, list) else 0
+            ad_secs = sum(e-s for s,e in ads) if isinstance(ads, list) else 0
+            ad_rate = ad_secs / dur if dur > 0 else 0
+            by_chan.setdefault(slug, []).append((ads_p.stat().st_mtime,
+                                                  n_blocks, ad_rate, dur))
+    THRESHOLD_RECS = 5
+    for slug, recs in by_chan.items():
+        recs.sort(key=lambda r: -r[0])  # newest first
+        recent = recs[:THRESHOLD_RECS]
+        if len(recent) < THRESHOLD_RECS:
+            continue
+        all_zero = all(n == 0 for _, n, _, _ in recent)
+        all_high = all(rate > 0.60 for _, _, rate, dur in recent if dur > 0)
+        if all_zero or all_high:
+            out["broken_channels"].append({
+                "slug": slug,
+                "kind": "zero-blocks" if all_zero else "all-ad-rate",
+                "n": len(recent)})
+            if out["status"] == "ok":
+                out["status"] = "warn"
+
+    # ── C: trend-based regression check ─────────────────────────
+    # Champion-Challenger only compares to the LAST deployed run —
+    # 5pp/day drift over 2 weeks would never trip it. Compare
+    # current IoU against the median of the last 7 deployed runs.
+    out["trend_drift"] = None
+    deployed_recent = [e.get("test_iou") for e in h
+                       if e.get("deployed") and e.get("test_iou") is not None]
+    if len(deployed_recent) >= 7:
+        last7 = deployed_recent[-7:]
+        med = sorted(last7)[len(last7)//2]
+        cur_iou = last7[-1]
+        drift = cur_iou - med
+        if drift < -0.05:
+            out["trend_drift"] = round(drift, 3)
+            if out["status"] == "ok":
+                out["status"] = "warn"
+
+    return out
+
+
+@app.route("/learning")
+def learning_page():
+    """Single-page dashboard for the autonomous training loop.
+    Reads head.history.json + head.uncertain.txt + head.confusion.txt +
+    .detection_learning.json + .block_length_prior.json — all
+    files written by the nightly retrain or the gateway's own
+    feedback-stats refresh."""
+    models_dir = HLS_DIR / ".tvd-models"
+
+    # 1. History
+    history = []
+    try:
+        history = json.loads((models_dir / "head.history.json").read_text())
+    except Exception:
+        pass
+
+    # 2. Per-channel learning + prior
+    learning = {}
+    try:
+        learning = json.loads((HLS_DIR / ".detection_learning.json").read_text())
+    except Exception:
+        pass
+    priors = {}
+    try:
+        priors = json.loads((HLS_DIR / ".block_length_prior.json").read_text())
+    except Exception:
+        pass
+    channel_cfg = {}
+    try:
+        channel_cfg = json.loads(
+            (HLS_DIR / ".channel-config.json").read_text()).get("channels", {})
+    except Exception:
+        pass
+    all_slugs = sorted(set(list(learning) + list(priors) + list(channel_cfg)))
+
+    # 3. Active learning queue. Filter out:
+    #    - frames in already-reviewed recordings (user explicitly hit
+    #      "Geprüft" → all remaining unsicheren are now confirmed_show)
+    #    - frames inside an existing user ad-block (was a known-ad,
+    #      uncertainty here is intra-block confusion not actionable)
+    uncertain = []
+    reviewed_skipped = 0
+    try:
+        for ln in (models_dir / "head.uncertain.txt").read_text().splitlines():
+            if not ln or ln.startswith("#"):
+                continue
+            parts = ln.split("\t")
+            if len(parts) < 4:
+                continue
+            uuid = parts[0].strip()
+            t = float(parts[1])
+            user_cache = HLS_DIR / f"_rec_{uuid}" / "ads_user.json"
+            if user_cache.exists():
+                try:
+                    raw = json.loads(user_cache.read_text())
+                except Exception:
+                    raw = None
+                if isinstance(raw, dict):
+                    if raw.get("reviewed_at"):
+                        reviewed_skipped += 1
+                        continue
+                    in_ad = any(s <= t <= e
+                                for s, e in raw.get("ads", []) or [])
+                    if in_ad:
+                        continue
+            # source column is optional (5th field, added with
+            # --with-minute-prior); old runs without it still parse.
+            src = parts[4].strip() if len(parts) > 4 else "unc"
+            uncertain.append({
+                "uuid": uuid, "t": t,
+                "p": float(parts[2]), "title": parts[3].strip(),
+                "src": src,
+            })
+    except Exception:
+        pass
+    # Sort: divergence-source first (more actionable — model is
+    # confidently wrong about a wall-clock-anomalous frame), then
+    # uncertainty-source by closeness-to-0.5.
+    uncertain.sort(key=lambda u: (0 if u.get("src") in ("div", "both") else 1,
+                                    abs(u["p"] - 0.5)))
+
+    # 4. Confusion (last summary block per show)
+    confusion = []
+    try:
+        cur = None
+        for ln in (models_dir / "head.confusion.txt").read_text().splitlines():
+            if ln.startswith("## "):
+                if cur:
+                    confusion.append(cur)
+                cur = {"title": ln[3:].strip(), "blocks": "", "errors": ""}
+            elif cur and ln.startswith("  blocks:"):
+                cur["blocks"] = ln.strip().replace("blocks:  ", "")
+            elif cur and ln.startswith("  errors:"):
+                cur["errors"] = ln.strip().replace("errors:  ", "")
+            elif cur and ln.startswith("  frames:"):
+                cur["frames"] = ln.strip().replace("frames:  ", "")
+        if cur:
+            confusion.append(cur)
+    except Exception:
+        pass
+
+    health = _learning_health()
+    ok_color = {"ok": "#27ae60", "warn": "#f39c12", "fail": "#e74c3c"}[health["status"]]
+
+    # ── Build HTML ───────────────────────────────────────────────
+    out = []
+    out.append("<!doctype html><html lang=de><head><meta charset=utf-8>")
+    out.append("<title>tv-detect Lernfortschritt</title>")
+    out.append("<meta name=viewport content='width=device-width,initial-scale=1'>")
+    out.append("<style>")
+    out.append("body{font-family:-apple-system,sans-serif;background:#1c1c1c;color:#eee;margin:0;padding:18px;max-width:1200px;margin-left:auto;margin-right:auto}")
+    out.append("h1{font-size:1.5em;margin:0 0 8px}h2{margin:24px 0 8px;font-size:1.1em;color:#bbb;border-bottom:1px solid #333;padding-bottom:4px}")
+    out.append(f".status{{padding:12px 14px;border-radius:6px;background:{ok_color}22;border-left:4px solid {ok_color};margin:8px 0 16px}}")
+    out.append(".status .dot{display:inline-block;width:10px;height:10px;border-radius:5px;margin-right:8px;vertical-align:middle}")
+    out.append("table{border-collapse:collapse;width:100%;font-size:.85em}")
+    out.append("th,td{padding:5px 9px;text-align:left;border-bottom:1px solid #333}")
+    out.append("th{color:#888;font-weight:600}")
+    out.append("tr:hover{background:#252525}")
+    out.append(".rej{color:#e74c3c}.dep{color:#27ae60}")
+    out.append(".bar{display:inline-block;height:8px;background:#3498db;border-radius:2px;vertical-align:middle}")
+    out.append(".muted{color:#777}")
+    out.append("a{color:#5dade2}a:hover{color:#85c1e9}")
+    out.append("nav{margin-bottom:14px}nav a{margin-right:14px;color:#888}")
+    out.append("</style></head><body>")
+    out.append(f"<nav><a href='{HOST_URL}/'>← Home</a> <a href='{HOST_URL}/recordings'>Aufnahmen</a></nav>")
+    out.append("<h1>tv-detect Lernfortschritt</h1>")
+
+    # Status banner
+    out.append("<div class='status'>")
+    out.append(f"<span class='dot' style='background:{ok_color}'></span>")
+    if health["status"] == "ok":
+        out.append(f"<b>Healthy</b> — letzter Deploy: {health['last_deploy']} "
+                   f"(vor {health['last_age_h']} h)")
+    elif health["status"] == "warn":
+        out.append(f"<b>Achtung</b> — letzter Deploy vor {health['last_age_h']} h. "
+                   f"Letzter Reject-Grund: {health['last_reject'] or '–'}")
+    else:
+        out.append(f"<b>Modell-Training stockt</b> — letzter erfolgreicher Deploy "
+                   f"vor {health['last_age_h']} h. Reject-Grund: "
+                   f"{health['last_reject'] or '–'}. Logs: ~/Library/Logs/tv-train-head.log")
+    # B + C surface as additional rows inside the status banner
+    bc = health.get("broken_channels", []) or []
+    if bc:
+        for entry in bc:
+            kind_label = ("alle Detections leer (Logo-Template kaputt?)"
+                          if entry["kind"] == "zero-blocks"
+                          else "alle Detections > 60 % Werbung (Logo greift überall)")
+            out.append(f"<br><b>⚠ {entry['slug']}:</b> letzte {entry['n']} "
+                       f"Aufnahmen → {kind_label}")
+    if health.get("trend_drift") is not None:
+        d = health["trend_drift"]
+        out.append(f"<br><b>📉 IoU-Drift</b> {d:+.2f} vs Median der letzten "
+                   f"7 deployed Runs — schleichende Regression?")
+    out.append("</div>")
+
+    # History chart (visual trend before the table)
+    if history:
+        out.append("<h2>Verlauf</h2>")
+        out.append(_render_history_chart(history))
+
+    # History table (last 30)
+    out.append("<h2>Modell-Historie (letzte 30 Runs)</h2>")
+    out.append("<table><tr><th>Zeit</th><th>Train Acc</th><th>Test Acc</th>"
+               "<th>Test IoU</th><th>n Test/Train</th><th>Status</th><th>Reason</th></tr>")
+    for e in reversed(history[-30:]):
+        ts = e.get("ts", "?")
+        ta = e.get("train_acc"); tea = e.get("test_acc"); iou = e.get("test_iou")
+        nt = e.get("n_test_recs", 0); ntr = e.get("n_train_recs", 0)
+        dep = e.get("deployed", False)
+        cls = "dep" if dep else "rej"
+        sym = "✓ DEPLOYED" if dep else "✗ REJECTED"
+        iou_bar = (f"<span class='bar' style='width:{int((iou or 0)*100)}px'></span> "
+                   f"{iou:.2f}" if iou is not None else "–")
+        out.append(f"<tr><td>{ts}</td><td>{ta*100:.1f}%</td>"
+                   f"<td>{tea*100:.1f}%</td><td>{iou_bar}</td>"
+                   f"<td>{nt}/{ntr}</td><td class='{cls}'>{sym}</td>"
+                   f"<td class='muted'>{e.get('reason','')}</td></tr>")
+    out.append("</table>")
+
+    # Per-channel
+    out.append("<h2>Per-Channel-Tuning</h2>")
+    out.append("<table><tr><th>Channel</th><th>Logo-Smooth</th>"
+               "<th>Start-Lag (gelernt)</th><th>Sponsor-Tail (gelernt)</th>"
+               "<th>Block-Länge Prior</th><th>n Samples</th></tr>")
+    for s in all_slugs:
+        ls = channel_cfg.get(s, {}).get("logo_smooth_s", 0)
+        lr = learning.get(s, {})
+        sl = lr.get("start_lag", 0); sp = lr.get("sponsor_duration", 0)
+        pr = priors.get(s, {})
+        prior_str = (f"{pr['min_block_s']:.0f}–{pr['max_block_s']:.0f} s "
+                     f"(μ={pr['mean_s']:.0f} σ={pr['std_s']:.0f})"
+                     if pr else "<span class='muted'>n &lt; 5 — Defaults</span>")
+        n = pr.get("sample_n", lr.get("sample_n", 0))
+        out.append(f"<tr><td><b>{s}</b></td><td>{ls or '–'} s</td>"
+                   f"<td>{sl or '–'} s</td><td>{sp or '–'} s</td>"
+                   f"<td>{prior_str}</td><td>{n}</td></tr>")
+    out.append("</table>")
+
+    # Confusion summary
+    if confusion:
+        out.append("<h2>Confusion-Analyse (letzter Test-Set Run)</h2>")
+        out.append("<table><tr><th>Show</th><th>Frames</th><th>Block-Vergleich</th><th>Fehlertyp</th></tr>")
+        for c in confusion:
+            out.append(f"<tr><td><b>{c['title']}</b></td>"
+                       f"<td class='muted'>{c.get('frames','')}</td>"
+                       f"<td>{c.get('blocks','')}</td>"
+                       f"<td class='muted'>{c.get('errors','')}</td></tr>")
+        out.append("</table>")
+
+    # Active-learning queue
+    # ── Recommendation engine: where would more labelling help most? ──
+    # Three buckets: (1) channels just below the per-channel-prior gate,
+    # (2) shows just below the per-show-prior gate, (3) test-set shows
+    # with low IoU (direct test-metric impact). Sorted by gap-to-threshold
+    # so the cheapest wins (= 1 more recording flips a channel into having
+    # its own prior) appear first.
+    recommendations = []
+    # (1) per-channel gates: count user-confirmed recordings + blocks per slug
+    chan_user_recs = {}
+    chan_user_blocks = {}
+    show_user_blocks = {}
+    show_user_recs = {}
+    for d in HLS_DIR.glob("_rec_*"):
+        uuid = d.name[5:]
+        slug = _rec_channel_slug(uuid) or ""
+        show = _show_title_for_rec(d)
+        user = d / "ads_user.json"
+        if not user.is_file():
+            continue
+        try:
+            raw = json.loads(user.read_text())
+        except Exception:
+            continue
+        blocks = raw if isinstance(raw, list) else (raw.get("ads", []) or [])
+        n_blocks = len([b for b in blocks if b and len(b) >= 2])
+        if slug:
+            chan_user_recs[slug] = chan_user_recs.get(slug, 0) + 1
+            chan_user_blocks[slug] = chan_user_blocks.get(slug, 0) + n_blocks
+        if show:
+            show_user_recs[show] = show_user_recs.get(show, 0) + 1
+            show_user_blocks[show] = show_user_blocks.get(show, 0) + n_blocks
+    for slug, n_blk in sorted(chan_user_blocks.items(), key=lambda x: x[1]):
+        if 0 < n_blk < 5:
+            need = 5 - n_blk
+            recommendations.append({
+                "kind": "channel", "key": slug, "n": need,
+                "msg": f"<b>{slug}</b> hat {n_blk} user-Block(s) — "
+                       f"{need} mehr für eigenen Channel-Block-Prior",
+                "priority": need})
+    for show, n_blk in sorted(show_user_blocks.items(), key=lambda x: x[1]):
+        if 0 < n_blk < 5:
+            need = 5 - n_blk
+            recommendations.append({
+                "kind": "show", "key": show, "n": need,
+                "msg": f"Show <b>{show}</b> hat {n_blk} user-Block(s) — "
+                       f"{need} mehr für eigenen Show-Prior",
+                "priority": need + 0.5})
+    weak_shows = []
+    for c in confusion:
+        m = re.search(r"missed=(\d+)\s+extra=(\d+)", c.get("blocks", ""))
+        if m:
+            missed = int(m.group(1)); extra = int(m.group(2))
+            if missed + extra >= 1:
+                weak_shows.append((c["title"], missed, extra))
+    for title, missed, extra in sorted(weak_shows, key=lambda x: -(x[1] + x[2])):
+        recommendations.append({
+            "kind": "test-iou", "key": title, "n": max(1, min(3, missed + extra)),
+            "msg": f"Test-Show <b>{title}</b> hat {missed} verfehlt + "
+                   f"{extra} extra Block(s) — manuelle Korrektur dort "
+                   f"steigert Test-IoU direkt",
+            "priority": 10 - missed - extra})
+    recommendations.sort(key=lambda r: r["priority"])
+
+    # Subtract already-scheduled future DVR entries that match each
+    # recommendation, so clicks across page reloads don't pile up
+    # extra recordings. Channel kind matches by channel uuid (slug
+    # lookup); show/test-iou kinds match by exact title.
+    upcoming_by_slug = {}
+    upcoming_by_title = {}
+    try:
+        up = json.loads(urllib.request.urlopen(
+            f"{TVH_BASE}/api/dvr/entry/grid_upcoming?limit=500",
+            timeout=10).read())
+        uuid_to_slug = {}
+        with cmap_lock:
+            for s, info in channel_map.items():
+                uuid_to_slug[info["uuid"]] = s
+        for e in up.get("entries", []):
+            slug = uuid_to_slug.get(e.get("channel", ""), "")
+            if slug:
+                upcoming_by_slug[slug] = upcoming_by_slug.get(slug, 0) + 1
+            t = (e.get("disp_title") or "").strip()
+            if t:
+                upcoming_by_title[t] = upcoming_by_title.get(t, 0) + 1
+    except Exception:
+        pass
+    pruned = []
+    for r in recommendations:
+        if r["kind"] == "channel":
+            already = upcoming_by_slug.get(r["key"], 0)
+        else:
+            already = upcoming_by_title.get(r["key"], 0)
+        remaining = r["n"] - already
+        if remaining <= 0:
+            continue
+        r["n"] = remaining
+        pruned.append(r)
+    recommendations = pruned
+
+    if recommendations:
+        out.append("<h2>Empfehlungen — wo Labelling am meisten bringt</h2>")
+        out.append("<ul style='line-height:1.8;font-size:.9em;list-style:none;"
+                   "padding-left:0'>")
+        for i, r in enumerate(recommendations[:10]):
+            kind_api = "channel" if r["kind"] == "channel" else (
+                "show" if r["kind"] == "show" else "test-iou")
+            # data-attrs picked up by the JS handler at the end
+            out.append(
+                f"<li style='display:flex;gap:10px;align-items:baseline;"
+                f"padding:6px 0;border-bottom:1px solid #2a2a2a'>"
+                f"<span style='flex:1'>{r['msg']}</span>"
+                f"<button class='plan-btn' data-kind='{kind_api}' "
+                f"data-key='{r['key']}' data-n='{r['n']}' "
+                f"style='padding:4px 10px;border-radius:4px;border:1px solid #2980b9;"
+                f"background:#2980b9;color:#fff;font-size:.85em;cursor:pointer;"
+                f"white-space:nowrap'>📅 alle {r['n']} planen</button>"
+                f"</li>")
+        out.append("</ul>")
+        # Button click handler — confirm + POST + toast
+        out.append("""<script>
+document.querySelectorAll('.plan-btn').forEach(btn => {
+  btn.addEventListener('click', async () => {
+    const kind = btn.dataset.kind;
+    const key = btn.dataset.key;
+    const n = parseInt(btn.dataset.n);
+    if (!confirm(`Plane ${n} kommende Aufnahme(n) für ${key}?\\n\\nBestätigen → tvheadend findet die nächsten ${n} EPG-Termine und legt sie als DVR-Einträge an. Konflikte (Tuner belegt) werden gemeldet.`)) return;
+    btn.disabled = true; btn.textContent = '…';
+    try {
+      const r = await fetch('/api/learning/plan', {
+        method: 'POST', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({kind, key, n})
+      });
+      const d = await r.json();
+      if (!d.ok) throw new Error(d.error || 'unknown');
+      let msg = `${d.planned.length}/${n} geplant`;
+      if (d.planned.length > 0) {
+        msg += ':\\n' + d.planned.map(p => `  ${p.start_iso} ${p.title} (${p.channelname})`).join('\\n');
+      }
+      if (d.skipped.length > 0) {
+        msg += `\\n\\nÜbersprungen (${d.skipped.length}):\\n` + d.skipped.map(s => `  ${s.start_iso} ${s.title}: ${s.reason}`).join('\\n');
+      }
+      if (d.found === 0) msg = `Keine kommenden EPG-Termine für ${key} in den nächsten 14 Tagen.`;
+      alert(msg);
+      btn.textContent = '✓ ' + d.planned.length + '/' + n;
+    } catch (e) {
+      alert('Fehler: ' + e.message);
+      btn.disabled = false;
+      btn.textContent = `📅 alle ${n} planen`;
+    }
+  });
+});
+</script>""")
+
+    # ── Show-Fingerprint section ──────────────────────────────────
+    # List shows with enough confirmed episodes for a fingerprint, and
+    # a button to scan all unreviewed recordings against them. Each
+    # match auto-confirms (writes a synthetic ads_user.json) so the
+    # recording disappears from the active-learning queue.
+    fingerprints = _compute_show_fingerprints()
+    if fingerprints:
+        out.append(f"<h2>Show-Fingerprints ({len(fingerprints)})</h2>")
+        out.append("<p class='muted'>Shows mit ≥3 user-bestätigten Episoden + "
+                   "konsistenter Block-Anzahl. Auto-Confirm prüft neue Aufnahmen "
+                   "gegen den Fingerprint und übernimmt Treffer als bestätigt — "
+                   "spart manuelles Klicken bei wiederkehrenden Sendungen.</p>")
+        out.append("<table><tr><th>Show</th><th>Episoden</th>"
+                   "<th>Blocks</th><th>Layout (rel. zur Show)</th></tr>")
+        for show in sorted(fingerprints):
+            fp = fingerprints[show]
+            layout = " · ".join(
+                f"{int(b['start_s']//60)}:{int(b['start_s']%60):02d}–"
+                f"{int(b['end_s']//60)}:{int(b['end_s']%60):02d}"
+                for b in fp["blocks"])
+            out.append(f"<tr><td>{show}</td><td>{fp['n_recs']}</td>"
+                       f"<td>{fp['block_count']}</td>"
+                       f"<td style='font-size:.85em'>{layout}</td></tr>")
+        out.append("</table>")
+        out.append("<p><button id='fp-scan-btn' "
+                   "style='padding:6px 14px;border-radius:4px;border:1px solid #27ae60;"
+                   "background:#27ae60;color:#fff;font-size:.95em;cursor:pointer;"
+                   "margin-right:8px'>"
+                   "🔍 Auto-Confirm via Fingerprint</button>"
+                   "<button id='fp-val-btn' "
+                   "style='padding:6px 14px;border-radius:4px;border:1px solid #7f8c8d;"
+                   "background:#7f8c8d;color:#fff;font-size:.95em;cursor:pointer'>"
+                   "📊 Validieren (Leave-One-Out)</button></p>")
+        out.append("""<script>
+document.getElementById('fp-scan-btn').addEventListener('click', async (ev) => {
+  const btn = ev.target;
+  if (!confirm('Alle unreviewten Aufnahmen gegen die Show-Fingerprints prüfen?\\n\\nTreffer werden als bestätigt markiert (= identisch zu manuellem ✓ Geprüft).')) return;
+  btn.disabled = true; btn.textContent = '…läuft';
+  try {
+    const r = await fetch('/api/learning/fingerprint-scan', {method:'POST'});
+    const d = await r.json();
+    if (!d.ok) throw new Error(d.error || 'unknown');
+    let msg = `Geprüft: ${d.scanned} Aufnahmen · Auto-bestätigt: ${d.matched}`;
+    if (d.matched_list && d.matched_list.length) {
+      msg += '\\n\\nNeu bestätigt:\\n' + d.matched_list.map(m =>
+        `  ${m.show} (${m.blocks} Blocks)`).join('\\n');
+    }
+    if (d.skipped && d.skipped.length) {
+      msg += `\\n\\nÜbersprungen (${d.skipped.length}, Fingerprint mismatch):\\n`
+        + d.skipped.slice(0, 10).map(s => `  ${s.show}: ${s.reason}`).join('\\n');
+      if (d.skipped.length > 10) msg += `\\n  ... +${d.skipped.length - 10} weitere`;
+    }
+    alert(msg);
+    if (d.matched > 0) location.reload();
+    else { btn.disabled = false; btn.textContent = '🔍 Auto-Confirm via Fingerprint'; }
+  } catch (e) {
+    alert('Fehler: ' + e.message);
+    btn.disabled = false; btn.textContent = '🔍 Auto-Confirm via Fingerprint';
+  }
+});
+document.getElementById('fp-val-btn').addEventListener('click', async (ev) => {
+  const btn = ev.target;
+  btn.disabled = true; btn.textContent = '…läuft';
+  try {
+    const r = await fetch('/api/learning/fingerprint-validate', {method:'POST'});
+    const d = await r.json();
+    if (!d.ok) throw new Error(d.error || 'unknown');
+    const s = d.summary;
+    let msg = `Leave-One-Out Validierung über ${s.total} reviewte Aufnahmen:\\n\\n`;
+    msg += `  ✓ matched (Fingerprint hätte korrekt auto-bestätigt): ${s.matched}\\n`;
+    msg += `  ✗ mismatch (Fingerprint zu eng / Episode Ausreißer):  ${s.mismatch}\\n`;
+    msg += `  – no_fp (nicht genug Geschwister-Episoden):           ${s.no_fp}\\n`;
+    if (s.matched + s.mismatch > 0) {
+      const acc = (100 * s.matched / (s.matched + s.mismatch)).toFixed(0);
+      msg += `\\nMatch-Rate (testbar): ${acc}%\\n`;
+    }
+    const mismatches = d.results.filter(r => r.decision === 'mismatch');
+    if (mismatches.length) {
+      msg += `\\nMismatches im Detail:\\n` +
+        mismatches.slice(0, 10).map(r => `  ${r.show}: ${r.reason}`).join('\\n');
+      if (mismatches.length > 10) msg += `\\n  ... +${mismatches.length - 10} weitere`;
+    }
+    alert(msg);
+  } catch (e) {
+    alert('Fehler: ' + e.message);
+  }
+  btn.disabled = false; btn.textContent = '📊 Validieren (Leave-One-Out)';
+});
+</script>""")
+
+    if uncertain:
+        skip_note = (f" · {reviewed_skipped} weitere ausgeblendet "
+                     f"(geprüfte Aufnahmen)" if reviewed_skipped else "")
+        out.append(f"<h2>Active-Learning Targets "
+                   f"({len(uncertain)} offen{skip_note})</h2>")
+        out.append("<p class='muted'>Frames mit hohem Trainings-Wert. "
+                   "🎯 = Modell unsicher (p≈0.5). "
+                   "⚠ = Modell sicher, aber Wall-Clock-Prior widerspricht "
+                   "(z. B. 99% Werbung gesagt, aber dieser Sender hat zur Minute "
+                   "fast nie Werbung). Click → Player.</p>")
+        out.append("<table><tr><th></th><th>Show</th><th>Zeit</th>"
+                   "<th>p</th><th></th></tr>")
+        for u in uncertain[:30]:
+            mm = int(u["t"] // 60); ss = int(u["t"] % 60)
+            link = f"{HOST_URL}/recording/{u['uuid']}"
+            src = u.get("src", "unc")
+            icon = ("⚠" if src == "div" else
+                    "🎯⚠" if src == "both" else "🎯")
+            out.append(f"<tr><td title='{src}'>{icon}</td>"
+                       f"<td>{u['title']}</td>"
+                       f"<td>{mm}:{ss:02d}</td>"
+                       f"<td>{u['p']:.3f}</td>"
+                       f"<td><a href='{link}'>öffnen</a></td></tr>")
+        out.append("</table>")
+
+    out.append("</body></html>")
+    return Response("\n".join(out), mimetype="text/html")
+
+
 @app.route("/root.crt")
 def root_cert():
     """Serve Caddy's local CA root for device trust install."""
@@ -2355,6 +3032,11 @@ body.ctrl-min #skipad{background:#0006;color:#ddd;padding:4px 9px;
  box-shadow:0 0 0 1px #000a;z-index:1}
 .ad-block.editable{pointer-events:auto;cursor:pointer}
 .ad-block.editable:hover{height:11px}
+.uncertain-mark{position:absolute;top:50%;transform:translate(-50%,-50%);
+ width:6px;height:14px;border-radius:1px;background:#f39c12;
+ border:1px solid #000;cursor:pointer;pointer-events:auto;
+ z-index:3;box-shadow:0 0 3px #f39c12cc}
+.uncertain-mark:hover{height:18px;width:8px}
 .ad-edit-modal{position:fixed;inset:0;background:#000c;z-index:2000;
  display:flex;align-items:center;justify-content:center;padding:20px}
 .ad-edit-card{background:#222;color:#eee;border-radius:10px;
@@ -2366,7 +3048,22 @@ body.ctrl-min #skipad{background:#0006;color:#ddd;padding:4px 9px;
 .ad-edit-card input{margin-top:4px;padding:8px 10px;border-radius:6px;
  border:1px solid #444;background:#111;color:#fff;font-size:1em;
  font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
+.ad-edit-row{display:flex;align-items:center;gap:10px;margin-bottom:10px;
+ padding:8px 10px;background:#1a1a1a;border-radius:6px}
+.ad-edit-label{color:#888;font-size:.85em;width:42px;flex-shrink:0}
+.ad-edit-val{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;
+ font-size:1.05em;color:#fff;flex:1;text-align:center}
+.ad-edit-grab{padding:8px 12px;border-radius:6px;border:1px solid #2980b9;
+ background:#2980b9;color:#fff;font-size:.85em;font-weight:600;
+ cursor:pointer;white-space:nowrap}
+.ad-edit-grab:active{background:#1f6391}
 .ad-edit-hint{font-size:.75em;color:#888;margin-bottom:14px}
+/* Live staging bar shown while a block is being marked via START
+   (no ENDE yet). Translucent gray so it visually separates from
+   confirmed orange ad-blocks. */
+.ad-staging{position:absolute;top:50%;transform:translateY(-50%);
+ height:9px;border-radius:2px;pointer-events:none;
+ background:#7f7f7f88;border:1px dashed #fff8;z-index:2}
 .ad-edit-btns{display:flex;gap:8px;align-items:center}
 .ad-edit-btns .spacer{flex:1}
 .ad-edit-btns button{padding:8px 14px;border-radius:6px;
@@ -5301,6 +5998,18 @@ def recordings_page():
             elif mac_scanning:
                 status_cell += (' <span class="badge scanning" '
                                 'title="Mac comskip analysiert Werbeblöcke">🔍</span>')
+            if (out_dir / "ads_user.json").exists():
+                status_cell += (' <span class="badge ads-edited" '
+                                'title="Werbeblöcke manuell angepasst">✏️</span>')
+            unc_n = _uncertain_count(uuid)
+            if unc_n > 0:
+                status_cell += (
+                    f' <a class="badge ads-uncertain" '
+                    f'href="{HOST_URL}/recording/{uuid}" '
+                    f'title="{unc_n} hochwertige Label-Targets — '
+                    f'NN-Modell ist hier unsicher, manuelle Prüfung '
+                    f'verbessert das Training am meisten">'
+                    f'🎯 {unc_n}</a>')
         elif is_live:
             status_cell = (f'<a class="badge live" href="{play_url}" '
                            f'title="Live ansehen">● live</a>')
@@ -5505,6 +6214,9 @@ def recordings_page():
             f".badge.pending{{background:var(--stripe);color:var(--muted)}}"
             f".badge.scanning{{background:#8e44ad;color:#fff;"
             f"animation:scanpulse 1.2s ease-in-out infinite}}"
+            f".badge.ads-edited{{background:#16a085;color:#fff}}"
+            f".badge.ads-uncertain{{background:#d35400;color:#fff;"
+            f"text-decoration:none}}"
             f"@keyframes scanpulse{{0%,100%{{opacity:.5}}50%{{opacity:1}}}}"
             f".badge.live{{animation:livepulse 1.5s ease-in-out infinite}}"
             f"@keyframes livepulse{{0%,100%{{opacity:1}}50%{{opacity:.6}}}}"
@@ -5566,6 +6278,7 @@ def recordings_page():
             f"<a class='home-link' href='{HOST_URL}/'>"
             f"<span class='arrow'>←</span><h1>Aufnahmen</h1></a>"
             f"</div>"
+            f"{_learning_health_banner()}"
             f"<div class='rec-body'>"
             f"<table>"
             f"{''.join(rows) if rows else '<tr><td colspan=5>Keine Aufnahmen</td></tr>'}"
@@ -5707,6 +6420,89 @@ def _rec_channel_slug(uuid):
 
 
 _TVD_LOGO_DIR = HLS_DIR / ".tvd-logos"
+_TVD_UNCERTAIN_FILE = HLS_DIR / ".tvd-models" / "head.uncertain.txt"
+
+
+# Lazy mtime-cached parse of train-head.py's active-learning output.
+# Key: uuid → list of {time_s, prob}. Reloads whenever the file's
+# mtime changes, so a fresh head retrain (which rewrites the file)
+# is picked up without restarting the gateway.
+_uncertain_cache = {"mtime": 0, "data": {}, "total": 0}
+_uncertain_lock = threading.Lock()
+
+
+def _uncertain_for_recording(uuid):
+    """Return list of {"t": time_s, "p": probability} for uuid, or
+    [] if no entries / file missing. Entries are the timestamps where
+    the trained NN head is least confident — surfaced for the user
+    to manually verify (active learning).
+
+    Returns [] when the recording has been marked reviewed (matches
+    the recordings-list 🎯 badge filter and the /learning queue
+    filter — once user clicks Geprüft the orange scrub-bar marks
+    must also disappear, both immediately via JS and on page reload
+    via this server-side filter)."""
+    try:
+        mtime = int(_TVD_UNCERTAIN_FILE.stat().st_mtime)
+    except Exception:
+        return []
+    with _uncertain_lock:
+        if mtime != _uncertain_cache["mtime"]:
+            data, total = {}, 0
+            try:
+                for ln in _TVD_UNCERTAIN_FILE.read_text().splitlines():
+                    if not ln or ln.startswith("#"):
+                        continue
+                    parts = ln.split("\t")
+                    if len(parts) < 3:
+                        continue
+                    u = parts[0].strip()
+                    try:
+                        t = float(parts[1]); p = float(parts[2])
+                    except ValueError:
+                        continue
+                    data.setdefault(u, []).append({"t": t, "p": p})
+                    total += 1
+            except Exception:
+                data, total = {}, 0
+            for u in data:
+                data[u].sort(key=lambda e: e["t"])
+            _uncertain_cache.update({"mtime": mtime, "data": data,
+                                     "total": total})
+        items = list(_uncertain_cache["data"].get(uuid, []))
+    # Reviewed-aware filter (mirrors _uncertain_count)
+    user_cache = HLS_DIR / f"_rec_{uuid}" / "ads_user.json"
+    if items and user_cache.exists():
+        try:
+            data = json.loads(user_cache.read_text())
+            if isinstance(data, dict) and data.get("reviewed_at"):
+                return []
+        except Exception:
+            pass
+    return items
+
+
+def _uncertain_count(uuid):
+    """Cheap count for the recordings list. Returns 0 if the user has
+    ever marked this recording reviewed — matches the /learning page
+    filter so badge and queue stay consistent. Once geprüft, off
+    forever, even if a later retrain finds new uncertain frames in
+    the same recording (those are usually intra-block confusion or
+    already inside a user ad-block)."""
+    _uncertain_for_recording(uuid)  # ensure cache fresh
+    with _uncertain_lock:
+        n = len(_uncertain_cache["data"].get(uuid, []))
+    if n == 0:
+        return 0
+    user_cache = HLS_DIR / f"_rec_{uuid}" / "ads_user.json"
+    if user_cache.exists():
+        try:
+            data = json.loads(user_cache.read_text())
+            if isinstance(data, dict) and data.get("reviewed_at"):
+                return 0
+        except Exception:
+            pass
+    return n
 
 def _rec_cskip_spawn(uuid):
     """Run tv-detect on the original TS so we can mark commercial blocks
@@ -6514,130 +7310,6 @@ def save_live_ads():
         print(f"save live-ads: {e}", flush=True)
 
 
-def _live_ads_analyze(slug, window_end_seg=None, window_size=1800):
-    """Concatenate HLS segments of a live channel in a sliding window,
-    run comskip to detect commercial blocks, and store the result
-    keyed by wall-clock seconds. `window_end_seg` names the rightmost
-    segment to include (default: live edge). `window_size` is in
-    segments (each ~1 s). Keeps results from previous scans that
-    covered a different window (via the caller merging)."""
-    ch_dir = HLS_DIR / slug
-    playlist = ch_dir / "index.m3u8"
-    if not playlist.exists():
-        return False
-    # Anchor wall time: parse the first #EXT-X-PROGRAM-DATE-TIME.
-    first_pdt = None
-    try:
-        from datetime import datetime
-        for line in playlist.read_text().splitlines():
-            if line.startswith("#EXT-X-PROGRAM-DATE-TIME:"):
-                first_pdt = datetime.fromisoformat(
-                    line.split(":", 1)[1].strip()).timestamp()
-                break
-    except Exception as e:
-        print(f"[{slug}] adskip PDT parse: {e}", flush=True)
-    if first_pdt is None:
-        print(f"[{slug}] adskip skip: no PROGRAM-DATE-TIME found",
-              flush=True)
-        return False
-    all_segs = sorted(ch_dir.glob("seg_*.ts"))
-    if len(all_segs) < 120:      # at least ~2 min of segments
-        return False
-    # Determine scan window.
-    if window_end_seg is not None:
-        end_idx = next((i for i, p in enumerate(all_segs)
-                        if p.name == window_end_seg), len(all_segs))
-        end_idx = min(end_idx + 1, len(all_segs))
-    else:
-        end_idx = len(all_segs)
-    start_idx = max(0, end_idx - window_size)
-    segs = all_segs[start_idx:end_idx]
-    latest_name = segs[-1].name if segs else all_segs[-1].name
-    # For live-edge scans, short-circuit if nothing new.
-    if window_end_seg is None:
-        with _live_ads_lock:
-            prev = _live_ads.get(slug) or {}
-        if prev.get("latest_seg") == latest_name:
-            return False
-    first_pdt += start_idx * SEGMENT_TIME
-    work = ch_dir / ".adskip"
-    work.mkdir(exist_ok=True)
-    for f in work.glob("*.txt"):
-        try: f.unlink()
-        except Exception: pass
-    merged = work / "merged.ts"
-    merged.unlink(missing_ok=True)
-    # Concatenate into a single MPEG-TS so comskip sees a continuous
-    # file. TS is self-synchronising so raw cat works — much faster
-    # than ffmpeg's concat demuxer which was bottlenecked on per-file
-    # parsing.
-    try:
-        with open(merged, "wb") as out:
-            for s in segs:
-                try:
-                    out.write(s.read_bytes())
-                except Exception:
-                    pass
-    except Exception as e:
-        print(f"[{slug}] adskip cat: {e}", flush=True)
-        return False
-    if not merged.exists() or merged.stat().st_size < 1_000_000:
-        return False
-    # comskip — maximum niceness and tight ionice so it loses to
-    # every live-TV ffmpeg whenever there's contention.
-    ini = comskip_ini_for(slug)
-    try:
-        subprocess.run(
-            ["nice", "-n", "19", "ionice", "-c", "3",
-             "comskip", "--ini", str(ini), "--quiet",
-             "--output", str(work), str(merged)],
-            timeout=600, check=False)
-    except Exception as e:
-        print(f"[{slug}] adskip comskip: {e}", flush=True)
-    ads_sec = _rec_parse_comskip(work)
-    ads_sec = _blackframe_extend_ads(str(merged), ads_sec,
-                                       channel_slug=slug)
-    merged.unlink(missing_ok=True)
-    # Convert frame-based seconds (relative to concat start) to wall
-    ads_wall = [[round(first_pdt + a, 1), round(first_pdt + b, 1)]
-                for a, b in ads_sec]
-    # Keep ads from previous scans that lie OUTSIDE the current scan
-    # window (either before it starts or after it ends). Drop anything
-    # older than the 2 h DVR buffer.
-    buffer_cutoff = time.time() - WINDOW_SECONDS
-    scan_start = first_pdt
-    scan_end = first_pdt + len(segs) * SEGMENT_TIME
-    with _live_ads_lock:
-        prev = _live_ads.get(slug, {}).get("ads", [])
-    retained = [a for a in prev
-                if (a[1] <= scan_start or a[0] >= scan_end)
-                and a[1] > buffer_cutoff]
-    merged_ads = sorted(retained + ads_wall)
-    # Cross-scan merge pass: _rec_parse_comskip merges adjacent
-    # detections within MERGE_GAP INSIDE one scan, but a single
-    # commercial break can span a scan boundary — sub-ads detected
-    # in two different scans end up as separate entries here. Re-run
-    # the same merge across the combined list so the player sees
-    # one block per actual commercial break instead of fragmented
-    # stubs.
-    MERGE_GAP = 45.0
-    coalesced = []
-    for a, b in merged_ads:
-        if coalesced and a - coalesced[-1][1] <= MERGE_GAP:
-            coalesced[-1][1] = max(coalesced[-1][1], b)
-        else:
-            coalesced.append([a, b])
-    merged_ads = coalesced
-    with _live_ads_lock:
-        _live_ads[slug] = {"generated": time.time(), "ads": merged_ads,
-                            "latest_seg": latest_name}
-    save_live_ads()
-    print(f"[{slug}] adskip: {len(ads_wall)} new, "
-          f"{len(retained)} retained, {len(merged_ads)} total",
-          flush=True)
-    return True
-
-
 # Only scan channels where commercials are plausible — public
 # broadcasters have no regular ads primetime.
 LIVE_ADSKIP_SLUGS = {
@@ -6645,90 +7317,6 @@ LIVE_ADSKIP_SLUGS = {
     "rtl", "vox", "rtlzwei", "nitro", "rtlup", "superrtl",
     "tele-5", "tele5", "sport1", "dmax", "sixx",
 }
-
-
-def _live_adskip_loop():
-    # When LIVE_ADS_OFFLOAD is set (e.g. "mac"), the live-buffer scan
-    # runs on another host that writes .live_ads.json directly. We read
-    # that file on every /api/live-ads/<slug> call instead.
-    if os.environ.get("LIVE_ADS_OFFLOAD"):
-        print("adskip loop: disabled (LIVE_ADS_OFFLOAD set — "
-              f"{os.environ.get('LIVE_ADS_OFFLOAD')} handles scanning)",
-              flush=True)
-        return
-    # Short warm-up: threads and adopted ffmpegs settle in a few seconds.
-    # The per-channel `started_at > 120s` check below is what actually
-    # guarantees the buffer is long enough to bother analysing.
-    time.sleep(10)
-    # 1-min loadavg threshold: we have 4 cores and 5 SD-MPEG-2 streams
-    # already running libx264, each eating ~0.7-1.0 core. Add comskip
-    # and the playing client, and ffmpeg starves — segment writes
-    # stall for 20 s, playback stutters. Hold off the scan until
-    # there's real headroom.
-    LOAD_CAP = 10.0
-    while True:
-        try:
-            load = os.getloadavg()[0]
-            if load > LOAD_CAP:
-                time.sleep(60)
-                continue
-            with active_lock:
-                candidates = [s for s, i in channels.items()
-                              if i["process"].poll() is None
-                              and s in LIVE_ADSKIP_SLUGS
-                              and (time.time() - i.get("started_at", 0)) > 120]
-            with _live_ads_lock:
-                recent = {s for s, v in _live_ads.items()
-                          if time.time() - v.get("generated", 0) < 720}
-            todo = [s for s in candidates if s not in recent]
-            if todo:
-                slug = todo[0]
-                print(f"[{slug}] adskip: analysing "
-                      f"(load={load:.1f}, {len(todo)-1} more queued)",
-                      flush=True)
-                _live_ads_proc["slug"] = slug
-                _live_ads_proc["started"] = time.time()
-                try:
-                    _live_ads_analyze(slug)
-                finally:
-                    _live_ads_proc["slug"] = None
-        except Exception as e:
-            print(f"adskip loop: {e}", flush=True)
-        time.sleep(30)
-
-
-@app.route("/api/live-ads/<slug>/scan", methods=["POST"])
-def api_live_ads_scan(slug):
-    """Force an ad-detection pass across the whole current live buffer
-    in 25-min chunks. Each chunk's result is merged into the cache so
-    older ad blocks aren't lost when the next chunk runs."""
-    if os.environ.get("LIVE_ADS_OFFLOAD"):
-        return _cors(Response(json.dumps({"skipped": True,
-                                           "reason": "offloaded — external scanner owns live-ad detection"}),
-                               mimetype="application/json"))
-    if slug not in LIVE_ADSKIP_SLUGS:
-        return _cors(Response(json.dumps({"skipped": True,
-                                           "reason": "not in commercial list"}),
-                               mimetype="application/json"))
-    def run():
-        try:
-            ch_dir = HLS_DIR / slug
-            all_segs = sorted(ch_dir.glob("seg_*.ts"))
-            CHUNK = 1800
-            STEP = 1500  # overlap by 5 min so blocks at chunk edges aren't missed
-            end_idx = len(all_segs)
-            while end_idx > 120:
-                anchor = all_segs[end_idx - 1].name
-                _live_ads_analyze(slug, window_end_seg=anchor,
-                                   window_size=CHUNK)
-                end_idx -= STEP
-                if end_idx <= 0:
-                    break
-        except Exception as e:
-            print(f"[{slug}] manual adskip: {e}", flush=True)
-    threading.Thread(target=run, daemon=True).start()
-    return _cors(Response(json.dumps({"started": True, "slug": slug}),
-                           mimetype="application/json"))
 
 
 def _live_ads_payload(slug):
@@ -6988,55 +7576,129 @@ def recording_hls(uuid):
                     mimetype="application/vnd.apple.mpegurl")
 
 
+def _read_user_ads(user_cache):
+    """Read ads_user.json. Backward-compat: supports both legacy
+    list-of-pairs format ([[s,e], ...]) and the dict format
+    ({"ads": [...], "deleted": [...]}) used since the smart-merge
+    rewrite. Returns (user_ads, deleted_auto)."""
+    if not user_cache.exists():
+        return [], []
+    try:
+        raw = json.loads(user_cache.read_text())
+    except Exception:
+        return [], []
+    if isinstance(raw, list):
+        return raw, []
+    if isinstance(raw, dict):
+        return raw.get("ads", []) or [], raw.get("deleted", []) or []
+    return [], []
+
+
+def _smart_merge_ads(auto, user, deleted):
+    """Merge auto-detected blocks with user edits.
+
+    Semantics:
+      * any auto block overlapping a user block is dropped (user
+        version wins — covers boundary refinements)
+      * any auto block overlapping an explicit deletion is dropped
+        (covers false-positive removal that survives re-scans)
+      * remaining auto blocks + all user blocks form the result
+
+    Overlap = the two intervals share any time. Float comparison
+    uses no tolerance — adjacent (touching) blocks don't count as
+    overlapping; that mirrors the existing `b > a` vs `>=` semantics
+    in the parser."""
+    def overlaps(a, b):
+        return a[0] < b[1] and b[0] < a[1]
+    surviving = [a for a in auto
+                 if not any(overlaps(a, x) for x in user)
+                 and not any(overlaps(a, d) for d in deleted)]
+    out = sorted(surviving + list(user), key=lambda b: b[0])
+    return out
+
+
 @app.route("/recording/<uuid>/ads")
 def recording_ads(uuid):
-    """Commercial-block markers for the scrub bar. { ads: [[s,e], …] }.
-    User-edited markers (saved via /api/recording/<uuid>/ads/edit)
-    take precedence over the auto-detected set so manual fixes
-    survive re-scans."""
+    """Commercial-block markers for the scrub bar.
+
+    Returns the smart-merged view of auto-detected blocks
+    (`ads.json`, regenerated from the comskip/tv-detect cutlist) and
+    the user's manual edits (`ads_user.json` — refined boundaries,
+    additions, and explicit deletions of false positives). User
+    blocks override overlapping auto blocks; user deletions suppress
+    overlapping auto blocks across re-scans.
+
+    Response includes both the merged `ads` (what the player should
+    render) and the raw `auto` set so the editor UI can tell which
+    blocks came from auto-detection vs the user — essential for
+    classifying a future delete-action as "remove user-block" vs
+    "mark auto-block as false-positive"."""
     out_dir = HLS_DIR / f"_rec_{uuid}"
     cskip_info = _rec_cskip_procs.get(uuid)
     running = cskip_info is not None and cskip_info["proc"].poll() is None
     if not out_dir.exists():
-        ads = []
-        edited = False
+        payload = {"ads": [], "auto": [], "user": [], "deleted": [],
+                   "edited": False, "running": running}
+        resp = _cors(Response(json.dumps(payload),
+                              mimetype="application/json"))
+        resp.headers["Cache-Control"] = "no-store"
+        return resp
+
+    user_cache = out_dir / "ads_user.json"
+    user_ads, deleted = _read_user_ads(user_cache)
+    edited = user_cache.exists()
+
+    auto = []
+    ads_cache = out_dir / "ads.json"
+    SIDECAR = (".logo.txt", ".trained.logo.txt", ".cskp.txt", ".tvd.txt")
+    txts = [p for p in out_dir.glob("*.txt")
+            if not any(p.name.endswith(s) for s in SIDECAR)]
+    txt_mtime = max((t.stat().st_mtime for t in txts), default=0)
+    if (not running and txts
+            and ads_cache.exists()
+            and ads_cache.stat().st_mtime >= txt_mtime):
+        try:
+            auto = json.loads(ads_cache.read_text())
+        except Exception:
+            auto = _rec_parse_comskip(out_dir)
     else:
-        user_cache = out_dir / "ads_user.json"
-        edited = user_cache.exists()
-        if edited:
+        auto = _rec_parse_comskip(out_dir)
+        if not running and auto:
+            src = _rec_source_path(uuid)
+            if src and Path(src).exists():
+                auto = _blackframe_extend_ads(
+                    src, auto, channel_slug=_rec_channel_slug(uuid))
             try:
-                ads = json.loads(user_cache.read_text())
+                ads_cache.write_text(json.dumps(auto))
             except Exception:
-                edited = False
-        if not edited:
-            ads_cache = out_dir / "ads.json"
-            # Same sidecar-exclusion as _rec_parse_comskip — a stale
-            # .cskp.txt mtime would otherwise force endless re-parses.
-            SIDECAR = (".logo.txt", ".trained.logo.txt", ".cskp.txt", ".tvd.txt")
-            txts = [p for p in out_dir.glob("*.txt")
-                    if not any(p.name.endswith(s) for s in SIDECAR)]
-            txt_mtime = max((t.stat().st_mtime for t in txts), default=0)
-            if (not running and txts
-                    and ads_cache.exists()
-                    and ads_cache.stat().st_mtime >= txt_mtime):
-                try:
-                    ads = json.loads(ads_cache.read_text())
-                except Exception:
-                    ads = _rec_parse_comskip(out_dir)
-            else:
-                ads = _rec_parse_comskip(out_dir)
-                if not running and ads:
-                    src = _rec_source_path(uuid)
-                    if src and Path(src).exists():
-                        ads = _blackframe_extend_ads(
-                            src, ads, channel_slug=_rec_channel_slug(uuid))
+                pass
+
+    merged = _smart_merge_ads(auto, user_ads, deleted)
+    # Surface the playlist duration so the client can render ads
+    # immediately on the /ads response — without it, renderAds() bails
+    # at `if (D<=0) return` until v.duration is populated by the
+    # video element's loadedmetadata, which costs ~6 s of "blank
+    # scrub bar" after the page first paints. Parse the m3u8's
+    # EXTINF lines (already on disk, single read) — accurate even
+    # for variable-duration last segments.
+    duration_s = 0.0
+    pl = out_dir / "index.m3u8"
+    if pl.exists():
+        try:
+            for ln in pl.read_text().splitlines():
+                if ln.startswith("#EXTINF:"):
                     try:
-                        ads_cache.write_text(json.dumps(ads))
+                        duration_s += float(ln.split(":", 1)[1].rstrip(","))
                     except Exception:
                         pass
-    resp = _cors(Response(json.dumps({"ads": ads, "running": running,
-                                        "edited": edited}),
-                            mimetype="application/json"))
+        except Exception:
+            pass
+    payload = {"ads": merged, "auto": auto, "user": user_ads,
+               "deleted": deleted, "edited": edited, "running": running,
+               "duration_s": round(duration_s, 3),
+               "uncertain": _uncertain_for_recording(uuid)}
+    resp = _cors(Response(json.dumps(payload),
+                          mimetype="application/json"))
     resp.headers["Cache-Control"] = "no-store"
     return resp
 
@@ -7062,29 +7724,429 @@ def api_recording_ads_edit(uuid):
         return Response(json.dumps({"ok": False,
                                       "error": "ads array required"}),
                         status=400, mimetype="application/json")
-    # Normalise + sort + drop nonsense ranges.
-    cleaned = []
-    for blk in ads:
-        try:
-            s = float(blk[0]); e = float(blk[1])
-            if e > s and e - s >= 1:
-                cleaned.append([round(s, 2), round(e, 2)])
-        except Exception:
-            continue
-    cleaned.sort()
+    # Optional explicit-deletion list — auto-blocks the user marked as
+    # false positives. Without this, deletion-of-an-auto-block can't
+    # survive a re-scan (the auto would re-add the block).
+    deleted_in = body.get("deleted") if isinstance(body, dict) else None
+    if deleted_in is not None and not isinstance(deleted_in, list):
+        return Response(json.dumps({"ok": False,
+                                      "error": "deleted must be array"}),
+                        status=400, mimetype="application/json")
+
+    def _clean(items):
+        out = []
+        for blk in items or []:
+            try:
+                s = float(blk[0]); e = float(blk[1])
+                if e > s and e - s >= 1:
+                    out.append([round(s, 2), round(e, 2)])
+            except Exception:
+                continue
+        out.sort(key=lambda b: b[0])
+        return out
+    cleaned = _clean(ads)
+    cleaned_deleted = _clean(deleted_in)
+
     user_cache = out_dir / "ads_user.json"
+    # Preserve confirmed_show + reviewed_at from existing ads_user.json
+    # (set by /mark-reviewed) — those are user-meta fields, the ad-edit
+    # UI doesn't know about them and a full overwrite would wipe them.
+    existing_extras = {}
+    if user_cache.exists():
+        try:
+            cur = json.loads(user_cache.read_text())
+            if isinstance(cur, dict):
+                for k in ("confirmed_show", "reviewed_at"):
+                    if k in cur:
+                        existing_extras[k] = cur[k]
+        except Exception:
+            pass
     try:
-        if not cleaned:
+        if not cleaned and not cleaned_deleted and not existing_extras:
             user_cache.unlink(missing_ok=True)
         else:
+            payload = {"ads": cleaned, "deleted": cleaned_deleted, **existing_extras}
             tmp = user_cache.with_suffix(".tmp")
-            tmp.write_text(json.dumps(cleaned))
+            tmp.write_text(json.dumps(payload))
             tmp.replace(user_cache)
     except Exception as e:
         return Response(json.dumps({"ok": False, "error": str(e)}),
                         status=500, mimetype="application/json")
-    return _cors(Response(json.dumps({"ok": True, "ads": cleaned}),
+    return _cors(Response(json.dumps({"ok": True, "ads": cleaned,
+                                       "deleted": cleaned_deleted}),
                            mimetype="application/json"))
+
+
+@app.route("/api/learning/plan", methods=["POST"])
+def api_learning_plan():
+    """Schedule N upcoming EPG events that match a learning recommendation.
+    Body: {"kind": "channel"|"show"|"test-iou", "key": "...", "n": <int>}
+
+    For 'channel': key=channel slug, schedules N upcoming events on that
+                  channel regardless of show.
+    For 'show'/'test-iou': key=show title, schedules N upcoming
+                  occurrences of that show on any channel that airs it.
+
+    Returns:
+      {"planned": [{title, channelname, start_iso, dvr_uuid}, ...],
+       "skipped": [{reason, title, start_iso}, ...],
+       "found": <int total EPG matches>}
+
+    Each event schedule uses tvheadend's /api/dvr/entry/create_by_event
+    which inherits the default DVR config (storage path, padding, etc).
+    Existing scheduled entries (same channel + same start ±60 s) are
+    skipped as duplicates so re-clicking the button is idempotent."""
+    try:
+        body = request.get_json(silent=True) or {}
+        kind = body.get("kind", "")
+        key = (body.get("key") or "").strip()
+        n = int(body.get("n", 1))
+    except Exception:
+        return Response(json.dumps({"ok": False, "error": "bad body"}),
+                        status=400, mimetype="application/json")
+    if kind not in ("channel", "show", "test-iou") or not key or n < 1:
+        return Response(json.dumps({"ok": False, "error": "missing/invalid kind|key|n"}),
+                        status=400, mimetype="application/json")
+
+    import urllib.parse
+    # 1. Pull upcoming EPG events
+    now_ts = int(time.time())
+    horizon_ts = now_ts + 14 * 24 * 3600  # search 14 days ahead
+    if kind == "channel":
+        # Resolve channel slug → uuid via cached channel_map
+        ch_uuid = None
+        with cmap_lock:
+            for slug, info in channel_map.items():
+                if slug == key:
+                    ch_uuid = info["uuid"]; break
+        if not ch_uuid:
+            return Response(json.dumps({"ok": False,
+                                          "error": f"unknown channel slug: {key}"}),
+                            status=404, mimetype="application/json")
+        params = {"limit": 200, "channel": ch_uuid, "sort": "start"}
+    else:  # show / test-iou
+        params = {"limit": 500, "title": key, "fulltext": 0, "sort": "start"}
+    try:
+        epg_url = f"{TVH_BASE}/api/epg/events/grid?{urllib.parse.urlencode(params)}"
+        epg = json.loads(urllib.request.urlopen(epg_url, timeout=10).read())
+    except Exception as e:
+        return Response(json.dumps({"ok": False, "error": f"epg query: {e}"}),
+                        status=502, mimetype="application/json")
+    candidates = [e for e in epg.get("entries", [])
+                  if e.get("start", 0) > now_ts and e.get("start", 0) < horizon_ts]
+    candidates.sort(key=lambda e: e.get("start", 0))
+
+    # For show kind, the title filter is exact in tvheadend, but be defensive
+    if kind in ("show", "test-iou"):
+        candidates = [e for e in candidates
+                      if (e.get("title") or "").strip() == key]
+
+    # 2. Pull already-scheduled DVR entries to dedupe
+    try:
+        dvr = json.loads(urllib.request.urlopen(
+            f"{TVH_BASE}/api/dvr/entry/grid_upcoming?limit=500",
+            timeout=10).read())
+        scheduled_keys = {(e.get("channel"), e.get("start", 0))
+                          for e in dvr.get("entries", [])}
+    except Exception:
+        scheduled_keys = set()
+
+    # tvheadend's create_by_event requires config_uuid — pick first enabled
+    dvr_config_uuid = ""
+    try:
+        cfgs = json.loads(urllib.request.urlopen(
+            f"{TVH_BASE}/api/dvr/config/grid?limit=10", timeout=10).read())
+        for c in cfgs.get("entries", []):
+            if c.get("enabled"):
+                dvr_config_uuid = c.get("uuid", ""); break
+    except Exception:
+        pass
+
+    def is_dup(ev):
+        for ch_u, s in scheduled_keys:
+            if ev.get("channelUuid") == ch_u and abs(ev.get("start", 0) - s) <= 60:
+                return True
+        return False
+
+    planned = []
+    skipped = []
+    for ev in candidates:
+        if len(planned) >= n:
+            break
+        title = (ev.get("title") or "").strip() or "?"
+        start_iso = time.strftime("%a %d.%m %H:%M",
+                                    time.localtime(ev.get("start", 0)))
+        if is_dup(ev):
+            skipped.append({"reason": "schon geplant",
+                              "title": title, "start_iso": start_iso})
+            continue
+        # Schedule via create_by_event (config_uuid required by tvheadend)
+        try:
+            payload = {"event_id": ev.get("eventId", 0)}
+            if dvr_config_uuid:
+                payload["config_uuid"] = dvr_config_uuid
+            req = urllib.request.Request(
+                f"{TVH_BASE}/api/dvr/entry/create_by_event",
+                data=urllib.parse.urlencode(payload).encode(),
+                method="POST")
+            res = json.loads(urllib.request.urlopen(req, timeout=10).read())
+            # tvheadend returns {"uuid": ["..."]}
+            ru = res.get("uuid") if isinstance(res, dict) else None
+            dvr_uuid = ru[0] if isinstance(ru, list) and ru else (ru or None)
+            planned.append({"title": title, "start_iso": start_iso,
+                            "channelname": ev.get("channelName", ""),
+                            "dvr_uuid": dvr_uuid})
+        except Exception as e:
+            skipped.append({"reason": str(e)[:120],
+                              "title": title, "start_iso": start_iso})
+    return _cors(Response(json.dumps({
+        "ok": True, "planned": planned, "skipped": skipped,
+        "found": len(candidates)}),
+        mimetype="application/json"))
+
+
+@app.route("/api/learning/fingerprint-scan", methods=["POST"])
+def api_learning_fingerprint_scan():
+    """Compute show fingerprints from user-confirmed episodes, then
+    walk every recording lacking ads_user.json: if its show has a
+    fingerprint AND the auto-detected ads.json matches within
+    tolerance, write a synthetic ads_user.json marking it auto-
+    confirmed. Same downstream effect as the user clicking
+    ✓ Geprüft — disappears from active-learning, contributes to
+    training with auto_user_weight (lower than real edits but >1×).
+
+    Idempotent: skips recordings already having ads_user.json (real
+    or auto-confirmed). Re-running picks up newly-arrived recordings
+    only. Pure read-only against existing user data — never overrides
+    a real review.
+
+    Returns: {ok, scanned, matched, skipped: [...], fingerprints_used}"""
+    fingerprints = _compute_show_fingerprints()
+    if not fingerprints:
+        return _cors(Response(json.dumps({
+            "ok": True, "scanned": 0, "matched": 0,
+            "skipped": ["no fingerprints — need ≥3 user-confirmed "
+                        "episodes per show with consensus block count"],
+            "fingerprints_used": 0}), mimetype="application/json"))
+    scanned = 0
+    matched = 0
+    matched_list = []
+    skipped = []
+    for d in HLS_DIR.glob("_rec_*"):
+        scanned += 1
+        user = d / "ads_user.json"
+        if user.is_file():
+            continue  # already user-reviewed or fingerprint-confirmed
+        auto = d / "ads.json"
+        if not auto.is_file():
+            continue
+        try:
+            auto_blocks = json.loads(auto.read_text())
+        except Exception:
+            continue
+        if not isinstance(auto_blocks, list) or not auto_blocks:
+            continue
+        show = _show_title_for_rec(d)
+        if not show or show not in fingerprints:
+            continue
+        fp = fingerprints[show]
+        ok, reason = _check_fingerprint_match(fp, auto_blocks)
+        if not ok:
+            skipped.append({"uuid": d.name[5:], "show": show,
+                            "reason": reason})
+            continue
+        ts = int(time.time())
+        user.write_text(json.dumps({
+            "ads": auto_blocks,
+            "deleted": [],
+            "auto_confirmed_via_fingerprint": True,
+            "fingerprint_show": show,
+            "fingerprint_n_recs": fp["n_recs"],
+            "reviewed_at": ts,
+        }))
+        matched += 1
+        matched_list.append({"uuid": d.name[5:], "show": show,
+                              "blocks": len(auto_blocks)})
+    return _cors(Response(json.dumps({
+        "ok": True, "scanned": scanned, "matched": matched,
+        "matched_list": matched_list[:50],
+        "skipped": skipped[:50],
+        "fingerprints_used": len(fingerprints)}),
+        mimetype="application/json"))
+
+
+@app.route("/api/learning/fingerprint-validate", methods=["POST"])
+def api_learning_fingerprint_validate():
+    """Leave-one-out cross-validation of show fingerprints against
+    actual user labels. For every reviewed episode whose show has
+    enough siblings (≥3 positive episodes total), rebuild the
+    fingerprint EXCLUDING that episode, then test the episode's
+    user-confirmed blocks against that fingerprint.
+
+    Tells you what fraction of recordings the auto-confirm pass
+    WOULD have correctly flagged as 'matches the fingerprint',
+    without touching any data. The 'mismatch' bucket shows where
+    the fingerprint is too tight (or the episode is genuinely an
+    outlier worth keeping in review).
+
+    Returns: {ok, results: [{uuid, show, decision, reason}, ...],
+              summary: {total, matched, mismatch, no_fp}}.
+    Non-destructive — never writes to disk."""
+    by_show = _aggregate_episodes_by_show()
+    results = []
+    summary = {"total": 0, "matched": 0, "mismatch": 0, "no_fp": 0}
+    # min_recs=1 here, NOT the production 2 — with sparse data
+    # (most shows have 1-2 episodes total), a strict LOO would
+    # always leave too few siblings for a fingerprint. With min_recs=1
+    # the test becomes "does this episode match its single sibling?",
+    # which is a useful conservative signal even if not statistically
+    # rigorous. The mismatch reasons reveal whether boundaries are
+    # consistent across episodes regardless of count.
+    for show, eps in sorted(by_show.items()):
+        for i, (rec_dir_name, blocks) in enumerate(eps):
+            uuid = rec_dir_name[5:]
+            summary["total"] += 1
+            loo = [b for j, (_, b) in enumerate(eps) if j != i]
+            fp_loo = _build_fingerprint(loo, min_recs=1)
+            if fp_loo is None:
+                summary["no_fp"] += 1
+                results.append({"uuid": uuid, "show": show,
+                                  "decision": "no_fp",
+                                  "reason": (f"only {len(loo)} other positive "
+                                             f"episodes — need ≥2 after LOO")})
+                continue
+            ok, reason = _check_fingerprint_match(fp_loo, blocks)
+            if ok:
+                summary["matched"] += 1
+                results.append({"uuid": uuid, "show": show,
+                                  "decision": "matched",
+                                  "reason": ""})
+            else:
+                summary["mismatch"] += 1
+                results.append({"uuid": uuid, "show": show,
+                                  "decision": "mismatch",
+                                  "reason": reason})
+    return _cors(Response(json.dumps({
+        "ok": True, "summary": summary, "results": results}),
+        mimetype="application/json"))
+
+
+@app.route("/api/recording/<uuid>/skip-event", methods=["POST"])
+def api_recording_skip_event(uuid):
+    """User pressed the Werbung-Skip button while an auto-detected
+    block was active. Implicit confirmation that the block IS a real
+    ad break (= positive class with bonus weight at training time).
+    Cleaner signal than scrub-through or completion-percent — those
+    have too many alternative interpretations.
+
+    Stored as `confirmed_ad_skips: [t1, t2, ...]` in ads_user.json,
+    deduped within ±5 s so repeated taps don't pile up. train-head.py
+    treats each timestamp as a forced label=1 with sample_weight ×1.5
+    (between auto's 1.0 and explicit-edit's 2.0)."""
+    out_dir = HLS_DIR / f"_rec_{uuid}"
+    if not out_dir.exists():
+        return Response(json.dumps({"ok": False, "error": "unknown recording"}),
+                        status=404, mimetype="application/json")
+    try:
+        body = request.get_json(silent=True) or {}
+        t = float(body.get("t", -1))
+    except Exception:
+        t = -1
+    if t < 0:
+        return Response(json.dumps({"ok": False, "error": "t required"}),
+                        status=400, mimetype="application/json")
+    user_cache = out_dir / "ads_user.json"
+    user_ads, deleted = _read_user_ads(user_cache)
+    cur = {}
+    if user_cache.exists():
+        try:
+            raw = json.loads(user_cache.read_text())
+            if isinstance(raw, dict):
+                cur = raw
+        except Exception:
+            pass
+    skips = [float(x) for x in cur.get("confirmed_ad_skips", []) or []]
+    # Dedupe within ±5 s — repeated skip-taps in same block are noise
+    if any(abs(t - s) <= 5.0 for s in skips):
+        return _cors(Response(json.dumps({"ok": True, "added": False,
+                                            "total": len(skips)}),
+                               mimetype="application/json"))
+    skips.append(round(t, 1))
+    skips.sort()
+    payload = dict(cur)
+    payload.update({"ads": user_ads, "deleted": deleted,
+                    "confirmed_ad_skips": skips})
+    try:
+        tmp = user_cache.with_suffix(".tmp")
+        tmp.write_text(json.dumps(payload))
+        tmp.replace(user_cache)
+    except Exception as e:
+        return Response(json.dumps({"ok": False, "error": str(e)}),
+                        status=500, mimetype="application/json")
+    return _cors(Response(json.dumps({"ok": True, "added": True,
+                                       "total": len(skips)}),
+                           mimetype="application/json"))
+
+
+@app.route("/api/recording/<uuid>/mark-reviewed", methods=["POST"])
+def api_recording_mark_reviewed(uuid):
+    """User explicitly tapped 'Geprüft' in the player. Two effects:
+
+      1. UI: hides the 🎯 active-learning badge on the recordings list
+         (gateway compares uncertain count vs reviewed_at + confirmed_show).
+      2. TRAINING: each currently-uncertain frame in this recording that
+         the user did NOT cover with an ad block becomes a confirmed-
+         show negative-sample at training time. The next nightly retrain
+         picks them up via train-head.py's confirmed_show handling.
+
+    Persisted as `confirmed_show: [t1, t2, ...]` and `reviewed_at: <ts>`
+    in ads_user.json alongside the existing ads/deleted fields.
+    Idempotent — re-tapping just refreshes the timestamp."""
+    out_dir = HLS_DIR / f"_rec_{uuid}"
+    if not out_dir.exists():
+        return Response(json.dumps({"ok": False, "error": "unknown recording"}),
+                        status=404, mimetype="application/json")
+    user_cache = out_dir / "ads_user.json"
+    user_ads, deleted = _read_user_ads(user_cache)
+    # Read existing confirmed_show so re-tapping doesn't drop frames
+    # that were confirmed-show in a previous review cycle.
+    confirmed = []
+    if user_cache.exists():
+        try:
+            cur = json.loads(user_cache.read_text())
+            if isinstance(cur, dict):
+                confirmed = [float(x) for x in cur.get("confirmed_show", [])]
+        except Exception:
+            pass
+    confirmed_set = set(round(x, 1) for x in confirmed)
+    # Pull this recording's currently-uncertain timestamps
+    new_confirmed = 0
+    for u in _uncertain_for_recording(uuid):
+        t = float(u.get("t", 0))
+        # Skip if inside any user-marked ad block (= it IS an ad,
+        # the model just was uncertain within the block)
+        if any(s <= t <= e for s, e in user_ads):
+            continue
+        key = round(t, 1)
+        if key in confirmed_set:
+            continue
+        confirmed.append(round(t, 1))
+        confirmed_set.add(key)
+        new_confirmed += 1
+    payload = {"ads": user_ads, "deleted": deleted,
+               "confirmed_show": sorted(confirmed),
+               "reviewed_at": int(time.time())}
+    try:
+        tmp = user_cache.with_suffix(".tmp")
+        tmp.write_text(json.dumps(payload))
+        tmp.replace(user_cache)
+    except Exception as e:
+        return Response(json.dumps({"ok": False, "error": str(e)}),
+                        status=500, mimetype="application/json")
+    return _cors(Response(json.dumps({
+        "ok": True, "added": new_confirmed,
+        "total_confirmed": len(confirmed)}),
+        mimetype="application/json"))
 
 
 @app.route("/recording/<uuid>/thumbs.json")
@@ -7419,6 +8481,18 @@ def play_recording(uuid):
             f"<span class='spacer'></span>"
             f"<button id='skipad' class='pill rec' onclick='skipAd()'"
             f">Werbung ⏭</button>"
+            f"<button id='ad-start' class='pill' onclick='adMarkStart()'"
+            f" title='Aktuelle Stelle als Werbe-Start markieren'>"
+            f"⏵ Start</button>"
+            f"<button id='ad-end' class='pill' onclick='adMarkEnd()'"
+            f" title='Aktuelle Stelle als Werbe-Ende übernehmen "
+            f"(speichert gestagten Block oder korrigiert nächstgelegenen)'>"
+            f"⏹ Ende</button>"
+            f"<button id='ad-reviewed' class='pill' onclick='markReviewed()'"
+            f" title='Aufnahme als geprüft markieren — "
+            f"verbleibende unsichere Frames werden als Show bestätigt"
+            f" (höhere Trainings-Wirkung als kein-Klick)'>"
+            f"✓ Geprüft</button>"
             f"<span id='dur' class='time'>0:00</span>"
             f"</div>"
             f"<div id='ttlrow'>{title_safe}</div>"
@@ -7462,10 +8536,26 @@ def play_recording(uuid):
             f"  return null;"
             f"}}"
             f"function skipAd(){{"
-            f"  const a=currentAd();if(a)v.currentTime=a[1]+0.1;"
+            f"  const a=currentAd();"
+            f"  if(!a)return;"
+            f"  /* Implicit confirmation: pressing Skip while inside a"
+            f"     block confirms it WAS a real ad — soft positive label"
+            f"     for training (deduped server-side within ±5 s). */"
+            f"  const t0=v.currentTime||a[0];"
+            f"  fetch('{HOST_URL}/api/recording/{uuid}/skip-event',"
+            f"    {{method:'POST',headers:{{'Content-Type':'application/json'}},"
+            f"     body:JSON.stringify({{t:t0}})}}).catch(()=>{{}});"
+            f"  v.currentTime=a[1]+0.1;"
             f"}}"
             f"function renderAds(){{"
-            f"  const D=isFinite(v.duration)?v.duration:0;"
+            f"  /* Prefer the video element's duration (authoritative once"
+            f"     metadata is loaded). Fall back to the server-supplied"
+            f"     playlist duration so blocks render immediately on first"
+            f"     /ads response, instead of waiting ~6 s for"
+            f"     loadedmetadata to fire. The loadedmetadata handler"
+            f"     re-renders to refine positions if they shift. */"
+            f"  const vd=isFinite(v.duration)?v.duration:0;"
+            f"  const D=vd>0?vd:adsDurationFallback;"
             f"  document.querySelectorAll('.ad-block').forEach(e=>e.remove());"
             f"  if(D<=0)return;"
             f"  ads.forEach((blk,idx)=>{{"
@@ -7482,10 +8572,30 @@ def play_recording(uuid):
             f"    scrub.appendChild(el);"
             f"  }});"
             f"}}"
+            f"/* A 'user' ad is one that doesn't overlap any auto-detected"
+            f"   block — boundary refinements (which DO overlap an auto"
+            f"   block) override the auto via the smart-merge and don't"
+            f"   need to be re-listed separately. Sending only the"
+            f"   diverging blocks keeps ads_user.json minimal and lets"
+            f"   re-scans pick up newly detected blocks automatically. */"
+            f"function blocksOverlap(a,b){{return a[0]<b[1]&&b[0]<a[1];}}"
             f"function saveAdsEdit(){{"
+            f"  const userOnly=ads.filter(u=>"
+            f"    !autoAds.some(a=>blocksOverlap(a,u))"
+            f"  );"
+            f"  /* User-edits that DO overlap an auto-block override it"
+            f"     — include them in the user list too so smart-merge"
+            f"     drops the (now superseded) auto version. */"
+            f"  const overrides=ads.filter(u=>"
+            f"    autoAds.some(a=>blocksOverlap(a,u)"
+            f"      && (Math.abs(a[0]-u[0])>0.5 || Math.abs(a[1]-u[1])>0.5))"
+            f"  );"
+            f"  const userList=[...userOnly,...overrides]"
+            f"    .sort((a,b)=>a[0]-b[0]);"
             f"  fetch('{HOST_URL}/api/recording/{uuid}/ads/edit',"
             f"    {{method:'POST',headers:{{'Content-Type':'application/json'}},"
-            f"     body:JSON.stringify({{ads:ads}})}}).catch(()=>{{}});"
+            f"     body:JSON.stringify({{ads:userList,deleted:userDeleted}})"
+            f"    }}).catch(()=>{{}});"
             f"}}"
             f"/* Parse 'mm:ss' / 'hh:mm:ss' / 'ss' → seconds. */"
             f"function parseTimeToSec(s){{"
@@ -7495,19 +8605,151 @@ def play_recording(uuid):
             f"  let t=0;for(const p of parts)t=t*60+p;"
             f"  return t;"
             f"}}"
-            f"function openAdEditor(idx){{"
+            f"/* Two-button mark-and-save flow for touchscreens —"
+            f"   no time inputs, no modal. While the user watches:"
+            f"   tap START at the moment the ad begins → the position"
+            f"   is captured, the START button hides and ENDE appears."
+            f"   At the end of the ad, tap ENDE → block is sealed and"
+            f"   POSTed. Visual feedback: a translucent gray bar grows"
+            f"   on the scrub bar from the start position to the live"
+            f"   playhead while the block is staged. */"
+            f"let _adStaging=null;  /* {{startTime}} or null */"
+            f"const adStartBtn=document.getElementById('ad-start');"
+            f"const adEndBtn  =document.getElementById('ad-end');"
+            f"function _adShowToast(msg){{"
+            f"  let t=document.getElementById('ad-toast');"
+            f"  if(!t){{"
+            f"    t=document.createElement('div');t.id='ad-toast';"
+            f"    Object.assign(t.style,{{position:'fixed',left:'50%',"
+            f"      bottom:'90px',transform:'translateX(-50%)',"
+            f"      background:'#16a085',color:'#fff',padding:'8px 14px',"
+            f"      borderRadius:'4px',fontSize:'.9em',zIndex:'2500',"
+            f"      pointerEvents:'none',transition:'opacity .3s'}});"
+            f"    document.body.appendChild(t);"
+            f"  }}"
+            f"  t.textContent=msg;t.style.opacity='1';"
+            f"  clearTimeout(t._h);"
+            f"  t._h=setTimeout(()=>{{t.style.opacity='0';}},2000);"
+            f"}}"
+            f"function _renderStagingBar(){{"
+            f"  const old=document.querySelector('.ad-staging');"
+            f"  if(old)old.remove();"
+            f"  if(!_adStaging)return;"
+            f"  const D=isFinite(v.duration)?v.duration:adsDurationFallback;"
+            f"  if(D<=0)return;"
+            f"  const s=_adStaging.startTime;"
+            f"  const e=Math.max(s,v.currentTime||s);"
+            f"  const el=document.createElement('div');"
+            f"  el.className='ad-staging';"
+            f"  el.style.left=((s/D)*100)+'%';"
+            f"  el.style.width=Math.max(0.3,((e-s)/D)*100)+'%';"
+            f"  scrub.appendChild(el);"
+            f"}}"
+            f"v.addEventListener('timeupdate',_renderStagingBar);"
+            f"/* Find the block that the user is implicitly addressing"
+            f"   for an in-place boundary edit. Priority: 1) playhead"
+            f"   inside a block, 2) playhead within ±60 s of a block"
+            f"   edge (extending mode). Returns the index or -1. */"
+            f"const ADJUST_TOLERANCE_S=60;"
+            f"function _adFindNearbyBlock(t){{"
+            f"  for(let i=0;i<ads.length;i++){{"
+            f"    if(t>=ads[i][0] && t<=ads[i][1]) return i;"
+            f"  }}"
+            f"  let best=-1, bestDist=ADJUST_TOLERANCE_S+1;"
+            f"  for(let i=0;i<ads.length;i++){{"
+            f"    const d=Math.min(Math.abs(t-ads[i][0]),Math.abs(t-ads[i][1]));"
+            f"    if(d<bestDist){{best=i;bestDist=d;}}"
+            f"  }}"
+            f"  return best;"
+            f"}}"
+            f"function adMarkStart(){{"
+            f"  const t=Math.max(0,v.currentTime||0);"
+            f"  /* In-place edit: find nearby block and adjust its"
+            f"     start to current playhead. Beats a 4-tap modal. */"
+            f"  const idx=_adFindNearbyBlock(t);"
+            f"  if(idx>=0){{"
+            f"    const newStart=Math.min(t,ads[idx][1]-1);"
+            f"    ads[idx]=[Math.max(0,newStart),ads[idx][1]];"
+            f"    ads.sort((a,b)=>a[0]-b[0]);"
+            f"    renderAds();saveAdsEdit();"
+            f"    _adShowToast('Start korrigiert @ '+fmt(newStart));"
+            f"    return;"
+            f"  }}"
+            f"  /* No block in range → stage a new one. */"
+            f"  _adStaging={{startTime:t}};"
+            f"  _adShowToast('Werbe-Start markiert @ '+fmt(t)+' — jetzt ⏹ Ende');"
+            f"  _renderStagingBar();"
+            f"}}"
+            f"/* Mark this recording as reviewed: server promotes any"
+            f"   currently-uncertain frame that isn't covered by a user"
+            f"   ad-block to a confirmed-show negative for training,"
+            f"   then the 🎯 badge disappears from the recordings list. */"
+            f"function markReviewed(){{"
+            f"  fetch('{HOST_URL}/api/recording/{uuid}/mark-reviewed',"
+            f"    {{method:'POST'}}).then(r=>r.json()).then(d=>{{"
+            f"      if(d && d.ok){{"
+            f"        _adShowToast('Geprüft — '+d.added+' frame(s) als Show bestätigt');"
+            f"        document.querySelectorAll('.uncertain-mark').forEach(e=>e.remove());"
+            f"        uncertainPts=[];"
+            f"      }} else {{"
+            f"        _adShowToast('Fehler beim Speichern');"
+            f"      }}"
+            f"  }}).catch(()=>_adShowToast('Netzwerk-Fehler'));"
+            f"}}"
+            f"function adMarkEnd(){{"
+            f"  const t=Math.max(0,v.currentTime||0);"
+            f"  const D=isFinite(v.duration)?v.duration:0;"
+            f"  /* Staging in progress takes priority: commits the"
+            f"     half-open block the user opened with START. */"
+            f"  if(_adStaging){{"
+            f"    const s=_adStaging.startTime;"
+            f"    const e=Math.max(s+1,t||s+1);"
+            f"    const eClamp=D>0?Math.min(D,e):e;"
+            f"    ads.push([s,eClamp]);"
+            f"    ads.sort((a,b)=>a[0]-b[0]);"
+            f"    _adStaging=null;"
+            f"    document.querySelectorAll('.ad-staging').forEach(x=>x.remove());"
+            f"    renderAds();saveAdsEdit();"
+            f"    _adShowToast('Block gespeichert: '+fmt(s)+' – '+fmt(eClamp));"
+            f"    return;"
+            f"  }}"
+            f"  /* Otherwise: in-place end-edit on nearby block. */"
+            f"  const idx=_adFindNearbyBlock(t);"
+            f"  if(idx<0){{_adShowToast('Kein Block in der Nähe');return;}}"
+            f"  const newEnd=Math.max(ads[idx][0]+1,t);"
+            f"  const eClamp=D>0?Math.min(D,newEnd):newEnd;"
+            f"  ads[idx]=[ads[idx][0],eClamp];"
+            f"  ads.sort((a,b)=>a[0]-b[0]);"
+            f"  renderAds();saveAdsEdit();"
+            f"  _adShowToast('Ende korrigiert @ '+fmt(eClamp));"
+            f"}}"
+            f"function openAdEditor(idx,isNew){{"
             f"  const blk=ads[idx];if(!blk)return;"
             f"  const D=isFinite(v.duration)?v.duration:0;"
             f"  const m=document.createElement('div');"
             f"  m.className='ad-edit-modal';"
+            f"  /* Touch-first design — no time inputs. The user scrubs"
+            f"     to the right position then taps a 'Übernehmen' button."
+            f"     Block boundaries are stored in modal-local state and"
+            f"     committed on Speichern. */"
             f"  m.innerHTML="
             f"    '<div class=\"ad-edit-card\">'"
             f"   +'<div class=\"ad-edit-head\">Werbeblock bearbeiten</div>'"
-            f"   +'<label>Start <input id=\"adEditS\" type=\"text\" "
-            f"           inputmode=\"numeric\" autocomplete=\"off\"></label>'"
-            f"   +'<label>Ende <input id=\"adEditE\" type=\"text\" "
-            f"           inputmode=\"numeric\" autocomplete=\"off\"></label>'"
-            f"   +'<div class=\"ad-edit-hint\">Format: mm:ss oder hh:mm:ss</div>'"
+            f"   +'<div class=\"ad-edit-row\">'"
+            f"   +'<span class=\"ad-edit-label\">Start</span>'"
+            f"   +'<span class=\"ad-edit-val\" id=\"adValS\"></span>'"
+            f"   +'<button class=\"ad-edit-grab\" id=\"adGrabS\">'"
+            f"   +    'aktuelle Stelle'"
+            f"   +'</button></div>'"
+            f"   +'<div class=\"ad-edit-row\">'"
+            f"   +'<span class=\"ad-edit-label\">Ende</span>'"
+            f"   +'<span class=\"ad-edit-val\" id=\"adValE\"></span>'"
+            f"   +'<button class=\"ad-edit-grab\" id=\"adGrabE\">'"
+            f"   +    'aktuelle Stelle'"
+            f"   +'</button></div>'"
+            f"   +'<div class=\"ad-edit-hint\">'"
+            f"   +    'Player-Position scrubben → Button drücken'"
+            f"   +'</div>'"
             f"   +'<div class=\"ad-edit-btns\">'"
             f"   +'<button class=\"ad-edit-del\">Löschen</button>'"
             f"   +'<span class=\"spacer\"></span>'"
@@ -7515,25 +8757,63 @@ def play_recording(uuid):
             f"   +'<button class=\"ad-edit-save\">Speichern</button>'"
             f"   +'</div></div>';"
             f"  document.body.appendChild(m);"
-            f"  const sIn=m.querySelector('#adEditS');"
-            f"  const eIn=m.querySelector('#adEditE');"
-            f"  sIn.value=fmt(blk[0]);eIn.value=fmt(blk[1]);"
-            f"  setTimeout(()=>sIn.focus(),50);"
-            f"  const close=()=>m.remove();"
+            f"  /* Modal-local state: start/end times, updated by 'grab'"
+            f"     buttons, displayed in the .ad-edit-val spans. */"
+            f"  let modalS=blk[0], modalE=blk[1];"
+            f"  const valS=m.querySelector('#adValS');"
+            f"  const valE=m.querySelector('#adValE');"
+            f"  const refreshVals=()=>{{"
+            f"    valS.textContent=fmt(modalS);valE.textContent=fmt(modalE);"
+            f"  }};"
+            f"  refreshVals();"
+            f"  m.querySelector('#adGrabS').addEventListener('click',()=>{{"
+            f"    modalS=Math.max(0,v.currentTime||0);refreshVals();"
+            f"  }});"
+            f"  m.querySelector('#adGrabE').addEventListener('click',()=>{{"
+            f"    modalE=Math.max(modalS+1,v.currentTime||(modalS+1));"
+            f"    if(D>0)modalE=Math.min(D,modalE);"
+            f"    refreshVals();"
+            f"  }});"
+            f"  /* In 'create' mode the placeholder was already pushed"
+            f"     into ads[]; on Cancel we have to roll it back so the"
+            f"     scrub bar doesn't keep an unconfirmed block. Save"
+            f"     paths null isNew so this branch is a no-op there. */"
+            f"  const close=()=>{{"
+            f"    if(isNew){{"
+            f"      const i=ads.findIndex(a=>a===blk);"
+            f"      if(i>=0){{ads.splice(i,1);renderAds();}}"
+            f"    }}"
+            f"    m.remove();"
+            f"  }};"
             f"  m.addEventListener('click',ev=>{{if(ev.target===m)close();}});"
             f"  m.querySelector('.ad-edit-cancel').addEventListener('click',close);"
             f"  m.querySelector('.ad-edit-del').addEventListener('click',()=>{{"
+            f"    /* In create-mode (placeholder block, never saved):"
+            f"       Delete means 'don't bother', same as Cancel. Do"
+            f"       NOT record a userDeleted entry — the block isn't"
+            f"       real yet, and any incidentally-overlapping auto"
+            f"       block should stay untouched. */"
+            f"    if(isNew){{close();return;}}"
+            f"    /* For a real existing block: if it covers an auto-"
+            f"       detected one, record the deletion explicitly so"
+            f"       the next re-scan doesn't resurrect it. User-only"
+            f"       blocks just disappear from the user list. */"
+            f"    const target=ads[idx];"
+            f"    const auto=autoAds.find(a=>blocksOverlap(a,target));"
+            f"    if(auto && !userDeleted.some(d=>blocksOverlap(d,auto))){{"
+            f"      userDeleted=[...userDeleted,auto].sort((a,b)=>a[0]-b[0]);"
+            f"    }}"
             f"    ads.splice(idx,1);renderAds();saveAdsEdit();close();"
             f"  }});"
             f"  m.querySelector('.ad-edit-save').addEventListener('click',()=>{{"
-            f"    const s=parseTimeToSec(sIn.value);"
-            f"    const e=parseTimeToSec(eIn.value);"
-            f"    if(s==null||e==null||e<=s){{"
-            f"      sIn.style.borderColor='#e74c3c';"
-            f"      eIn.style.borderColor='#e74c3c';return;"
+            f"    if(modalE<=modalS+0.5){{"
+            f"      valE.style.color='#e74c3c';return;"
             f"    }}"
-            f"    ads[idx]=[Math.max(0,s),D>0?Math.min(D,e):e];"
+            f"    ads[idx]=[Math.max(0,modalS),D>0?Math.min(D,modalE):modalE];"
             f"    ads.sort((a,b)=>a[0]-b[0]);"
+            f"    /* Confirmed save — clear isNew so close() doesn't"
+            f"       roll back the (now-real) block. */"
+            f"    isNew=false;"
             f"    renderAds();saveAdsEdit();close();"
             f"  }});"
             f"}}"
@@ -7555,10 +8835,60 @@ def play_recording(uuid):
             f"  const D=isFinite(v.duration)?v.duration:0;"
             f"  if(D>0)v.currentTime=p*D;"
             f"}}"
-            f"v.addEventListener('click',()=>{{"
+            f"/* Tap policy on the recording player:"
+            f"   - tap inside a CIRCULAR center zone (like the native"
+            f"     iOS player's central play button) → play/pause"
+            f"   - tap outside → show/hide chrome only, no pause"
+            f"   - registered in CAPTURE phase + stopImmediatePropagation"
+            f"     so it OVERRIDES the PLAYER_BASE_JS click handler"
+            f"     which toggles play/pause on every click (correct for"
+            f"     live channels but wrong for the recording player). */"
+            f"function _isCenterTap(clientX,clientY){{"
+            f"  const r=v.getBoundingClientRect();"
+            f"  const cx=r.left+r.width/2, cy=r.top+r.height/2;"
+            f"  const dx=clientX-cx, dy=clientY-cy;"
+            f"  const radius=Math.min(r.width,r.height)*0.18;"
+            f"  return dx*dx+dy*dy <= radius*radius;"
+            f"}}"
+            f"v.addEventListener('click',ev=>{{"
+            f"  ev.stopImmediatePropagation();"
+            f"  ev.preventDefault();"
+            f"  /* Skip if a touch just fired — mobile sends a synthetic"
+            f"     click after touchend; without this guard we'd toggle"
+            f"     twice on iOS taps. */"
+            f"  if(Date.now()-_lastTouchT<500)return;"
+            f"  if(_isCenterTap(ev.clientX,ev.clientY)) togglePlay();"
             f"  if(chromeBar.classList.contains('hidden'))show();"
             f"  else {{chromeBar.classList.add('hidden');"
             f"    topbar.classList.add('hidden');}}"
+            f"}},true);"
+            f"/* CSS touch-action: manipulation tells the browser the"
+            f"   player handles its own gestures — disables the iOS/"
+            f"   Android double-tap-to-zoom delay without breaking"
+            f"   single-tap. Belt-and-suspenders preventDefault on"
+            f"   dblclick stops mouse-driven double-clicks too. */"
+            f"v.style.touchAction='manipulation';"
+            f"v.addEventListener('dblclick',ev=>ev.preventDefault());"
+            f"/* Mobile single-tap goes through PLAYER_BASE_JS's"
+            f"   touchend → 280 ms-deferred togglePlay() pipeline."
+            f"   We can't intercept it the same way as a click; instead"
+            f"   we wait one tick (so PLAYER_BASE has set _singleTapT)"
+            f"   and CANCEL the pending toggle when the tap was outside"
+            f"   the middle 60 % of the video — same gate as the click"
+            f"   handler above. Chrome-visibility toggle still happens"
+            f"   either way so the user can find the controls. */"
+            f"v.addEventListener('touchend',ev=>{{"
+            f"  if(!ev.changedTouches[0])return;"
+            f"  const cx=ev.changedTouches[0].clientX;"
+            f"  const cy=ev.changedTouches[0].clientY;"
+            f"  setTimeout(()=>{{"
+            f"    if(!_singleTapT)return;"
+            f"    if(_isCenterTap(cx,cy))return;"
+            f"    clearTimeout(_singleTapT);_singleTapT=null;"
+            f"    if(chromeBar.classList.contains('hidden'))show();"
+            f"    else {{chromeBar.classList.add('hidden');"
+            f"      topbar.classList.add('hidden');}}"
+            f"  }},0);"
             f"}});"
             f"document.addEventListener('mousemove',show);"
             f"const hideLoader=()=>loader.classList.add('hidden');"
@@ -7642,13 +8972,43 @@ def play_recording(uuid):
             f"   }}).catch(()=>setTimeout(tick,2500));"
             f"}}"
             f"tick();"
+            f"let autoAds=[],userDeleted=[],adsDurationFallback=0,"
+            f"    uncertainPts=[];"
             f"function fetchAds(){{"
             f"  fetch('{HOST_URL}/recording/{uuid}/ads').then(r=>r.json())"
             f"   .then(d=>{{"
-            f"     ads=d.ads||[];renderAds();refresh();"
+            f"     ads=d.ads||[];autoAds=d.auto||[];userDeleted=d.deleted||[];"
+            f"     adsDurationFallback=d.duration_s||0;"
+            f"     uncertainPts=d.uncertain||[];"
+            f"     renderAds();renderUncertain();refresh();"
             f"     if(d.running)setTimeout(fetchAds,10000);"
             f"   }}).catch(()=>{{}});"
             f"}}"
+            f"/* Active-learning markers: small chevrons on the scrub"
+            f"   bar at frames where the trained NN is least sure"
+            f"   (~p=0.5). Click jumps the player there so the user"
+            f"   can verify ad-vs-show and refine the cutlist. */"
+            f"function renderUncertain(){{"
+            f"  document.querySelectorAll('.uncertain-mark').forEach("
+            f"    e=>e.remove());"
+            f"  const vd=isFinite(v.duration)?v.duration:0;"
+            f"  const D=vd>0?vd:adsDurationFallback;"
+            f"  if(D<=0||!uncertainPts.length)return;"
+            f"  uncertainPts.forEach(pt=>{{"
+            f"    const el=document.createElement('div');"
+            f"    el.className='uncertain-mark';"
+            f"    el.style.left=((pt.t/D)*100)+'%';"
+            f"    el.title='NN unsicher (p='+pt.p.toFixed(2)+') — Werbung?';"
+            f"    el.addEventListener('click',ev=>{{"
+            f"      ev.stopPropagation();"
+            f"      v.currentTime=Math.max(0,pt.t-2);"
+            f"      v.play().catch(()=>{{}});"
+            f"    }});"
+            f"    scrub.appendChild(el);"
+            f"  }});"
+            f"}}"
+            f"v.addEventListener('loadedmetadata',()=>renderUncertain());"
+            f"v.addEventListener('durationchange',renderUncertain);"
             f"fetchAds();"
             f"let thumbMeta={{count:0,interval:30,done:false}};"
             f"const thumbPrev=document.createElement('div');"
@@ -8152,10 +9512,20 @@ def _compute_feedback_stats():
         if not user_p.is_file():
             continue
         try:
-            user_ads = json.loads(user_p.read_text())
+            user_raw = json.loads(user_p.read_text())
             auto_ads = json.loads(auto_p.read_text()) if auto_p.is_file() else []
         except Exception:
             continue
+        # Backward-compat: ads_user.json may be either the legacy
+        # list-of-pairs or the {"ads":[…], "deleted":[…]} dict the
+        # smart-merge UI writes. Stats only care about the user's
+        # positive list (added/refined blocks), not deletions.
+        if isinstance(user_raw, list):
+            user_ads = user_raw
+        elif isinstance(user_raw, dict):
+            user_ads = user_raw.get("ads") or []
+        else:
+            user_ads = []
         slug = _rec_channel_slug(uuid) or "?"
         s = stats.setdefault(slug, {
             "n": 0, "dstart_sum": 0.0, "dend_sum": 0.0, "matched": 0,
@@ -8221,6 +9591,306 @@ def _compute_feedback_stats():
 _feedback_cache = {"data": None, "computed_at": 0}
 _feedback_lock = threading.Lock()
 DETECTION_LEARNING_FILE = HLS_DIR / ".detection_learning.json"
+BLOCK_LENGTH_PRIOR_FILE = HLS_DIR / ".block_length_prior.json"
+BLOCK_LENGTH_PRIOR_BY_SHOW_FILE = HLS_DIR / ".block_length_prior_by_show.json"
+
+
+def _show_title_for_rec(rec_dir):
+    """Derive a stable show key from the recording's .txt basename
+    (e.g. 'Galileo $2026-04-25-1905' → 'Galileo'). Used for per-show
+    prior aggregation — finer-grained than per-channel for shows
+    with distinct ad patterns (Galileo magazin vs. Simpsons clean
+    cuts, both ProSieben)."""
+    for p in rec_dir.glob("*.txt"):
+        if any(p.name.endswith(s) for s in
+               (".logo.txt", ".cskp.txt", ".tvd.txt", ".trained.logo.txt")):
+            continue
+        title = p.stem
+        if " $" in title:
+            title = title.split(" $", 1)[0]
+        return title.strip()
+    return ""
+
+
+def _compute_block_length_priors_by_show():
+    """Same shape as _compute_block_length_priors but grouped by
+    show title instead of channel slug. Need ≥5 user-confirmed blocks
+    AND σ≥30s. Channels host multiple shows with different ad
+    patterns (Galileo vs Die Simpsons on ProSieben), so per-show is
+    tighter where data permits, falls back to per-channel otherwise."""
+    import statistics
+    by_show = {}
+    if not HLS_DIR.exists():
+        return {}
+    for d in HLS_DIR.glob("_rec_*"):
+        user = d / "ads_user.json"
+        if not user.is_file():
+            continue
+        try:
+            raw = json.loads(user.read_text())
+        except Exception:
+            continue
+        blocks = raw if isinstance(raw, list) else raw.get("ads", []) or []
+        show = _show_title_for_rec(d)
+        if not show:
+            continue
+        for s, e in blocks:
+            try:
+                dur = float(e) - float(s)
+            except Exception:
+                continue
+            if dur > 0:
+                by_show.setdefault(show, []).append(dur)
+    out = {}
+    for show, durs in by_show.items():
+        n = len(durs)
+        if n < 5:
+            continue
+        mean = statistics.mean(durs)
+        sd = statistics.stdev(durs) if n > 1 else 0.0
+        if sd < 30.0:
+            continue
+        out[show] = {"min_block_s": 60.0,
+                     "max_block_s": round(mean + 3.0 * sd, 1),
+                     "mean_s": round(mean, 1),
+                     "std_s": round(sd, 1),
+                     "sample_n": n,
+                     "computed_at": int(time.time())}
+    return out
+
+
+def _rec_duration_s(rec_dir):
+    """Sum #EXTINF entries from index.m3u8 for total HLS duration.
+    Returns 0.0 if the playlist is missing or unparseable. Used by
+    fingerprint matching to normalise block positions across episodes
+    with different lengths (e.g. an episode running 3 min over)."""
+    pl = rec_dir / "index.m3u8"
+    if not pl.is_file():
+        return 0.0
+    dur = 0.0
+    try:
+        for ln in pl.read_text().splitlines():
+            if ln.startswith("#EXTINF:"):
+                try: dur += float(ln.split(":", 1)[1].rstrip(","))
+                except Exception: pass
+    except Exception:
+        return 0.0
+    return dur
+
+
+def _aggregate_episodes_by_show():
+    """Walk every _rec_*/ads_user.json (excluding fingerprint-auto-
+    confirmed ones to avoid circular reinforcement), return a dict
+    {show: [(rec_dir_name, merged_blocks), ...]}. Each episode's
+    blocks are the smart-merge of user-edits + non-deleted auto.
+    Empty (0-block) episodes are excluded — they're valid 'no ads'
+    reviews but contribute no structural signal.
+
+    Factored out of _compute_show_fingerprints so leave-one-out
+    validation can rebuild fingerprints excluding individual episodes."""
+    by_show = {}
+    if not HLS_DIR.exists():
+        return {}
+    for d in HLS_DIR.glob("_rec_*"):
+        user = d / "ads_user.json"
+        if not user.is_file():
+            continue
+        try:
+            raw = json.loads(user.read_text())
+        except Exception:
+            continue
+        if isinstance(raw, dict) and raw.get("auto_confirmed_via_fingerprint"):
+            continue
+        blocks = raw if isinstance(raw, list) else (raw.get("ads", []) or [])
+        deleted = [] if isinstance(raw, list) else (raw.get("deleted") or [])
+        try:
+            auto_p = d / "ads.json"
+            auto_blocks = (json.loads(auto_p.read_text())
+                           if auto_p.is_file() else [])
+        except Exception:
+            auto_blocks = []
+        def _ov(a, b): return a[0] < b[1] and b[0] < a[1]
+        kept_auto = [a for a in auto_blocks
+                     if not any(_ov(a, x) for x in blocks)
+                     and not any(_ov(a, dd) for dd in deleted)]
+        merged = sorted(blocks + kept_auto, key=lambda b: b[0])
+        if not merged:
+            continue
+        show = _show_title_for_rec(d)
+        if not show:
+            continue
+        by_show.setdefault(show, []).append((d.name, merged))
+    return by_show
+
+
+def _build_fingerprint(episode_blocks_list, min_recs=2,
+                        count_consensus=0.66, pos_tolerance_s=90.0):
+    """Build a single fingerprint dict from a list of [(start,end),...]
+    block lists. Returns None if not enough recs or no count consensus."""
+    import statistics
+    from collections import Counter
+    if len(episode_blocks_list) < min_recs:
+        return None
+    counts = Counter(len(eb) for eb in episode_blocks_list)
+    consensus_count, consensus_n = counts.most_common(1)[0]
+    if consensus_count == 0:
+        return None
+    if consensus_n / len(episode_blocks_list) < count_consensus:
+        return None
+    consensus_eps = [eb for eb in episode_blocks_list
+                     if len(eb) == consensus_count]
+    block_stats = []
+    for i in range(consensus_count):
+        starts = sorted(float(eb[i][0]) for eb in consensus_eps)
+        ends = sorted(float(eb[i][1]) for eb in consensus_eps)
+        n = len(starts)
+        def pct(arr, p):
+            idx = max(0, min(n - 1, int(p / 100.0 * (n - 1))))
+            return arr[idx]
+        block_stats.append({
+            "start_s": round(statistics.median(starts), 1),
+            "end_s": round(statistics.median(ends), 1),
+            "start_p10": round(pct(starts, 10), 1),
+            "start_p90": round(pct(starts, 90), 1),
+            "end_p10": round(pct(ends, 10), 1),
+            "end_p90": round(pct(ends, 90), 1),
+        })
+    return {
+        "n_recs": len(consensus_eps),
+        "block_count": consensus_count,
+        "blocks": block_stats,
+        "tolerance_s": pos_tolerance_s,
+        "computed_at": int(time.time()),
+    }
+
+
+def _compute_show_fingerprints(min_recs=2, count_consensus=0.66,
+                                pos_tolerance_s=90.0):
+    """Build a per-show structural fingerprint of ad-block layout from
+    user-confirmed episodes. Recurring shows (Unter uns, Galileo, GZSZ)
+    have very stable structure week-to-week — same number of blocks,
+    similar positions relative to show start. From n≥min_recs episodes
+    where ≥count_consensus fraction agree on block count, we extract
+    median block start/end times.
+
+    Output: {show_title: {n_recs, block_count, blocks: [{start_s,
+    end_s, start_p10, start_p90, end_p10, end_p90}, ...]}}.
+
+    Used by the auto-confirm pass (api_learning_fingerprint_scan):
+    a new auto-detected ads.json that matches its show's fingerprint
+    within tolerance can be promoted to user-quality without manual
+    review — same effect as the user clicking ✓ Geprüft."""
+    by_show = _aggregate_episodes_by_show()  # {show: [(rec_dir, blocks)]}
+    out = {}
+    for show, eps in by_show.items():
+        fp = _build_fingerprint([b for _, b in eps],
+                                  min_recs=min_recs,
+                                  count_consensus=count_consensus,
+                                  pos_tolerance_s=pos_tolerance_s)
+        if fp is None:
+            continue
+        out[show] = {
+            "n_recs": fp["n_recs"],
+            "block_count": fp["block_count"],
+            "blocks": fp["blocks"],
+            "tolerance_s": fp["tolerance_s"],
+            "computed_at": fp["computed_at"],
+        }
+    return out
+
+
+def _check_fingerprint_match(fingerprint, auto_blocks, tolerance_s=None):
+    """Test whether an auto-detected ads list matches a show's
+    fingerprint within tolerance. Returns (matched: bool, reason: str).
+
+    Match criteria:
+      1. Same block count as the fingerprint consensus
+      2. Each block's start AND end within ±tolerance_s of the
+         fingerprint's median for that block index
+    Both checks must pass — partial matches are NOT auto-confirmed
+    (better to flag for review than silently mislabel)."""
+    if not fingerprint or not auto_blocks:
+        return False, "no fingerprint or no auto blocks"
+    if tolerance_s is None:
+        tolerance_s = fingerprint.get("tolerance_s", 60.0)
+    if len(auto_blocks) != fingerprint["block_count"]:
+        return False, (f"block count {len(auto_blocks)} != "
+                       f"fingerprint {fingerprint['block_count']}")
+    sorted_auto = sorted(auto_blocks, key=lambda b: float(b[0]))
+    for i, (s, e) in enumerate(sorted_auto):
+        fb = fingerprint["blocks"][i]
+        ds = abs(float(s) - fb["start_s"])
+        de = abs(float(e) - fb["end_s"])
+        if ds > tolerance_s or de > tolerance_s:
+            return False, (f"block {i+1}: Δstart={ds:.0f}s "
+                           f"Δend={de:.0f}s > tol {tolerance_s:.0f}s")
+    return True, "ok"
+
+
+def _compute_block_length_priors():
+    """Walk every _rec_<uuid>/ads_user.json, group block durations by
+    channel slug, fit a per-channel min/max range that tv-detect
+    consumes via --min-block-sec / --max-block-sec. Channels with
+    too few samples or a degenerate (zero) std fall back to the
+    library defaults (60-900 s) — the prior only kicks in when we
+    have enough data to trust it.
+
+    Range formula: [60, mean + 3σ]. We deliberately DON'T tighten
+    the lower bound from the prior — channels mix long-format shows
+    (RTL Wetzel: 6-10 min ads) with short-format (RTL Unter uns:
+    3-5 min ads) under the same slug. A per-channel mean-2σ floor
+    would reject the short-format block as spurious. The library's
+    MinBlockS=60 already filters single-frame noise, so the prior
+    only needs to clip suprious-LONG blocks.
+
+    Quality gate: n_samples ≥ 5 AND σ ≥ 30 s. Below either, the
+    sample is too thin to fit confidently."""
+    import statistics
+    by_slug = {}
+    if not HLS_DIR.exists():
+        return {}
+    for d in HLS_DIR.glob("_rec_*"):
+        uuid = d.name[5:]
+        user = d / "ads_user.json"
+        if not user.is_file():
+            continue
+        try:
+            raw = json.loads(user.read_text())
+        except Exception:
+            continue
+        blocks = raw if isinstance(raw, list) else raw.get("ads", []) or []
+        slug = _rec_channel_slug(uuid) or ""
+        if not slug:
+            continue
+        for s, e in blocks:
+            try:
+                dur = float(e) - float(s)
+            except Exception:
+                continue
+            if dur > 0:
+                by_slug.setdefault(slug, []).append(dur)
+    out = {}
+    for slug, durs in by_slug.items():
+        n = len(durs)
+        if n < 5:
+            continue
+        mean = statistics.mean(durs)
+        sd = statistics.stdev(durs) if n > 1 else 0.0
+        if sd < 30.0:
+            # Too tight — refuse to fit. Coincidence rather than signal.
+            continue
+        # MIN_BLOCK_S stays at library default 60 — see docstring.
+        lo = 60.0
+        hi = mean + 3.0 * sd
+        out[slug] = {
+            "min_block_s": round(lo, 1),
+            "max_block_s": round(hi, 1),
+            "mean_s": round(mean, 1),
+            "std_s": round(sd, 1),
+            "sample_n": n,
+            "computed_at": int(time.time()),
+        }
+    return out
 LEARNING_MIN_SAMPLES = 5  # auto-apply only with ≥N edited recordings
 
 
@@ -8265,6 +9935,21 @@ def _get_feedback_stats(max_age_s=300):
                 _feedback_cache["data"] = stats
                 _feedback_cache["computed_at"] = time.time()
                 applied = _persist_detection_learning(stats)
+                # Block-length priors live in their own file so the
+                # consumer side (tv-detect-rec.sh, tv-live-detect.py)
+                # can read just the channels-with-enough-samples and
+                # not misinterpret detection_learning entries.
+                try:
+                    by_show = _compute_block_length_priors_by_show()
+                    tmp = BLOCK_LENGTH_PRIOR_BY_SHOW_FILE.with_suffix(".tmp")
+                    tmp.write_text(json.dumps(by_show, indent=2))
+                    tmp.replace(BLOCK_LENGTH_PRIOR_BY_SHOW_FILE)
+                    priors = _compute_block_length_priors()
+                    tmp = BLOCK_LENGTH_PRIOR_FILE.with_suffix(".tmp")
+                    tmp.write_text(json.dumps(priors, indent=2))
+                    tmp.replace(BLOCK_LENGTH_PRIOR_FILE)
+                except Exception as e:
+                    print(f"[block-prior write] {e}", flush=True)
                 # Tag each stats entry with whether it was applied
                 for slug, s in stats.items():
                     s["applied"] = slug in applied
@@ -8539,16 +10224,11 @@ def _file_watcher_loop():
 
 if __name__ == "__main__":
     HLS_DIR.mkdir(parents=True, exist_ok=True)
-    try:
-        COMSKIP_INI.write_text(COMSKIP_INI_TEXT)
-    except Exception as e:
-        print(f"comskip.ini write: {e}", flush=True)
-    # Pre-generate per-channel inis so the Mac scanner sees them on
-    # the SMB share even when LIVE_ADS_OFFLOAD disables the Pi-side
-    # comskip path that would otherwise lazily create them via
-    # comskip_ini_for() at first call.
-    for _slug in COMSKIP_INI_PER_CHANNEL:
-        comskip_ini_for(_slug)
+    # tv-detect (which fully replaced comskip 2026-04-25) reads its
+    # tuning from CLI flags, not from .ini files, so the legacy
+    # COMSKIP_INI / COMSKIP_INI_PER_CHANNEL maps are no longer
+    # written to disk. The constants stay defined for backward
+    # compat with downstream code that still imports them.
     load_codec_cache()
     load_stats()
     load_epg_archive()
@@ -8564,7 +10244,6 @@ if __name__ == "__main__":
     threading.Thread(target=epg_snapshot_loop, daemon=True).start()
     threading.Thread(target=_rec_prewarm_loop, daemon=True).start()
     threading.Thread(target=always_warm_loop, daemon=True).start()
-    threading.Thread(target=_live_adskip_loop, daemon=True).start()
     threading.Thread(target=_mediathek_rip_loop, daemon=True).start()
     threading.Thread(target=_mediathek_autorec_loop, daemon=True).start()
     threading.Thread(target=ffmpeg_watchdog_loop, daemon=True).start()
