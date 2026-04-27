@@ -8918,6 +8918,39 @@ def api_recording_mark_reviewed(uuid):
         mimetype="application/json"))
 
 
+@app.route("/api/recording/<uuid>/redetect", methods=["POST"])
+def api_recording_redetect(uuid):
+    """Force a fresh tv-detect pass on this recording.
+
+    Truncates the cutlist .txt (filename preserved — train-head loader
+    needs it to find the .ts source) and writes the .detect-requested
+    marker. Daemon picks it up on its next poll cycle (≤5s).
+
+    Filename-preserving truncate mirrors the head-invalidation path
+    in _rec_prewarm so we don't introduce a second invalidation
+    convention. Idempotent — repeated calls just refresh the marker."""
+    out_dir = HLS_DIR / f"_rec_{uuid}"
+    if not out_dir.exists():
+        return Response(json.dumps({"ok": False, "error": "unknown recording"}),
+                        status=404, mimetype="application/json")
+    n_truncated = 0
+    for t in out_dir.glob("*.txt"):
+        if any(t.name.endswith(s) for s in
+               (".logo.txt", ".cskp.txt", ".tvd.txt",
+                ".trained.logo.txt")):
+            continue
+        try: t.write_text(""); n_truncated += 1
+        except Exception: pass
+    marker = out_dir / ".detect-requested"
+    try: marker.write_text(json.dumps({"ts": time.time()}))
+    except Exception as e:
+        return Response(json.dumps({"ok": False, "error": str(e)}),
+                        status=500, mimetype="application/json")
+    return _cors(Response(json.dumps({
+        "ok": True, "truncated": n_truncated}),
+        mimetype="application/json"))
+
+
 @app.route("/recording/<uuid>/thumbs.json")
 def recording_thumbs_manifest(uuid):
     """How many thumbs are ready and what interval they cover."""
