@@ -8535,6 +8535,82 @@ def api_internal_detect_logo(slug):
 _TVD_BUMPER_DIR = HLS_DIR / ".tvd-bumpers"
 
 
+@app.route("/api/recording/<uuid>/bumper-capture", methods=["POST"])
+def api_recording_bumper_capture(uuid):
+    """User marks a bumper window in the player. We extract one frame
+    per second across [start_s, end_s] from the source .ts and write
+    them as PNGs into /mnt/tv/hls/.tvd-bumpers/<channel_slug>/. Each
+    PNG is an independent template for the matcher; max IoU wins.
+
+    Body: {"start_s": float, "end_s": float}.
+    Returns: {ok, slug, count, files}."""
+    out_dir = HLS_DIR / f"_rec_{uuid}"
+    if not out_dir.exists():
+        return Response(json.dumps({"ok": False, "error": "unknown recording"}),
+                        status=404, mimetype="application/json")
+    body = request.get_json(silent=True) or {}
+    try:
+        s = float(body.get("start_s"))
+        e = float(body.get("end_s"))
+    except (TypeError, ValueError):
+        return Response(json.dumps({"ok": False, "error": "start_s/end_s required"}),
+                        status=400, mimetype="application/json")
+    if e <= s or e - s > 30:
+        return Response(json.dumps({"ok": False,
+            "error": "window must be 0 < (end-start) <= 30s"}),
+                        status=400, mimetype="application/json")
+    slug = _rec_channel_slug(uuid) or ""
+    if not slug:
+        return Response(json.dumps({"ok": False, "error": "no channel slug"}),
+                        status=400, mimetype="application/json")
+    src = _rec_source_path(uuid)
+    if not src or not Path(src).exists():
+        return Response(json.dumps({"ok": False, "error": "source .ts missing"}),
+                        status=404, mimetype="application/json")
+    bdir = _TVD_BUMPER_DIR / slug
+    bdir.mkdir(parents=True, exist_ok=True)
+    base = f"bumper-{uuid[:8]}-{int(s)}"
+    pattern = str(bdir / f"{base}-%02d.png")
+    cmd = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+           "-ss", f"{s:.2f}", "-t", f"{e-s:.2f}",
+           "-i", src,
+           "-vf", "fps=1,scale=720:576",
+           pattern]
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+    except (subprocess.TimeoutExpired, OSError) as exc:
+        return Response(json.dumps({"ok": False,
+            "error": f"ffmpeg failed: {exc}"}),
+                        status=500, mimetype="application/json")
+    if r.returncode != 0:
+        return Response(json.dumps({"ok": False,
+            "error": f"ffmpeg rc={r.returncode}: {r.stderr[-200:]}"}),
+                        status=500, mimetype="application/json")
+    # Auto-skip oversized frames: bumpers (mostly black + few coloured
+    # boxes) PNG-compress to ~25-40 KB; full content frames are
+    # 150-500 KB. Anything > 80 KB is almost certainly a show frame
+    # captured because the user pressed END too late or START too
+    # early. Drop them so they can't pollute the matcher.
+    SHOW_LIKE_BYTES = 80 * 1024
+    files = []
+    skipped = []
+    for p in sorted(bdir.glob(f"{base}-*.png")):
+        if p.stat().st_size > SHOW_LIKE_BYTES:
+            try: p.unlink(); skipped.append(p.name)
+            except Exception: pass
+        else:
+            files.append(p.name)
+    note = ""
+    if skipped:
+        note = f", skipped {len(skipped)} oversized (likely show)"
+    print(f"[bumper-capture {uuid[:8]}] {slug}: {len(files)} frames "
+          f"in [{s:.1f}, {e:.1f}]s{note}", flush=True)
+    return _cors(Response(json.dumps({
+        "ok": True, "slug": slug, "count": len(files), "files": files,
+        "skipped_oversized": skipped}),
+        mimetype="application/json"))
+
+
 @app.route("/api/internal/detect-bumpers/<slug>")
 def api_internal_detect_bumpers(slug):
     """Lists per-channel bumper template PNGs for the Mac daemon to
@@ -9349,12 +9425,24 @@ def play_recording(uuid):
             f"<span class='spacer'></span>"
             f"<button id='skipad' class='pill rec' onclick='skipAd()'"
             f">Werbung ⏭</button>"
-            f"<button id='ad-start' class='pill' onclick='adMarkStart()'"
-            f" title='Aktuelle Stelle als Werbe-Start markieren'>"
+            f"<button id='mark-mode' class='pill' onclick='toggleMarkMode()'"
+            f" title='Markier-Modus umschalten: Werbung 🎯 ↔ Bumper 🎬 "
+            f"(Bumper = sender-spezifische Animation am Werbeblock-Ende, "
+            f"wird als Frame-Template für die automatische Detection gespeichert)'>"
+            f"🎯 Werbung</button>"
+            f"<button id='step-back' class='pill bumper-only' "
+            f"style='display:none' onclick='stepFrame(-1)' "
+            f"title='1 Sekunde zurück (Bumper-Feinjustage)'>"
+            f"⏴ −1s</button>"
+            f"<button id='step-fwd' class='pill bumper-only' "
+            f"style='display:none' onclick='stepFrame(1)' "
+            f"title='1 Sekunde vor (Bumper-Feinjustage)'>"
+            f"+1s ⏵</button>"
+            f"<button id='ad-start' class='pill' onclick='markStart()'"
+            f" title='Aktuelle Stelle als Start markieren'>"
             f"⏵ Start</button>"
-            f"<button id='ad-end' class='pill' onclick='adMarkEnd()'"
-            f" title='Aktuelle Stelle als Werbe-Ende übernehmen "
-            f"(speichert gestagten Block oder korrigiert nächstgelegenen)'>"
+            f"<button id='ad-end' class='pill' onclick='markEnd()'"
+            f" title='Aktuelle Stelle als Ende übernehmen'>"
             f"⏹ Ende</button>"
             f"<button id='ad-reviewed' class='pill' onclick='markReviewed()'"
             f" title='Aufnahme als geprüft markieren — "
@@ -9590,6 +9678,80 @@ def play_recording(uuid):
             f"  ads.sort((a,b)=>a[0]-b[0]);"
             f"  renderAds();saveAdsEdit();"
             f"  _adShowToast('Ende korrigiert @ '+fmt(eClamp));"
+            f"}}"
+            f"/* Mark-mode wrapper: same buttons drive ad-block marking"
+            f"   OR bumper-template capture, depending on the mode toggle."
+            f"   Default 'ad' preserves old behaviour; 'bumper' routes to"
+            f"   POST /api/recording/<uuid>/bumper-capture which extracts"
+            f"   one frame per second across [start,end] into the channel's"
+            f"   .tvd-bumpers/<slug>/ dir (auto-named). Mode persists across"
+            f"   page loads via localStorage. */"
+            f"const MARK_MODE_KEY='player-mark-mode';"
+            f"let _markMode='ad';"
+            f"try{{_markMode=localStorage.getItem(MARK_MODE_KEY)||'ad';}}catch(e){{}}"
+            f"let _bumperStaging=null;"
+            f"function _renderMarkBtn(){{"
+            f"  const b=document.getElementById('mark-mode');if(!b)return;"
+            f"  if(_markMode==='bumper'){{b.textContent='🎬 Bumper';b.classList.add('rec');}}"
+            f"  else{{b.textContent='🎯 Werbung';b.classList.remove('rec');}}"
+            f"  /* Show step-buttons only in bumper mode — they're noisy"
+            f"     during normal ad-block marking and useless in playback. */"
+            f"  document.querySelectorAll('.bumper-only').forEach(el=>{{"
+            f"    el.style.display=_markMode==='bumper'?'':'none';"
+            f"  }});"
+            f"}}"
+            f"/* Pause-on-click + delta-jump. Pausing first ensures the"
+            f"   visible frame matches the bumper-mark we will capture; the"
+            f"   currentTime setter is robust against tiny floating-point"
+            f"   drift across calls. */"
+            f"function stepFrame(deltaS){{"
+            f"  if(!v.paused)v.pause();"
+            f"  const D=isFinite(v.duration)?v.duration:0;"
+            f"  const t=Math.max(0,Math.min(D||1e9,(v.currentTime||0)+deltaS));"
+            f"  v.currentTime=t;"
+            f"}}"
+            f"_renderMarkBtn();"
+            f"function toggleMarkMode(){{"
+            f"  _markMode=_markMode==='ad'?'bumper':'ad';"
+            f"  try{{localStorage.setItem(MARK_MODE_KEY,_markMode);}}catch(e){{}}"
+            f"  _renderMarkBtn();"
+            f"  _adShowToast(_markMode==='bumper'?"
+            f"    'Bumper-Modus: Start/Ende markieren das Bumper-Fenster':"
+            f"    'Werbe-Modus: Start/Ende markieren einen Werbeblock');"
+            f"}}"
+            f"function markStart(){{"
+            f"  if(_markMode==='bumper'){{bumperMarkStart();}}else{{adMarkStart();}}"
+            f"}}"
+            f"function markEnd(){{"
+            f"  if(_markMode==='bumper'){{bumperMarkEnd();}}else{{adMarkEnd();}}"
+            f"}}"
+            f"function bumperMarkStart(){{"
+            f"  const t=Math.max(0,v.currentTime||0);"
+            f"  _bumperStaging={{startTime:t}};"
+            f"  _adShowToast('Bumper-Start @ '+fmt(t)+' — jetzt ⏹ Ende beim letzten Frame');"
+            f"}}"
+            f"function bumperMarkEnd(){{"
+            f"  if(!_bumperStaging){{_adShowToast('Erst Bumper-Start klicken');return;}}"
+            f"  const s=_bumperStaging.startTime;"
+            f"  const e=Math.max(s+0.5,v.currentTime||s+0.5);"
+            f"  if(e-s>30){{_adShowToast('Bumper-Fenster zu lang (max 30 s)');return;}}"
+            f"  _bumperStaging=null;"
+            f"  _adShowToast('Speichere Bumper-Frames…');"
+            f"  fetch('{HOST_URL}/api/recording/{uuid}/bumper-capture',"
+            f"    {{method:'POST',headers:{{'Content-Type':'application/json'}},"
+            f"     body:JSON.stringify({{start_s:s,end_s:e}})}})"
+            f"   .then(r=>r.json()).then(d=>{{"
+            f"      if(d&&d.ok){{"
+            f"        let msg=d.count+' Frame(s) als Bumper für '+d.slug+' gespeichert';"
+            f"        if(d.skipped_oversized&&d.skipped_oversized.length){{"
+            f"          msg+=' ('+d.skipped_oversized.length+' Show-Frame'+"
+            f"               (d.skipped_oversized.length===1?'':'s')+' verworfen)';"
+            f"        }}"
+            f"        _adShowToast(msg);"
+            f"      }}else{{"
+            f"        _adShowToast('Fehler: '+(d&&d.error||'unbekannt'));"
+            f"      }}"
+            f"   }}).catch(e=>_adShowToast('Netzwerk-Fehler'));"
             f"}}"
             f"function openAdEditor(idx,isNew){{"
             f"  const blk=ads[idx];if(!blk)return;"
