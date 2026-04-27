@@ -34,6 +34,7 @@ processing. Pi CPU during full-recording processing dropped from
 | Design decisions, file/state layout, HTTP endpoints, Player UI, public-broadcaster wiring | [docs/architecture.md](docs/architecture.md) |
 | Deploying code (SIGHUP, NOT compose restart), iOS Safari quirks, SSD swap / EXT4 recovery / USB cable + power-cap diagnostics | [docs/operations.md](docs/operations.md) |
 | Mac-offload daemon (HTTP-based job pipeline, /api/internal/* endpoints, why HTTP not SMB, TCC trap) | [docs/mac-handlers.md](docs/mac-handlers.md) |
+| Mac-daemon scripts themselves (`tv-thumbs-daemon.py`, `tv-train-head.sh`, `mount-pi-tv.sh`) — symlinked from `~/bin/` so launchd paths stay valid | [mac-daemon/](mac-daemon/) |
 | Things deliberately not done + open backlog | [docs/history.md](docs/history.md) |
 
 ## Stack at a glance
