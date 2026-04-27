@@ -8532,6 +8532,40 @@ def api_internal_detect_logo(slug):
     return send_file(p, mimetype="text/plain")
 
 
+_TVD_BUMPER_DIR = HLS_DIR / ".tvd-bumpers"
+
+
+@app.route("/api/internal/detect-bumpers/<slug>")
+def api_internal_detect_bumpers(slug):
+    """Lists per-channel bumper template PNGs for the Mac daemon to
+    download before invoking tv-detect. Templates live at
+    /mnt/tv/hls/.tvd-bumpers/<slug>/*.png — one or more per channel,
+    each a reference frame of a station-id card animation that recurs
+    at ad-block ends. Multiple PNGs cover color variants (RTL's "Mein
+    RTL" cycles through several palettes per appearance).
+    Returns {"templates": [{"name": "01.png", "url": "..."}, ...]}.
+    Empty list = no templates configured for this channel."""
+    d = _TVD_BUMPER_DIR / slug
+    out = []
+    if d.is_dir():
+        for p in sorted(d.glob("*.png")):
+            out.append({
+                "name": p.name,
+                "url": f"/api/internal/detect-bumper/{slug}/{p.name}"})
+    return _cors(Response(json.dumps({"templates": out}),
+                            mimetype="application/json"))
+
+
+@app.route("/api/internal/detect-bumper/<slug>/<fname>")
+def api_internal_detect_bumper(slug, fname):
+    if not re.fullmatch(r"[\w.-]+\.png", fname):
+        abort(404)
+    p = _TVD_BUMPER_DIR / slug / fname
+    if not p.is_file():
+        abort(404)
+    return send_file(p, mimetype="image/png")
+
+
 @app.route("/api/internal/detect-models/<fname>")
 def api_internal_detect_models(fname):
     """Serves head.bin + backbone.onnx so the Mac daemon doesn't need
