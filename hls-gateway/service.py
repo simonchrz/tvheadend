@@ -2661,6 +2661,97 @@ def learning_page():
                    f"<td>{prior_str}</td><td>{n}</td></tr>")
     out.append("</table>")
 
+    # Bumper-template coverage per channel — flags slugs where a
+    # marked station-id card would help boundary-snap precision.
+    # Private-TV channels (RTL/Pro7/SAT.1/sixx/kabel-eins/vox) are the
+    # ones that PLAY bumpers; public broadcasters don't have ad blocks
+    # at all so we don't list them. Per-show suggestions show up in the
+    # active-learning section based on test IoU.
+    PRIVATE_SLUGS = ["rtl", "rtlzwei", "prosieben", "prosiebenmaxx",
+                     "sat-1", "sixx", "kabel-eins", "kabel-eins-doku",
+                     "vox", "vox-up", "tlc", "dmax"]
+    out.append("<h2>Bumper-Templates pro Sender</h2>")
+    out.append("<p class='muted'>Sender-Bumper (z.B. RTL's „Mein RTL"
+               "\" Karte am Werbeblock-Ende) sind das stärkste "
+               "deterministische Ad-Ende-Signal. Pro Sender "
+               "1-5 Templates reichen meist — mehrere Farb-Varianten "
+               "fangen alle Animationen ab. Markierung über den "
+               "Player: 🎯 Werbung → 🎬 Bumper, dann ⏵ Start / ⏹ Ende.</p>")
+    bdir = HLS_DIR / ".tvd-bumpers"
+    # Only list slugs we actually have recordings on — no point urging
+    # the user to mark a kabel-eins-doku bumper if they've never recorded
+    # one. One DVR-grid pull covers all uuids.
+    have_slugs = set()
+    try:
+        data = json.loads(urllib.request.urlopen(
+            f"{TVH_BASE}/api/dvr/entry/grid?limit=500", timeout=6).read())
+        for e in data.get("entries", []):
+            s = slugify(e.get("channelname") or "")
+            if s:
+                have_slugs.add(s)
+    except Exception:
+        # If tvh is unreachable, fall back to "show every PRIVATE_SLUG"
+        # rather than producing an empty section.
+        have_slugs = set(PRIVATE_SLUGS)
+    rows = []
+    for slug in PRIVATE_SLUGS:
+        if slug not in have_slugs:
+            continue
+        sd = bdir / slug
+        files = sorted(sd.glob("*.png")) if sd.is_dir() else []
+        rows.append((len(files), slug, files))
+    rows.sort(key=lambda r: (r[0] > 0, r[0]))  # empty first, then ascending
+    out.append("<style>"
+               ".bm-row{margin:8px 0;padding:8px;background:#222;border-radius:4px}"
+               ".bm-head{display:flex;align-items:baseline;gap:10px;margin-bottom:6px}"
+               ".bm-slug{font-weight:bold;font-size:1.05em}"
+               ".bm-count{color:#888;font-size:.9em}"
+               ".bm-status{margin-left:auto;font-size:.9em}"
+               ".bm-thumbs{display:flex;flex-wrap:wrap;gap:6px}"
+               ".bm-thumb{position:relative;width:120px;border-radius:3px;overflow:hidden}"
+               ".bm-thumb img{width:120px;height:auto;display:block;background:#000}"
+               ".bm-del{position:absolute;top:2px;right:2px;width:22px;height:22px;"
+               "border:none;background:rgba(0,0,0,.7);color:#fff;cursor:pointer;"
+               "border-radius:50%;font-size:14px;line-height:18px;padding:0}"
+               ".bm-del:hover{background:#e74c3c}"
+               ".bm-name{font-size:.7em;color:#888;padding:3px;"
+               "white-space:nowrap;overflow:hidden;text-overflow:ellipsis}"
+               "</style>")
+    for n, slug, files in rows:
+        if n == 0:
+            status = ("<span style='color:#e74c3c'>fehlt — bringt vermutlich "
+                      "+0.05–0.13 IoU</span>")
+        elif n < 3:
+            status = (f"<span style='color:#f39c12'>nur {n} — mehrere "
+                      f"Varianten erfassen für bessere Match-Rate</span>")
+        else:
+            status = "<span style='color:#27ae60'>ausreichend</span>"
+        out.append(f"<div class='bm-row'>")
+        out.append(f"<div class='bm-head'><span class='bm-slug'>{slug}</span>"
+                   f"<span class='bm-count'>{n} Templates</span>"
+                   f"<span class='bm-status'>{status}</span></div>")
+        if files:
+            out.append("<div class='bm-thumbs'>")
+            for f in files:
+                fn = f.name
+                out.append(
+                    f"<div class='bm-thumb'>"
+                    f"<img src='/api/internal/detect-bumper/{slug}/{fn}' loading='lazy' alt=''/>"
+                    f"<button class='bm-del' onclick=\"deleteBumper('{slug}','{fn}',this)\" "
+                    f"title='Template löschen'>×</button>"
+                    f"<div class='bm-name' title='{fn}'>{fn}</div>"
+                    f"</div>")
+            out.append("</div>")
+        out.append("</div>")
+    out.append(
+        "<script>function deleteBumper(slug,fn,btn){"
+        "if(!confirm('Template '+fn+' löschen?'))return;"
+        "fetch('/api/bumper/'+slug+'/'+fn,{method:'DELETE'})"
+        ".then(r=>r.json()).then(d=>{"
+        "if(d.ok){btn.closest('.bm-thumb').remove();}"
+        "else{alert('Fehler: '+(d.error||'unbekannt'));}"
+        "}).catch(e=>alert('Netzwerk-Fehler'));}</script>")
+
     # Confusion summary
     if confusion:
         out.append("<h2>Confusion-Analyse (letzter Test-Set Run)</h2>")
@@ -7779,7 +7870,14 @@ def recording_hls(uuid):
     if not st["playlist"].exists() and not st["running"]:
         _rec_hls_spawn(uuid)
         st = _rec_state(uuid)
-    if not st["playlist"].exists() or st["segments"] < 10:
+    # Wait for at least 10 segments OR the remux to actually be done.
+    # The 10-segment threshold gives iOS some buffer when streaming
+    # mid-prepare, but very short recordings (sub-30s sitcom remnants
+    # like duplicate tail-recordings) only ever reach 5 segments —
+    # we'd 202 forever without the !running fallback.
+    playlist_ready = st["playlist"].exists() and (
+        st["segments"] >= 10 or not st["running"])
+    if not playlist_ready:
         return Response(json.dumps({"done": False,
                                      "segments": st["segments"],
                                      "total": st["total"]}),
@@ -8586,20 +8684,13 @@ def api_recording_bumper_capture(uuid):
         return Response(json.dumps({"ok": False,
             "error": f"ffmpeg rc={r.returncode}: {r.stderr[-200:]}"}),
                         status=500, mimetype="application/json")
-    # Auto-skip oversized frames: bumpers (mostly black + few coloured
-    # boxes) PNG-compress to ~25-40 KB; full content frames are
-    # 150-500 KB. Anything > 80 KB is almost certainly a show frame
-    # captured because the user pressed END too late or START too
-    # early. Drop them so they can't pollute the matcher.
-    SHOW_LIKE_BYTES = 80 * 1024
-    files = []
+    # No auto-filter: brightness-based heuristics don't separate
+    # bumpers from show frames cleanly across channels. Pro7's pink
+    # "We love…" card and a typical HIMYM interior shot have nearly
+    # identical YAVG. Instead the user prunes via the /learning page
+    # which shows a thumbnail + delete button per template.
+    files = sorted(p.name for p in bdir.glob(f"{base}-*.png"))
     skipped = []
-    for p in sorted(bdir.glob(f"{base}-*.png")):
-        if p.stat().st_size > SHOW_LIKE_BYTES:
-            try: p.unlink(); skipped.append(p.name)
-            except Exception: pass
-        else:
-            files.append(p.name)
     note = ""
     if skipped:
         note = f", skipped {len(skipped)} oversized (likely show)"
@@ -8640,6 +8731,26 @@ def api_internal_detect_bumper(slug, fname):
     if not p.is_file():
         abort(404)
     return send_file(p, mimetype="image/png")
+
+
+@app.route("/api/bumper/<slug>/<fname>", methods=["DELETE"])
+def api_bumper_delete(slug, fname):
+    """Remove a bumper template that turned out to be a show frame.
+    Used by the /learning UI's per-template delete buttons."""
+    if not re.fullmatch(r"[\w.-]+\.png", fname):
+        return Response(json.dumps({"ok": False, "error": "bad name"}),
+                        status=400, mimetype="application/json")
+    p = _TVD_BUMPER_DIR / slug / fname
+    if not p.is_file():
+        return Response(json.dumps({"ok": False, "error": "not found"}),
+                        status=404, mimetype="application/json")
+    try:
+        p.unlink()
+    except Exception as e:
+        return Response(json.dumps({"ok": False, "error": str(e)}),
+                        status=500, mimetype="application/json")
+    return _cors(Response(json.dumps({"ok": True}),
+                            mimetype="application/json"))
 
 
 @app.route("/api/internal/detect-models/<fname>")
