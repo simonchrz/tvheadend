@@ -7568,15 +7568,17 @@ def _rec_prewarm_once():
                   flush=True)
             n = 0
             for d in HLS_DIR.glob("_rec_*"):
-                # Drop non-sidecar .txt + ads.json so re-detection
-                # produces fresh ones; sidecar files (logo/cskp/tvd
-                # caches) stay
+                # Truncate (don't delete) the cutlist .txt — its
+                # FILENAME encodes the recording basename, which the
+                # train-head loader uses to find the .ts source. Daemon
+                # overwrites the content on next detect cycle anyway,
+                # so empty file is fine. Skip sidecar caches.
                 for t in d.glob("*.txt"):
                     if any(t.name.endswith(s) for s in
                            (".logo.txt", ".cskp.txt", ".tvd.txt",
                             ".trained.logo.txt")):
                         continue
-                    try: t.unlink()
+                    try: t.write_text("")
                     except Exception: pass
                 ads_p = d / "ads.json"
                 if ads_p.exists():
@@ -8376,11 +8378,15 @@ def api_internal_detect_pending():
         uuid = rec_dir.name[5:]
         if uuid in in_progress:
             continue
-        # Existing non-sidecar .txt = cutlist already produced
+        # Non-empty non-sidecar .txt = real cutlist already produced.
+        # An empty file is the head-invalidation truncation marker
+        # (filename kept so train-head can derive .ts basename, content
+        # cleared so we re-detect on the new model).
         existing = [t for t in rec_dir.glob("*.txt")
                     if not any(t.name.endswith(s) for s in
                                 (".logo.txt", ".cskp.txt", ".tvd.txt",
-                                 ".trained.logo.txt"))]
+                                 ".trained.logo.txt"))
+                       and t.stat().st_size > 0]
         if existing:
             try: marker.unlink()
             except Exception: pass
