@@ -6580,39 +6580,22 @@ def _rec_cskip_spawn(uuid):
         # (avoids stacked timers when prewarm re-calls every cycle).
         if DETECT_OFFLOAD == "mac":
             marker = out_dir / ".detect-requested"
-            if marker.exists():
-                # Already requested — let the existing fallback timer
-                # do its job. Refresh the mtime so a long Mac queue
-                # doesn't make the fallback fire prematurely.
+            if not marker.exists():
+                marker.write_text(json.dumps({"ts": time.time()}))
+                print(f"[rec-cskip {uuid[:8]}] marker for Mac", flush=True)
+            else:
+                # Refresh mtime so the daemon's pending-list still sees
+                # it as fresh during a long Mac queue
                 try: marker.touch()
                 except Exception: pass
-                return
-            marker.write_text(json.dumps({"ts": time.time()}))
-            print(f"[rec-cskip {uuid[:8]}] marker for Mac", flush=True)
-            def _detect_fallback():
-                time.sleep(DETECT_FALLBACK_S)
-                if out_txt.exists() or not marker.exists():
-                    return  # Mac delivered or marker withdrawn
-                # Marker mtime refreshed by repeat-spawn? extend wait
-                # rather than spawning Pi-local ffmpeg (Mac just busy).
-                age = time.time() - marker.stat().st_mtime
-                if age < DETECT_FALLBACK_S:
-                    print(f"[rec-cskip {uuid[:8]}] Mac queue active, "
-                          f"extending wait", flush=True)
-                    return
-                print(f"[rec-cskip {uuid[:8]}] Mac timeout {DETECT_FALLBACK_S}s "
-                      f"— Pi-local fallback", flush=True)
-                try: marker.unlink()
-                except Exception: pass
-                # Bypass offload branch on the recursive call by
-                # temporarily pretending offload is off. Avoids the
-                # infinite re-marker loop.
-                global DETECT_OFFLOAD
-                saved = DETECT_OFFLOAD
-                DETECT_OFFLOAD = ""
-                try: _rec_cskip_spawn(uuid)
-                finally: DETECT_OFFLOAD = saved
-            threading.Thread(target=_detect_fallback, daemon=True).start()
+            # NO automatic Pi-local fallback. With bulk markers (after
+            # head-bin invalidation triggers re-detect on every
+            # recording), the old 300 s fallback fired for many uuids
+            # in parallel — 3+ tv-detect processes on the Pi at once,
+            # CPU 90 °C, load 25+. If the Mac daemon is genuinely
+            # broken, the user will see no cutlists arriving and can
+            # intervene manually (restart daemon, check log) rather
+            # than the Pi auto-overloading itself.
             return
         if cached_logo and cached_logo.is_file() and cached_logo.stat().st_size > 0:
             cmd = ["tv-detect", "--quiet", "--workers", "4",
