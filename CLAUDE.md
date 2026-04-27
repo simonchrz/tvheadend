@@ -84,6 +84,8 @@ strand viewers.
 | `GET /api/internal/detect-config/<uuid>` | Per-job config bundle (slug, show, logo URL, smoothing, boundary extends, block prior) |
 | `GET /api/internal/detect-logo/<slug>` | Per-channel logo template |
 | `GET /api/internal/detect-models/<head.bin\|backbone.onnx>` | Model files for daemon-side caching |
+| `GET /api/internal/recording-uuids` | All known recording UUIDs (Mac daemon uses for hourly source-cache orphan GC) |
+| `POST /api/recording/<uuid>/redetect` | Force a fresh tv-detect pass on this recording (truncates cutlist + writes `.detect-requested` marker) |
 
 Why HTTP not SMB: macOS TCC restricts launchd Aqua agents from
 enumerating network mounts; `os.listdir(/Users/simon/mnt/pi-tv/hls)`
@@ -93,7 +95,19 @@ broken by this since 2026-04-25 (its log file went 0-byte). HTTP
 sidesteps the TCC scope entirely.
 
 Eager auto-invalidation: when nightly retrain bumps `head.bin`
-mtime, prewarm notices and drops every recording's cutlist + ads.json
-so the daemon serially re-detects everything with the fresh model.
-First-run case (marker missing) just records current mtime — without
-this guard a container restart would invalidate all 50+ recordings.
+mtime, prewarm notices, truncates every recording's cutlist .txt
+(filename kept — train-head's loader needs the basename to find the
+.ts source) and writes the `.detect-requested` marker so the daemon
+serially re-detects everything with the fresh model. First-run case
+(marker missing) just records current mtime — without this guard a
+container restart would invalidate all 50+ recordings. Also drops
+each recording's `ads.json` so the smart-merge regenerates against
+the new auto-cutlist.
+
+Letterbox compensation runs daemon-side: for each detect job, the
+daemon does a 5 s `ffmpeg cropdetect` pass at the 60 s mark, computes
+`offset = max(0, cropdetect_y - 20)`, passes `--logo-y-offset` to
+tv-detect. The 20-px constant is RTL-empirical (canonical case:
+Jungle Cruise on RTL Spielfilm — cropdetect=80, optimal offset=60).
+Same logic in `train-head.py` so cached training features match what
+inference produces.

@@ -7,7 +7,7 @@ DVB-C-Aufnahme + Live-Streaming über HLS, gebaut für iOS Safari auf dem Pi 5.
 - **tvheadend** (LXC-Image, `linuxserver/tvheadend`) — DVB-Input via SAT>IP (FRITZ!Box 6690 Cable), EPG, DVR, Autorec
 - **hls-gateway** (Flask über waitress, Python 3.12, ffmpeg 8.1 static) — on-demand HLS-Transcoding pro Kanal, EPG-Archiv, Web-UI, Watch-Player mit Scrub/Pause/Von-Anfang/Mediathek-Fallback, Recording-Player mit Werbe-Ausblendung via tv-detect (NN-basiert, ersetzt comskip seit 2026-04), virtuelle Mediathek-Aufnahmen
 - **Caddy** — HTTPS + HTTP/2 mit interner CA auf `:8443` (Pi-hole hält `:80`/`:443`)
-- **Mac-side daemon** (`~/bin/tv-thumbs-daemon.py` auf MacBook im LAN) — übernimmt HLS-Remux, Thumbnail-Generierung und tv-detect-Ad-Detection vom Pi via HTTP-API. Pi-CPU für Recording-Verarbeitung dropt von ~445 % auf ~5 %. Talks direkt zu Pi-Gateway auf `:8080` ohne Caddy-TLS-Hop.
+- **Mac-side daemon** (`~/bin/tv-thumbs-daemon.py` auf MacBook im LAN) — übernimmt HLS-Remux, Thumbnail-Generierung und tv-detect-Ad-Detection vom Pi via HTTP-API. Pi-CPU für Recording-Verarbeitung dropt von ~445 % auf ~5 %. Talks direkt zu Pi-Gateway auf `:8080` ohne Caddy-TLS-Hop. Lokaler `.ts`-Cache auf Mac-NVMe (LRU bei `SOURCE_CACHE_MAX_GB=60`, stündlicher Orphan-GC gegen `/api/internal/recording-uuids`) — Re-Detects nach Head-Bumps lesen aus Cache statt LAN, ~30× schneller. Daemon ruft pro Detect `ffmpeg cropdetect` auf 5 s Sample und übergibt `--logo-y-offset` an tv-detect (Letterbox-Kompensation für 16:9-in-4:3 Spielfilme).
 
 Alle drei Pi-Container als Docker, `network_mode: host`.
 
