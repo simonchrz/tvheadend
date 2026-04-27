@@ -2255,7 +2255,9 @@ def _render_history_chart(history, width=860, height=280):
     parts = [f"<svg viewBox='0 0 {width} {height}' "
              f"style='display:block;width:100%;max-width:{width}px;"
              f"background:#1a1a1a;border-radius:6px;margin-top:6px'>"]
-    # Y-axis grid + labels (0/25/50/75/100)
+    # Y-axis grid + percent labels. Both series (IoU and Acc) are in
+    # [0,1] internally, so the same axis serves both — series are
+    # disambiguated by colour via the legend, not by a second axis.
     for pct in (0, 25, 50, 75, 100):
         y = y_at(pct / 100)
         parts.append(f"<line x1='{pad_l}' y1='{y:.1f}' x2='{width-pad_r}' "
@@ -2272,6 +2274,24 @@ def _render_history_chart(history, width=860, height=280):
                      f"y2='{height-pad_b}' stroke='#2a2a2a' stroke-width='0.5'/>")
         parts.append(f"<text x='{x:.1f}' y='{height-8}' fill='#666' "
                      f"font-size='10' text-anchor='middle'>{label}</text>")
+    # All-time min/max horizontal references per series (computed
+    # from the FULL history, not just the visible window — gives a
+    # "best/worst we've ever hit" anchor that doesn't move when older
+    # runs scroll off-chart).
+    for key, color, _ in series:
+        vals = [r.get(key) for r in history if r.get(key) is not None]
+        if not vals:
+            continue
+        for v, tag in ((max(vals), "max"), (min(vals), "min")):
+            y = y_at(v)
+            parts.append(f"<line x1='{pad_l}' y1='{y:.1f}' "
+                         f"x2='{width-pad_r}' y2='{y:.1f}' "
+                         f"stroke='{color}' stroke-width='0.5' "
+                         f"stroke-dasharray='2,3' opacity='0.5'/>")
+            parts.append(f"<text x='{width-pad_r-3}' y='{y-2:.1f}' "
+                         f"fill='{color}' font-size='9' "
+                         f"text-anchor='end' opacity='0.75'>"
+                         f"{tag} {v*100:.1f}%</text>")
     # Series lines + dots
     for key, color, label in series:
         pts = [(x_at(i), y_at(r.get(key) or 0))
@@ -2594,7 +2614,7 @@ def learning_page():
                        f"Aufnahmen → {kind_label}")
     if health.get("trend_drift") is not None:
         d = health["trend_drift"]
-        out.append(f"<br><b>📉 IoU-Drift</b> {d:+.2f} vs Median der letzten "
+        out.append(f"<br><b>📉 IoU-Drift</b> {d*100:+.1f}% vs Median der letzten "
                    f"7 deployed Runs — schleichende Regression?")
     out.append("</div>")
 
@@ -2615,7 +2635,7 @@ def learning_page():
         cls = "dep" if dep else "rej"
         sym = "✓ DEPLOYED" if dep else "✗ REJECTED"
         iou_bar = (f"<span class='bar' style='width:{int((iou or 0)*100)}px'></span> "
-                   f"{iou:.2f}" if iou is not None else "–")
+                   f"{iou*100:.1f}%" if iou is not None else "–")
         out.append(f"<tr><td>{ts}</td><td>{ta*100:.1f}%</td>"
                    f"<td>{tea*100:.1f}%</td><td>{iou_bar}</td>"
                    f"<td>{nt}/{ntr}</td><td class='{cls}'>{sym}</td>"
