@@ -8355,6 +8355,21 @@ def api_internal_live_ads():
                             mimetype="application/json"))
 
 
+@app.route("/api/internal/recording-uuids")
+def api_internal_recording_uuids():
+    """All currently-valid recording uuids (= those with an actual
+    rec_dir on disk). Mac daemon uses this for orphan-GC of its
+    local .ts source cache: any cached uuid not in this list is
+    a deleted recording, safe to evict."""
+    out = []
+    for d in HLS_DIR.glob("_rec_*"):
+        if not d.is_dir():
+            continue
+        out.append(d.name[5:])
+    return _cors(Response(json.dumps({"uuids": sorted(out)}),
+                            mimetype="application/json"))
+
+
 @app.route("/api/internal/detect-pending")
 def api_internal_detect_pending():
     """Recordings with `.detect-requested` marker. Filters out
