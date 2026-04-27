@@ -7599,6 +7599,16 @@ def _rec_prewarm_once():
                 if ads_p.exists():
                     try: ads_p.unlink()
                     except Exception: pass
+                # Write the detect-requested marker so the Mac daemon
+                # actually picks this up. Without it, truncated cutlists
+                # sit untouched until some other code path (e.g.
+                # /api/recording/<uuid>/redetect) writes the marker.
+                # No-op in Pi-local mode where the prewarm loop spawns
+                # tv-detect directly without going through the marker.
+                if DETECT_OFFLOAD == "mac":
+                    try: (d / ".detect-requested").write_text(
+                        json.dumps({"ts": time.time()}))
+                    except Exception: pass
                 n += 1
             try: marker.write_text(str(cur_mt))
             except Exception: pass
