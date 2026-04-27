@@ -2985,7 +2985,14 @@ body.ctrl-min #skipad{background:#0006;color:#ddd;padding:4px 9px;
  border-radius:17px;font-size:1em;cursor:pointer;display:flex;
  align-items:center;justify-content:center;text-decoration:none;
  flex:0 0 auto;line-height:1;font-variant-emoji:text;
- transition:box-shadow .2s,background .2s}
+ transition:box-shadow .2s,background .2s;
+ /* Mobile Safari: rapid taps on the same button (e.g. user mashing
+  ⏩ to scrub forward) get interpreted as double-tap → zoom in.
+  touch-action:manipulation disables the 300ms double-tap delay
+  AND the zoom gesture for taps inside the button, while still
+  permitting pinch-to-zoom elsewhere. */
+ touch-action:manipulation;
+ -webkit-touch-callout:none}
 @media (hover:hover){
  .iconbtn:hover{background:#fff4;
   box-shadow:0 0 10px #7bdcff99,0 0 18px #7bdcff55}
@@ -3093,14 +3100,37 @@ const thumb=document.getElementById('thumb');
 v.addEventListener('play',()=>pp.textContent='\u23F8');
 v.addEventListener('pause',()=>pp.textContent='\u25B6');
 let _chromeT=null;
+const CHROME_PIN_KEY='player-chrome-pin';
+let _chromePinned=false;
+try{_chromePinned=localStorage.getItem(CHROME_PIN_KEY)==='1';}catch(e){}
 function show(){
   chromeBar.classList.remove('hidden');
   topbar.classList.remove('hidden');
   clearTimeout(_chromeT);
+  /* When pinned, leave the chrome visible indefinitely — user
+     opted out of the 3.5s auto-hide via the 📌 button. */
+  if(_chromePinned)return;
   _chromeT=setTimeout(()=>{
     if(!v.paused){chromeBar.classList.add('hidden');topbar.classList.add('hidden');}
   },3500);
 }
+function applyChromePin(pinned){
+  _chromePinned=!!pinned;
+  const btn=document.getElementById('chromePin');
+  if(btn){
+    btn.textContent=_chromePinned?'📌':'📍';
+    btn.setAttribute('aria-label',
+      _chromePinned?'Auto-Verbergen aktivieren':'Steuerleiste anpinnen');
+    btn.classList.toggle('on',_chromePinned);
+  }
+  if(_chromePinned){clearTimeout(_chromeT);show();}
+}
+function toggleChromePin(){
+  const next=!_chromePinned;
+  try{localStorage.setItem(CHROME_PIN_KEY,next?'1':'0');}catch(e){}
+  applyChromePin(next);
+}
+applyChromePin(_chromePinned);
 show();
 function toggleFs(){
   const fsEl=document.fullscreenElement||document.webkitFullscreenElement;
@@ -3314,6 +3344,8 @@ body{{touch-action:pan-y}}
  <button class='iconbtn' onclick='toggleFs()' aria-label='Vollbild'>⛶</button>
  <button id='ctrlMin' class='iconbtn' onclick='toggleCtrlMin()'
    aria-label='Steuerleiste verbergen'>⊟</button>
+ <button id='chromePin' class='iconbtn' onclick='toggleChromePin()'
+   aria-label='Steuerleiste anpinnen'>📍</button>
  <a class='iconbtn' href='{HOST_URL}/' aria-label='Schließen' onclick='return closePlayer(event)'>✕</a>
 </div>
 <div id='chrome'>
@@ -9210,6 +9242,8 @@ def play_recording(uuid):
             f"<button class='iconbtn' onclick='toggleFs()' aria-label='Vollbild'>⛶</button>"
             f"<button id='ctrlMin' class='iconbtn' onclick='toggleCtrlMin()' "
             f"aria-label='Steuerleiste verbergen'>⊟</button>"
+            f"<button id='chromePin' class='iconbtn' onclick='toggleChromePin()' "
+            f"aria-label='Steuerleiste anpinnen'>📍</button>"
             f"<a class='iconbtn' href='{HOST_URL}/recordings' aria-label='Schließen' "
             f"onclick='return closePlayer(event)'>✕</a>"
             f"</div>"
