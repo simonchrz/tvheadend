@@ -272,6 +272,19 @@ ul.channels .logo {
     overflow: hidden;
 }
 ul.channels .logo img { max-width: 100%; max-height: 100%; }
+/* Dark-mode only: mid-grey backdrop behind logos so dark channel
+   logos (Das Erste, Eurosport) AND light ones (NITRO, sixx) both
+   stay readable on the dark tile body. Light mode page bg is
+   already #fafafa, no backdrop needed. */
+@media (prefers-color-scheme: dark) {
+    ul.channels .logo,
+    .ch-cell img {
+        background: rgba(120, 120, 120, 0.55);
+        border-radius: 4px;
+        padding: 4px;
+    }
+    .ch-cell img { padding: 2px; border-radius: 3px; }
+}
 
 /* ===== EPG layout: wrap scrolls h+v, channels column sticky ===== */
 .epg-wrap {
@@ -2514,6 +2527,11 @@ def learning_page():
                 continue
             uuid = parts[0].strip()
             t = float(parts[1])
+            # Skip rows whose recording dir no longer exists (user
+            # deleted via tvheadend) — head.uncertain.txt is stale
+            # until the next nightly retrain re-writes it.
+            if not (HLS_DIR / f"_rec_{uuid}").exists():
+                continue
             user_cache = HLS_DIR / f"_rec_{uuid}" / "ads_user.json"
             if user_cache.exists():
                 try:
@@ -6056,6 +6074,12 @@ def recordings_page():
         ar = e.get("autorec") or ""
         by_autorec.setdefault(ar, []).append(e)
 
+    # Track the first is_now-or-earlier row so JS can scroll to it on
+    # load (newest-first sort puts FUTURE scheduled stuff at the top;
+    # the user's actual focus is the first row that's either currently
+    # recording or already done — that's "today's section").
+    now_anchor_set = {"hit": False}
+
     def _render_row(e, in_series=False):
         uuid = e.get("uuid", "")
         title = e.get("disp_title", "?")
@@ -6195,15 +6219,18 @@ def recordings_page():
                    f'data-title="{title.replace(chr(34),"&quot;")}" '
                    f'data-when="{when}">🗑</a>')
         tools_cell = f'<td class="row-tools">{watch_cell}{del_btn}</td>'
+        # First is_done/is_live row across the whole list is the
+        # "now anchor" — JS scrolls here on initial load.
+        anchor_attr = ""
+        if (is_done or is_live) and not now_anchor_set["hit"]:
+            anchor_attr = ' id="now-anchor"'
+            now_anchor_set["hit"] = True
         if in_series:
-            # Inside a series group the title is redundant (already in
-            # the purple group header). Status badge doubles as the
-            # play button when the recording is ready.
-            return (f'<tr><td>{status_cell}</td>'
+            return (f'<tr{anchor_attr}><td>{status_cell}</td>'
                     f'<td>{when}</td>'
                     f'<td>{dur_min} min</td>'
                     f'{tools_cell}</tr>')
-        return (f'<tr><td>{status_cell}</td>'
+        return (f'<tr{anchor_attr}><td>{status_cell}</td>'
                 f'<td>{title_cell}</td>'
                 f'<td>{when}</td>'
                 f'<td>{dur_min} min</td>'
@@ -6501,6 +6528,49 @@ def recordings_page():
             f"      else alert('Fehler: '+(d.error||'?'));"
             f"    }}).catch(e=>alert('Fehler: '+e));"
             f"}}"
+            f"/* Restore the user's last scroll position so a delete or"
+            f"   cancel doesn't kick them back to the top of a 200-row"
+            f"   list. Saved on every scroll (debounced) AND right"
+            f"   before any action button fires; restored on load if"
+            f"   recent (<30 min). Otherwise stay at top, which is"
+            f"   today/now since the list is sorted DESC. */"
+            f"const RECPOS_KEY='recordings-scroll';"
+            f"const RECPOS_TTL_MS=30*60*1000;"
+            f"let _recScrollT=null;"
+            f"function saveRecScroll(){{"
+            f"  try{{localStorage.setItem(RECPOS_KEY,"
+            f"    JSON.stringify({{y:window.scrollY,ts:Date.now()}}));}}"
+            f"  catch(e){{}}"
+            f"}}"
+            f"window.addEventListener('scroll',()=>{{"
+            f"  clearTimeout(_recScrollT);"
+            f"  _recScrollT=setTimeout(saveRecScroll,200);"
+            f"}},{{passive:true}});"
+            f"/* Wrap fetch so any action (delete, cancel, mark-watched)"
+            f"   on this page snapshots scroll first — otherwise the"
+            f"   subsequent location.reload() would race the debounce. */"
+            f"const _origFetch=window.fetch;"
+            f"window.fetch=function(){{saveRecScroll();return _origFetch.apply(this,arguments);}};"
+            f"window.addEventListener('load',()=>{{"
+            f"  let saved=null;"
+            f"  try{{saved=JSON.parse(localStorage.getItem(RECPOS_KEY)||'null');}}"
+            f"  catch(e){{}}"
+            f"  if(saved&&Date.now()-saved.ts<RECPOS_TTL_MS&&saved.y>0){{"
+            f"    window.scrollTo({{top:saved.y,behavior:'instant'}});"
+            f"    return;"
+            f"  }}"
+            f"  /* No recent saved scroll → land on the first not-future"
+            f"     row (= today's recordings, since list is sorted DESC"
+            f"     and future-scheduled items pile up at the very top). */"
+            f"  const a=document.getElementById('now-anchor');"
+            f"  if(a){{"
+            f"    /* If anchor is inside a collapsed <details>, open it"
+            f"       so scrollIntoView lands on a visible element. */"
+            f"    const det=a.closest('details');"
+            f"    if(det&&!det.open)det.open=true;"
+            f"    a.scrollIntoView({{block:'start',behavior:'instant'}});"
+            f"  }}"
+            f"}});"
             f"</script>"
             f"</body></html>")
     return body
