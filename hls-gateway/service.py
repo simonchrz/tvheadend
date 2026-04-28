@@ -2636,6 +2636,64 @@ def learning_page():
                    f"7 deployed Runs — schleichende Regression?")
     out.append("</div>")
 
+    # Daemon status banner — Mac-side detect / HLS-remux / thumbs
+    # daemon health, queue depth, and an estimated remaining time
+    # for the current backlog. Same color-coded box style as the
+    # model-status banner above.
+    # Daemon poll cadence is 5s normally, but during a long detect
+    # job (4-7 min wall) the poll loop pauses until the job finishes.
+    # Generous thresholds so a mid-detect daemon shows GREEN with a
+    # "busy" hint rather than warning.
+    daemon_age = int(time.time() - (_daemon_last_poll or 0))
+    if _daemon_last_poll == 0:
+        d_color = "#e74c3c"; d_label = "noch nie gepingt"
+    elif daemon_age <= 30:
+        d_color = "#27ae60"; d_label = f"aktiv (letzter Ping vor {daemon_age}s)"
+    elif daemon_age <= 600:
+        d_color = "#27ae60"; d_label = (f"aktiv, gerade in einem Detect-Job "
+                                          f"(letzter Ping vor {daemon_age}s)")
+    elif daemon_age <= 1800:
+        d_color = "#f39c12"; d_label = (f"⚠ ungewöhnlich lange beschäftigt "
+                                          f"({daemon_age//60} min ohne Ping — "
+                                          f"sehr großer Detect-Job?)")
+    else:
+        d_color = "#e74c3c"; d_label = (f"✗ offline (kein Ping seit "
+                                          f"{daemon_age//60} min)")
+    # Pending counts — re-uses the same logic the daemon polls
+    n_detect = n_thumbs = n_hls = 0
+    try:
+        for marker in HLS_DIR.glob("_rec_*/.detect-requested"):
+            if any(t.stat().st_size > 0
+                   for t in marker.parent.glob("*.txt")
+                   if not any(t.name.endswith(s) for s in
+                              (".logo.txt", ".cskp.txt", ".tvd.txt", ".trained.logo.txt"))):
+                continue
+            n_detect += 1
+        n_thumbs = sum(1 for _ in HLS_DIR.glob("_rec_*/thumbs/.requested"))
+        n_hls = sum(1 for _ in HLS_DIR.glob("_rec_*/.hls-requested"))
+    except Exception:
+        pass
+    # Recent detect timing → estimate ETA on the queue. The Mac daemon
+    # runs DETECT_PARALLEL detect-jobs concurrently (default 3) and each
+    # job now completes in ~3 min wallclock thanks to CoreML NN + ONNX
+    # ECAPA. Effective rate ≈ 1 min/detect-equivalent. Override per-knob
+    # via env: DAEMON_DETECT_PARALLEL, DAEMON_MIN_PER_DETECT.
+    parallel = max(1, int(os.environ.get("DAEMON_DETECT_PARALLEL", "3")))
+    min_per_detect = float(os.environ.get("DAEMON_MIN_PER_DETECT", "3"))
+    eta_min = int(n_detect * min_per_detect / parallel)
+    out.append(f"<div class='status' style='background:{d_color}22;"
+               f"border-left:4px solid {d_color}'>"
+               f"<span class='dot' style='background:{d_color}'></span>"
+               f"<b>Mac-Daemon</b> — {d_label}<br>"
+               f"Queue: {n_detect} detect · {n_thumbs} thumbs · {n_hls} hls")
+    if n_detect > 0:
+        eta_h = eta_min // 60
+        eta_rest = eta_min % 60
+        eta_str = f"~{eta_h}h {eta_rest}min" if eta_h else f"~{eta_min} min"
+        out.append(f" · geschätzte Restlaufzeit {eta_str} "
+                   f"(≈{min_per_detect:g} min/detect × {parallel} parallel)")
+    out.append("</div>")
+
     # History chart (visual trend before the table)
     if history:
         out.append("<h2>Verlauf</h2>")
@@ -5690,6 +5748,13 @@ def record_series(event_id):
         "fulltext": False,
         "channel": ch_uuid,
         "comment": f"auto via /record-series for eid={event_id}",
+        # Padding (minutes): broadcasters routinely start 1-3 min early
+        # and run 5-10 min long past the EPG-scheduled stop. Tvh's
+        # global pre/post-extra-time isn't applied to autorec-spawned
+        # entries (they freeze 0/0 unless overridden here). 5 min pre /
+        # 10 min post matches what we patched onto the existing rules.
+        "start_extra": 5,
+        "stop_extra": 10,
     }
     # Lock to the seed event's time-of-day so a midday rerun on the
     # same channel doesn't get picked up alongside the prime-time
