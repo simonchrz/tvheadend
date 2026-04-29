@@ -6017,20 +6017,37 @@ def record_series(event_id):
         # it ~2 s then count how many upcoming DVR entries the rule has
         # spawned so the client can show "N Folgen geplant".
         scheduled = 0
+        spawned_uuids = set()
         try:
             time.sleep(2)
             up = json.loads(urllib.request.urlopen(
                 f"{TVH_BASE}/api/dvr/entry/grid_upcoming?limit=500",
                 timeout=10).read())
-            scheduled = sum(1 for e in up.get("entries", [])
-                            if e.get("autorec") == autorec_uuid)
+            for e in up.get("entries", []):
+                if e.get("autorec") == autorec_uuid:
+                    scheduled += 1
+                    spawned_uuids.add(e.get("uuid"))
+        except Exception:
+            pass
+        # Tuner-conflict report: of the entries the autorec just spawned,
+        # how many overlap with > TUNER_TOTAL unique muxes? Helps the
+        # caller surface a warning ("3 of 5 planned episodes will silently
+        # fail at recording time — same-time conflict with X").
+        conflicts = []
+        try:
+            cmap = _compute_tuner_conflicts(int(time.time()))
+            conflicts = sorted(
+                u for u in spawned_uuids
+                if cmap.get(u, 0) > TUNER_TOTAL)
         except Exception:
             pass
         return _cors(Response(json.dumps({"ok": True,
                                            "uuid": autorec_uuid,
                                            "title": title,
                                            "channel": ch_name,
-                                           "scheduled": scheduled}),
+                                           "scheduled": scheduled,
+                                           "tuner_conflicts": conflicts,
+                                           "tuner_total": TUNER_TOTAL}),
                                mimetype="application/json"))
     except Exception as e:
         return Response(json.dumps({"ok": False, "error": str(e)}),
@@ -6382,6 +6399,11 @@ def recordings_page():
          and (e.get("start") or 0) > now_ts),
         key=lambda e: e.get("start") or 0)[:3]
     next_up_uuids = {e["uuid"]: i for i, e in enumerate(upcoming)}
+    # Tuner-conflict map: uuid → peak # unique muxes overlapping that
+    # entry's window. Compared against TUNER_TOTAL to mark over-booked
+    # rows in red — tvh would otherwise silently flip the lower-priority
+    # one to "Time missed" at recording time.
+    tuner_conflicts = _compute_tuner_conflicts(now_ts)
 
     # Track the first is_now-or-earlier row so JS can scroll to it on
     # load (newest-first sort puts FUTURE scheduled stuff at the top;
@@ -6519,6 +6541,16 @@ def recordings_page():
         # badge + countdown. JS at the bottom of the page refreshes the
         # countdown text every minute so the page stays informative
         # between auto-reloads.
+        # Tuner-conflict warning (rendered alongside the status badge).
+        # peak = how many unique muxes overlap THIS entry's window.
+        # If > TUNER_TOTAL the recording WILL fail at start time.
+        peak = tuner_conflicts.get(uuid, 0)
+        if peak > TUNER_TOTAL:
+            status_cell += (f' <span class="badge tuner-overbook" '
+                            f'title="{peak} überlappende Mux(e), nur '
+                            f'{TUNER_TOTAL} Tuner — niedrigere Priorität '
+                            f'wird tvh-seitig auf Time missed gesetzt">'
+                            f'⚠ {peak}/{TUNER_TOTAL} Tuner</span>')
         if uuid in next_up_uuids:
             secs = max(0, start - now_ts)
             mins = secs // 60
@@ -6768,6 +6800,10 @@ def recordings_page():
             f".badge.failed{{background:#7f1d1d;color:#fecaca}}"
             f".badge.next-up{{background:#1e3a8a;color:#dbeafe}}"
             f"tr:has(.badge.next-up){{outline:1px solid #2563eb;"
+            f"outline-offset:-1px}}"
+            f".badge.tuner-overbook{{background:#92400e;color:#fed7aa;"
+            f"animation:livepulse 2s ease-in-out infinite}}"
+            f"tr:has(.badge.tuner-overbook){{outline:1px solid #f59e0b;"
             f"outline-offset:-1px}}"
             f".badge.scanning{{background:#8e44ad;color:#fff;"
             f"animation:scanpulse 1.2s ease-in-out infinite}}"
@@ -8952,9 +8988,21 @@ def api_learning_plan():
         except Exception as e:
             skipped.append({"reason": str(e)[:120],
                               "title": title, "start_iso": start_iso})
+    # Tuner-conflict report on the just-spawned entries (analog to
+    # /record-series).
+    plan_conflicts = []
+    try:
+        cmap = _compute_tuner_conflicts(int(time.time()))
+        plan_conflicts = sorted(
+            p["dvr_uuid"] for p in planned
+            if cmap.get(p["dvr_uuid"], 0) > TUNER_TOTAL)
+    except Exception:
+        pass
     return _cors(Response(json.dumps({
         "ok": True, "planned": planned, "skipped": skipped,
-        "found": len(candidates)}),
+        "found": len(candidates),
+        "tuner_conflicts": plan_conflicts,
+        "tuner_total": TUNER_TOTAL}),
         mimetype="application/json"))
 
 
@@ -11072,6 +11120,49 @@ def tuner_status():
     _tuner_cache["epggrab"] = epg
     _tuner_cache["expires"] = now + 5
     return used, total, epg
+
+
+def _compute_tuner_conflicts(now_ts):
+    """Walk all upcoming/running DVR entries, group by overlapping
+    time windows, count UNIQUE muxes per cluster. Channels on the
+    same mux share one tuner. Returns dict {uuid: peak_mux_count}
+    where peak is the max count across all overlap-clusters that
+    entry belongs to. uuid not in dict = no conflict info available.
+    Conflict exists if peak > TUNER_TOTAL.
+    """
+    try:
+        data = json.loads(urllib.request.urlopen(
+            f"{TVH_BASE}/api/dvr/entry/grid?limit=500", timeout=5).read())
+    except Exception:
+        return {}
+    # Channel-name → mux_uuid map (falls back to channel name itself
+    # so unmapped channels still count individually).
+    with cmap_lock:
+        ch_to_mux = {}
+        for slug, info in channel_map.items():
+            name = info.get("name") or ""
+            mux = info.get("mux_uuid") or name
+            if name:
+                ch_to_mux[name] = mux
+    relevant = []
+    for e in data.get("entries", []):
+        if e.get("sched_status") not in ("scheduled", "recording"):
+            continue
+        s = e.get("start") or 0
+        p = e.get("stop") or 0
+        if not s or not p or p < now_ts:
+            continue
+        ch = e.get("channelname") or ""
+        mu = ch_to_mux.get(ch, ch)
+        relevant.append((s, p, mu, e.get("uuid", "")))
+    out = {}
+    for s, p, mu, u in relevant:
+        muxes = set()
+        for s2, p2, mu2, u2 in relevant:
+            if s2 < p and p2 > s:
+                muxes.add(mu2)
+        out[u] = len(muxes)
+    return out
 
 
 _pinned_mux_cache = {"muxes": set(), "running": 0, "expires": 0}
