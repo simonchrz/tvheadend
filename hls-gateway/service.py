@@ -2784,19 +2784,51 @@ def learning_page():
                    f"(≈{min_per_detect:g} min/detect × {parallel} parallel)")
     out.append("</div>")
 
+    # Collapsible sections via HTML5 <details> — the page used to
+    # be one long scroll. Each section is a <details>...</details>
+    # whose <summary> wraps the original <h2>. The most diagnostic
+    # ones (Verlauf, Per-Show IoU) default open; tabular reference
+    # data (Modell-Historie, Per-Channel-Tuning, Bumper-Templates,
+    # Confusion, Empfehlungen, Show-Fingerprints, Active-Learning)
+    # default closed.
+    out.append("""<style>
+      details.section { margin: 1.2em 0; border: 1px solid var(--border);
+        border-radius: 6px; padding: 0 12px; }
+      details.section[open] { padding: 0 12px 12px; }
+      details.section > summary { cursor: pointer; padding: 10px 0;
+        list-style-position: inside; }
+      details.section > summary > h2 { display: inline; margin: 0;
+        font-size: 1.1em; }
+      details.section > summary:hover { color: var(--link); }
+    </style>""")
+    _section_open = [False]
+    def _section(title, default_open=False):
+        if _section_open[0]:
+            out.append("</details>")
+        out.append(f"<details class='section'{' open' if default_open else ''}>")
+        out.append(f"<summary><h2>{title}</h2></summary>")
+        _section_open[0] = True
+
     # History chart (visual trend before the table)
     if history:
-        out.append("<h2>Verlauf</h2>")
+        _section("Verlauf", default_open=True)
         out.append(_render_history_chart(history))
 
     # Per-show IoU trend (one sparkline per show, sorted by current IoU
     # ascending so problem-shows surface at the top). Sourced from
     # head.per-show-iou.jsonl which is appended after each train-head
-    # deploy via /api/internal/snapshot-per-show-iou.
-    out.append(_render_per_show_iou_trend())
+    # deploy via /api/internal/snapshot-per-show-iou. The helper
+    # already emits its own <h2> + table; wrap in a section.
+    per_show_html = _render_per_show_iou_trend()
+    if per_show_html:
+        # Strip the <h2> the helper emits — _section will re-add it.
+        per_show_html = per_show_html.replace(
+            "<h2>Per-Show IoU-Verlauf</h2>", "")
+        _section("Per-Show IoU-Verlauf", default_open=True)
+        out.append(per_show_html)
 
     # History table (last 30)
-    out.append("<h2>Modell-Historie (letzte 30 Runs)</h2>")
+    _section("Modell-Historie (letzte 30 Runs)")
     out.append("<table><tr><th>Zeit</th><th>Train Acc</th><th>Test Acc</th>"
                "<th>Test IoU</th><th>n Test/Train</th><th>Status</th><th>Reason</th></tr>")
     for e in reversed(history[-30:]):
@@ -2815,7 +2847,7 @@ def learning_page():
     out.append("</table>")
 
     # Per-channel
-    out.append("<h2>Per-Channel-Tuning</h2>")
+    _section("Per-Channel-Tuning")
     out.append("<table><tr><th>Channel</th><th>Logo-Smooth</th>"
                "<th>Start-Lag (gelernt)</th><th>Sponsor-Tail (gelernt)</th>"
                "<th>Block-Länge Prior</th><th>n Samples</th></tr>")
@@ -2842,7 +2874,7 @@ def learning_page():
     PRIVATE_SLUGS = ["rtl", "rtlzwei", "prosieben", "prosiebenmaxx",
                      "sat-1", "sixx", "kabel-eins", "kabel-eins-doku",
                      "vox", "vox-up", "tlc", "dmax"]
-    out.append("<h2>Bumper-Templates pro Sender</h2>")
+    _section("Bumper-Templates pro Sender")
     out.append("<p class='muted'>Sender-Bumper (z.B. RTL's „Mein RTL"
                "\" Karte am Werbeblock-Ende) sind das stärkste "
                "deterministische Ad-Ende-Signal. Pro Sender "
@@ -2926,7 +2958,7 @@ def learning_page():
 
     # Confusion summary
     if confusion:
-        out.append("<h2>Confusion-Analyse (letzter Test-Set Run)</h2>")
+        _section("Confusion-Analyse (letzter Test-Set Run)")
         out.append("<table><tr><th>Show</th><th>Frames</th><th>Block-Vergleich</th><th>Fehlertyp</th></tr>")
         for c in confusion:
             out.append(f"<tr><td><b>{c['title']}</b></td>"
@@ -3036,7 +3068,7 @@ def learning_page():
     recommendations = pruned
 
     if recommendations:
-        out.append("<h2>Empfehlungen — wo Labelling am meisten bringt</h2>")
+        _section("Empfehlungen — wo Labelling am meisten bringt")
         out.append("<ul style='line-height:1.8;font-size:.9em;list-style:none;"
                    "padding-left:0'>")
         for i, r in enumerate(recommendations[:10]):
@@ -3096,7 +3128,7 @@ document.querySelectorAll('.plan-btn').forEach(btn => {
     # recording disappears from the active-learning queue.
     fingerprints = _compute_show_fingerprints()
     if fingerprints:
-        out.append(f"<h2>Show-Fingerprints ({len(fingerprints)})</h2>")
+        _section(f"Show-Fingerprints ({len(fingerprints)})")
         out.append("<p class='muted'>Shows mit ≥3 user-bestätigten Episoden + "
                    "konsistenter Block-Anzahl. Auto-Confirm prüft neue Aufnahmen "
                    "gegen den Fingerprint und übernimmt Treffer als bestätigt — "
@@ -3182,8 +3214,8 @@ document.getElementById('fp-val-btn').addEventListener('click', async (ev) => {
     if uncertain:
         skip_note = (f" · {reviewed_skipped} weitere ausgeblendet "
                      f"(geprüfte Aufnahmen)" if reviewed_skipped else "")
-        out.append(f"<h2>Active-Learning Targets "
-                   f"({len(uncertain)} offen{skip_note})</h2>")
+        _section(f"Active-Learning Targets "
+                 f"({len(uncertain)} offen{skip_note})")
         out.append("<p class='muted'>Frames mit hohem Trainings-Wert. "
                    "🎯 = Modell unsicher (p≈0.5). "
                    "⚠ = Modell sicher, aber Wall-Clock-Prior widerspricht "
@@ -3204,6 +3236,8 @@ document.getElementById('fp-val-btn').addEventListener('click', async (ev) => {
                        f"<td><a href='{link}'>öffnen</a></td></tr>")
         out.append("</table>")
 
+    if _section_open[0]:
+        out.append("</details>")
     out.append("</body></html>")
     return Response("\n".join(out), mimetype="text/html")
 
