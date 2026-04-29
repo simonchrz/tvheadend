@@ -2705,20 +2705,43 @@ def learning_page():
     out.append("<!doctype html><html lang=de><head><meta charset=utf-8>")
     out.append("<title>tv-detect Lernfortschritt</title>")
     out.append("<meta name=viewport content='width=device-width,initial-scale=1'>")
+    # Browser hint: page supports both light + dark modes. Without
+    # this, form controls + scrollbars stay light on dark pages.
+    out.append("<meta name=color-scheme content='light dark'>")
     out.append("<style>")
-    out.append("body{font-family:-apple-system,sans-serif;background:#1c1c1c;color:#eee;margin:0;padding:18px;max-width:1200px;margin-left:auto;margin-right:auto}")
-    out.append("h1{font-size:1.5em;margin:0 0 8px}h2{margin:24px 0 8px;font-size:1.1em;color:#bbb;border-bottom:1px solid #333;padding-bottom:4px}")
-    out.append(f".status{{padding:12px 14px;border-radius:6px;background:{ok_color}22;border-left:4px solid {ok_color};margin:8px 0 16px}}")
-    out.append(".status .dot{display:inline-block;width:10px;height:10px;border-radius:5px;margin-right:8px;vertical-align:middle}")
+    # CSS-variable theme matching BASE_CSS used elsewhere — tagsüber
+    # hell (prefers-color-scheme: light), abends dunkel (dark). Was
+    # previously hardcoded #1c1c1c forever.
+    out.append(":root{--bg:#fafafa;--fg:#222;--muted:#777;"
+               "--border:#ddd;--stripe:#f0f0f0;--link:#0366d6;"
+               "--code-bg:#f3f3f3}")
+    out.append("@media (prefers-color-scheme:dark){:root{"
+               "--bg:#1a1a1a;--fg:#e4e4e4;--muted:#999;--border:#333;"
+               "--stripe:#242424;--link:#79b8ff;--code-bg:#2a2a2a}}")
+    out.append("body{font-family:-apple-system,sans-serif;"
+               "background:var(--bg);color:var(--fg);"
+               "margin:0;padding:18px;max-width:1200px;"
+               "margin-left:auto;margin-right:auto}")
+    out.append("h1{font-size:1.5em;margin:0 0 8px}"
+               "h2{margin:24px 0 8px;font-size:1.1em;color:var(--fg);"
+               "border-bottom:1px solid var(--border);padding-bottom:4px}")
+    out.append(f".status{{padding:12px 14px;border-radius:6px;"
+               f"background:{ok_color}22;border-left:4px solid {ok_color};"
+               f"margin:8px 0 16px}}")
+    out.append(".status .dot{display:inline-block;width:10px;height:10px;"
+               "border-radius:5px;margin-right:8px;vertical-align:middle}")
     out.append("table{border-collapse:collapse;width:100%;font-size:.85em}")
-    out.append("th,td{padding:5px 9px;text-align:left;border-bottom:1px solid #333}")
-    out.append("th{color:#888;font-weight:600}")
-    out.append("tr:hover{background:#252525}")
+    out.append("th,td{padding:5px 9px;text-align:left;"
+               "border-bottom:1px solid var(--border)}")
+    out.append("th{color:var(--muted);font-weight:600}")
+    out.append("tr:hover{background:var(--stripe)}")
     out.append(".rej{color:#e74c3c}.dep{color:#27ae60}")
-    out.append(".bar{display:inline-block;height:8px;background:#3498db;border-radius:2px;vertical-align:middle}")
-    out.append(".muted{color:#777}")
-    out.append("a{color:#5dade2}a:hover{color:#85c1e9}")
-    out.append("nav{margin-bottom:14px}nav a{margin-right:14px;color:#888}")
+    out.append(".bar{display:inline-block;height:8px;background:#3498db;"
+               "border-radius:2px;vertical-align:middle}")
+    out.append(".muted{color:var(--muted)}")
+    out.append("a{color:var(--link)}a:hover{text-decoration:underline}")
+    out.append("nav{margin-bottom:14px}"
+               "nav a{margin-right:14px;color:var(--muted)}")
     out.append("</style></head><body>")
     out.append(f"<nav><a href='{HOST_URL}/'>← Home</a> <a href='{HOST_URL}/recordings'>Aufnahmen</a></nav>")
     out.append("<h1>tv-detect Lernfortschritt</h1>")
