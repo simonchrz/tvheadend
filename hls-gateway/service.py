@@ -3088,6 +3088,20 @@ def learning_page():
 
     if recommendations:
         _section("Empfehlungen — wo Labelling am meisten bringt")
+        # "Alle annehmen" — fires every individual plan-btn in order,
+        # collects results into one summary alert. Useful when there
+        # are 5-10 recommendations and the user just wants to accept
+        # them in bulk (typical after a model retrain surfaces a fresh
+        # set of under-represented shows / channels).
+        total_n = sum(min(r["n"], 10) for r in recommendations[:10])
+        out.append(
+            f"<p style='margin:0 0 10px'>"
+            f"<button id='plan-all-btn' "
+            f"style='padding:6px 14px;border-radius:4px;border:1px solid #27ae60;"
+            f"background:#27ae60;color:#fff;font-size:.9em;cursor:pointer;'>"
+            f"📅 alle {len(recommendations[:10])} Empfehlungen annehmen "
+            f"(~{total_n} Aufnahmen)</button>"
+            f"</p>")
         out.append("<ul style='line-height:1.8;font-size:.9em;list-style:none;"
                    "padding-left:0'>")
         for i, r in enumerate(recommendations[:10]):
@@ -3138,6 +3152,44 @@ document.querySelectorAll('.plan-btn').forEach(btn => {
     }
   });
 });
+
+// "Alle Empfehlungen annehmen" — fires every plan-btn in order and
+// aggregates results into a single summary. Sequential (not parallel)
+// because tvh autorec writes are not lock-free and back-to-back
+// concurrent requests can drop entries.
+const planAllBtn = document.getElementById('plan-all-btn');
+if (planAllBtn) {
+  planAllBtn.addEventListener('click', async () => {
+    const btns = Array.from(document.querySelectorAll('.plan-btn:not([disabled])'));
+    if (!btns.length) return;
+    if (!confirm(`Plane ALLE ${btns.length} Empfehlungen?\n\nFür jede wird tvheadend nach kommenden EPG-Terminen gesucht und neue DVR-Einträge angelegt. Konflikte werden gemeldet.`)) return;
+    planAllBtn.disabled = true;
+    const orig = planAllBtn.textContent;
+    let okN = 0, failN = 0, plannedTotal = 0, skippedTotal = 0;
+    for (let i = 0; i < btns.length; i++) {
+      planAllBtn.textContent = `läuft ${i+1}/${btns.length} …`;
+      const btn = btns[i];
+      const kind = btn.dataset.kind, key = btn.dataset.key, n = parseInt(btn.dataset.n);
+      btn.disabled = true; btn.textContent = '…';
+      try {
+        const r = await fetch('/api/learning/plan', {
+          method: 'POST', headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({kind, key, n})
+        });
+        const d = await r.json();
+        if (!d.ok) throw new Error(d.error || 'unknown');
+        plannedTotal += d.planned.length;
+        skippedTotal += d.skipped.length;
+        btn.textContent = '✓ ' + d.planned.length + '/' + n;
+        okN++;
+      } catch (e) {
+        btn.textContent = '✗ ' + e.message.slice(0, 20);
+        failN++;
+      }
+    }
+    planAllBtn.textContent = `${okN} ok · ${failN} err · ${plannedTotal} geplant · ${skippedTotal} übersprungen`;
+  });
+}
 </script>""")
 
     # ── Show-Fingerprint section ──────────────────────────────────
