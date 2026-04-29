@@ -6371,6 +6371,17 @@ def recordings_page():
     for e in data.get("entries", []):
         ar = e.get("autorec") or ""
         by_autorec.setdefault(ar, []).append(e)
+    # The 3 next-to-start scheduled recordings get a "⏰ als nächstes"
+    # badge so the user can see at a glance what's coming up next
+    # without scanning through all the future entries (sorted
+    # newest-first puts the FURTHEST-future stuff at the top, so the
+    # imminent ones can sit anywhere depending on schedule density).
+    upcoming = sorted(
+        (e for e in data.get("entries", [])
+         if e.get("sched_status") in ("scheduled", "recording")
+         and (e.get("start") or 0) > now_ts),
+        key=lambda e: e.get("start") or 0)[:3]
+    next_up_uuids = {e["uuid"]: i for i, e in enumerate(upcoming)}
 
     # Track the first is_now-or-earlier row so JS can scroll to it on
     # load (newest-first sort puts FUTURE scheduled stuff at the top;
@@ -6504,6 +6515,23 @@ def recordings_page():
             status_cell = ('<span class="badge scheduled" '
                            'title="Sendung wird zur geplanten Zeit aufgenommen">⏱ geplant</span>')
             row_status = "scheduled"
+        # Mark the next 3 imminent scheduled recordings with a "next-up"
+        # badge + countdown. JS at the bottom of the page refreshes the
+        # countdown text every minute so the page stays informative
+        # between auto-reloads.
+        if uuid in next_up_uuids:
+            secs = max(0, start - now_ts)
+            mins = secs // 60
+            if secs < 60:
+                rel = "<1 min"
+            elif mins < 60:
+                rel = f"{mins} min"
+            else:
+                rel = f"{mins // 60}h {mins % 60:02d}m"
+            status_cell += (f' <span class="badge next-up" '
+                            f'data-start="{start}" '
+                            f'title="Startet als nächstes">'
+                            f'⏰ in {rel}</span>')
         # Watched-button only makes sense for completed recordings —
         # marking a scheduled (not-yet-recorded) episode as "watched"
         # is nonsensical and the green-check next to a "—" size cell
@@ -6718,6 +6746,9 @@ def recordings_page():
             f".badge.warming{{background:#f39c12;color:#fff}}"
             f".badge.pending{{background:var(--stripe);color:var(--muted)}}"
             f".badge.failed{{background:#7f1d1d;color:#fecaca}}"
+            f".badge.next-up{{background:#1e3a8a;color:#dbeafe}}"
+            f"tr:has(.badge.next-up){{outline:1px solid #2563eb;"
+            f"outline-offset:-1px}}"
             f".badge.scanning{{background:#8e44ad;color:#fff;"
             f"animation:scanpulse 1.2s ease-in-out infinite}}"
             f".badge.ads-edited{{background:#16a085;color:#fff}}"
@@ -6820,6 +6851,24 @@ def recordings_page():
             f"<script>"
             f"if(document.querySelector('.badge.scanning,.badge.warming,.badge.live'))"
             f"  setTimeout(()=>location.reload(),15000);"
+            # Live countdown for the .next-up badges — refreshed every
+            # minute so users see "in 4 min" → "in 3 min" without
+            # waiting for the full page reload (15s loop only fires
+            # when there's active live/scanning/warming content).
+            f"(function(){{"
+            f"  function refresh(){{"
+            f"    const now=Date.now()/1000;"
+            f"    document.querySelectorAll('.badge.next-up[data-start]').forEach(b=>{{"
+            f"      const secs=Math.max(0,parseInt(b.dataset.start)-now);"
+            f"      const m=Math.floor(secs/60);"
+            f"      b.textContent=secs<60?'⏰ in <1 min':"
+            f"        m<60?'⏰ in '+m+' min':"
+            f"        '⏰ in '+Math.floor(m/60)+'h '+("
+            f"        String(m%60).padStart(2,'0'))+'m';"
+            f"    }});"
+            f"  }}"
+            f"  setInterval(refresh,60000);refresh();"
+            f"}})();"
             # Status filter — multi-select checkboxes hide rows whose
             # data-status isn't in the selected set. State persists per
             # tab via localStorage so the filter survives reloads + the
