@@ -2297,10 +2297,24 @@ def _render_per_show_iou_trend():
                 f"<circle cx='{xs[-1]}' cy='{ys[-1]}' r='3' fill='{color}'/>"
                 f"</svg>")
 
+    def _confidence(n):
+        """Three-tier sample-size ampel for the per-show IoU mean.
+        N=1 → mean is a single point, useless for trend judgement.
+        N=2-4 → thin, can move ±15 IoU on next episode.
+        N≥5 → robust, mean stable to ±5 within a recurring show.
+        """
+        if n >= 5:
+            return ("🟢", "robust", "#27ae60")
+        if n >= 2:
+            return ("🟡", "dünn", "#f39c12")
+        return ("🔴", "einzeln", "#e74c3c")
+
     out = ["<h2>Per-Show IoU-Verlauf</h2>",
            "<p class='muted'>letzte 12 Snapshots pro Sendung — sortiert nach "
            "aktueller IoU aufsteigend (Problemkinder oben). Y-Achse: 0 unten, "
-           "1 oben; gestrichelte Linie = 0.5.</p>",
+           "1 oben; gestrichelte Linie = 0.5. Ampel = Stichprobengröße: "
+           "🟢 ≥5 Episoden (robust), 🟡 2-4 (dünn), 🔴 1 (einzeln, IoU "
+           "spiegelt nur diese eine Aufnahme).</p>",
            "<table style='font-size:0.9em'>",
            "<tr><th>Show</th><th>n</th><th>IoU jetzt</th><th>Δ vs erste</th>"
            "<th>Trend (letzte 12)</th></tr>"]
@@ -2310,7 +2324,9 @@ def _render_per_show_iou_trend():
         delta = last - first
         delta_str = f"<span style='color:{('#27ae60' if delta>0.01 else '#e74c3c' if delta<-0.01 else 'var(--muted)')}'>{delta:+.2f}</span>"
         n_recs = pts[-1][2]
-        out.append(f"<tr><td>{show}</td><td>{n_recs}</td>"
+        emoji, label, _ = _confidence(n_recs)
+        out.append(f"<tr><td>{show}</td>"
+                   f"<td title='{label}'>{emoji} {n_recs}</td>"
                    f"<td>{last*100:.0f}%</td><td>{delta_str}</td>"
                    f"<td>{_sparkline(pts[-12:])}</td></tr>")
     out.append("</table>")
