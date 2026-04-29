@@ -2805,7 +2805,14 @@ def learning_page():
     def _section(title, default_open=False):
         if _section_open[0]:
             out.append("</details>")
-        out.append(f"<details class='section'{' open' if default_open else ''}>")
+        # Stable id from title — used by the localStorage script below
+        # to persist open/closed state across page reloads. Strip
+        # parenthesised numbers (e.g. "Show-Fingerprints (15)") so the
+        # id doesn't shift when the count changes.
+        clean = re.sub(r"\s*\(.*?\)", "", title)
+        sid = re.sub(r"[^a-z0-9]+", "-", clean.lower()).strip("-")
+        out.append(f"<details class='section' id='sec-{sid}' "
+                   f"data-default-open='{int(default_open)}'>")
         out.append(f"<summary><h2>{title}</h2></summary>")
         _section_open[0] = True
 
@@ -3238,6 +3245,25 @@ document.getElementById('fp-val-btn').addEventListener('click', async (ev) => {
 
     if _section_open[0]:
         out.append("</details>")
+    # Persist <details> open/closed across page reloads via
+    # localStorage. Read state on DOMContentLoaded; intercept each
+    # toggle event to save. Defaults from data-default-open survive
+    # only if no entry exists for that id yet (= first visit).
+    out.append("""<script>
+      (function() {
+        const KEY = 'learning-section-state';
+        let saved = {};
+        try { saved = JSON.parse(localStorage.getItem(KEY) || '{}'); } catch(_) {}
+        document.querySelectorAll('details.section').forEach(d => {
+          const id = d.id;
+          if (id in saved) d.open = !!saved[id];
+          d.addEventListener('toggle', () => {
+            saved[id] = d.open;
+            try { localStorage.setItem(KEY, JSON.stringify(saved)); } catch(_) {}
+          });
+        });
+      })();
+    </script>""")
     out.append("</body></html>")
     return Response("\n".join(out), mimetype="text/html")
 
