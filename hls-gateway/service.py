@@ -7313,6 +7313,24 @@ def _rec_probe_total_segments(src_url):
         return 0
 
 
+def _is_recording_in_progress(uuid):
+    """Return True if tvheadend's DVR entry for uuid currently has
+    sched_status='recording' (= file is still being written). Used as
+    a guard so HLS-remux + ad-detect don't run against a partial .ts.
+    Best-effort: returns False on tvh API error so we don't block all
+    work if the API hiccups.
+    """
+    try:
+        data = json.loads(urllib.request.urlopen(
+            f"{TVH_BASE}/api/dvr/entry/grid?limit=500", timeout=5).read())
+        for e in data.get("entries", []):
+            if e.get("uuid") == uuid:
+                return e.get("sched_status") == "recording"
+    except Exception:
+        pass
+    return False
+
+
 def _rec_hls_spawn(uuid):
     """Trigger HLS remux. With HLS_OFFLOAD=mac, drops a `.hls-requested`
     marker for the Mac daemon to pick up over HTTP and POST back the
@@ -7323,7 +7341,20 @@ def _rec_hls_spawn(uuid):
     Without HLS_OFFLOAD, this is the same in-process ffmpeg spawn as
     before — the actual local-spawn implementation is in
     `_rec_hls_spawn_local`, separated only for the offload-path
-    fallback re-call."""
+    fallback re-call.
+
+    Guards against in-progress recordings: if the DVR entry is still
+    being written (sched_status='recording'), returns immediately
+    without dropping the marker. The caller (player progress poll,
+    prewarm cycle, recording_hls VOD endpoint) can re-call later when
+    the recording actually completed; until then the playlist file
+    just doesn't exist and the player keeps polling. Was the cause of
+    the 'recording finalised short of real length' bug — Mac would
+    HTTP-fetch /source while tvh was still flushing the trailing GOP
+    and remux only the bytes that had landed at request time.
+    """
+    if _is_recording_in_progress(uuid):
+        return HLS_DIR / f"_rec_{uuid}" / "index.m3u8"
     out_dir = HLS_DIR / f"_rec_{uuid}"
     playlist = out_dir / "index.m3u8"
     with _rec_hls_lock:
