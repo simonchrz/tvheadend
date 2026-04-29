@@ -6653,11 +6653,31 @@ def recordings_page():
             f'alt="{ep_ch_name}" title="{ep_ch_name}" loading="lazy">'
             if ep_ch_logo_src else ''
         )
+        # Next-up hint shown collapsed in the summary so the user
+        # doesn't have to expand a series to see when the next
+        # episode airs. Picks the earliest still-future episode.
+        next_ep = min(
+            (e for e in eps if (e.get("start") or 0) > now_ts),
+            key=lambda e: e["start"], default=None)
+        next_html = ""
+        if next_ep:
+            t = next_ep["start"]
+            sd = time.strftime("%d.%m %H:%M", time.localtime(t))
+            mins = (t - now_ts) // 60
+            if mins < 60:
+                rel = f"in {mins} min"
+            elif mins < 24*60:
+                rel = f"in {mins // 60}h {mins % 60:02d}m"
+            else:
+                rel = f"in {mins // (24*60)}T"
+            next_html = (f' <small class="series-next" '
+                         f'title="nächste Folge: {sd}">'
+                         f'· nächste {sd} ({rel})</small>')
         summary = (f'<tr class="series-head"><td colspan="5">'
                    f'<details data-ar="{ar_uuid}"{open_attr}>'
                    f'<summary>{ch_logo_html}{poster_html}{badge}'
                    f'<span class="series-title">{group_title}'
-                   f' <small>({len(eps)})</small></span>'
+                   f' <small>({len(eps)})</small>{next_html}</span>'
                    f'{rating_html}{kill_btn}</summary>'
                    f'<table class="series-sub"><tbody>'
                    + "".join(_render_row(e, in_series=True) for e in sorted(
