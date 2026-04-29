@@ -2821,19 +2821,6 @@ def learning_page():
         _section("Verlauf", default_open=True)
         out.append(_render_history_chart(history))
 
-    # Per-show IoU trend (one sparkline per show, sorted by current IoU
-    # ascending so problem-shows surface at the top). Sourced from
-    # head.per-show-iou.jsonl which is appended after each train-head
-    # deploy via /api/internal/snapshot-per-show-iou. The helper
-    # already emits its own <h2> + table; wrap in a section.
-    per_show_html = _render_per_show_iou_trend()
-    if per_show_html:
-        # Strip the <h2> the helper emits — _section will re-add it.
-        per_show_html = per_show_html.replace(
-            "<h2>Per-Show IoU-Verlauf</h2>", "")
-        _section("Per-Show IoU-Verlauf", default_open=True)
-        out.append(per_show_html)
-
     # History table (last 30)
     _section("Modell-Historie (letzte 30 Runs)")
     out.append("<table><tr><th>Zeit</th><th>Train Acc</th><th>Test Acc</th>"
@@ -3133,6 +3120,19 @@ document.querySelectorAll('.plan-btn').forEach(btn => {
     # a button to scan all unreviewed recordings against them. Each
     # match auto-confirms (writes a synthetic ads_user.json) so the
     # recording disappears from the active-learning queue.
+    # Per-show IoU trend (one sparkline per show, sorted by current IoU
+    # ascending so problem-shows surface at the top). Sourced from
+    # head.per-show-iou.jsonl appended after each train-head deploy
+    # via /api/internal/snapshot-per-show-iou. Sits next to the other
+    # show-aggregate sections (Show-Fingerprints, Active-Learning) so
+    # all per-show diagnostics are grouped at the bottom of the page.
+    per_show_html = _render_per_show_iou_trend()
+    if per_show_html:
+        per_show_html = per_show_html.replace(
+            "<h2>Per-Show IoU-Verlauf</h2>", "")
+        _section("Per-Show IoU-Verlauf", default_open=True)
+        out.append(per_show_html)
+
     fingerprints = _compute_show_fingerprints()
     if fingerprints:
         _section(f"Show-Fingerprints ({len(fingerprints)})")
