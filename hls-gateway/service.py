@@ -2382,15 +2382,15 @@ def _render_history_chart(history, width=860, height=280):
     ]
     parts = [f"<svg viewBox='0 0 {width} {height}' "
              f"style='display:block;width:100%;max-width:{width}px;"
-             f"background:#1a1a1a;border-radius:6px;margin-top:6px'>"]
+             f"background:var(--code-bg);border-radius:6px;margin-top:6px'>"]
     # Y-axis grid + percent labels. Both series (IoU and Acc) are in
     # [0,1] internally, so the same axis serves both — series are
     # disambiguated by colour via the legend, not by a second axis.
     for pct in (0, 25, 50, 75, 100):
         y = y_at(pct / 100)
         parts.append(f"<line x1='{pad_l}' y1='{y:.1f}' x2='{width-pad_r}' "
-                     f"y2='{y:.1f}' stroke='#333' stroke-width='0.5'/>")
-        parts.append(f"<text x='{pad_l-5}' y='{y+3:.1f}' fill='#666' "
+                     f"y2='{y:.1f}' stroke='var(--border)' stroke-width='0.5'/>")
+        parts.append(f"<text x='{pad_l-5}' y='{y+3:.1f}' fill='var(--muted)'"
                      f"font-size='10' text-anchor='end'>{pct}%</text>")
     # X-axis: tick every ~10 runs with date label
     step = max(1, n // 6)
@@ -2399,8 +2399,8 @@ def _render_history_chart(history, width=860, height=280):
         label = ts[4:8] if len(ts) >= 8 else ts  # MMDD slice from YYYYMMDD
         x = x_at(i)
         parts.append(f"<line x1='{x:.1f}' y1='{pad_t}' x2='{x:.1f}' "
-                     f"y2='{height-pad_b}' stroke='#2a2a2a' stroke-width='0.5'/>")
-        parts.append(f"<text x='{x:.1f}' y='{height-8}' fill='#666' "
+                     f"y2='{height-pad_b}' stroke='var(--border)' stroke-width='0.5'/>")
+        parts.append(f"<text x='{x:.1f}' y='{height-8}' fill='var(--muted)'"
                      f"font-size='10' text-anchor='middle'>{label}</text>")
     # All-time min/max horizontal references per series (computed
     # from the FULL history, not just the visible window — gives a
@@ -2448,13 +2448,13 @@ def _render_history_chart(history, width=860, height=280):
     # in-plot legend always collides). Footnote BELOW the SVG so it
     # can't collide with the X-axis date labels at the right edge.
     legend = ["<div style='display:flex;gap:14px;font-size:.8em;"
-              "margin-top:6px;color:#aaa;align-items:center'>"]
+              "margin-top:6px;color:var(--fg);align-items:center'>"]
     for key, color, label in series:
         legend.append(f"<span><span style='display:inline-block;"
                       f"width:10px;height:10px;border-radius:5px;"
                       f"background:{color};vertical-align:middle;"
                       f"margin-right:4px'></span>{label}</span>")
-    legend.append(f"<span style='margin-left:auto;color:#777;font-size:.85em'>"
+    legend.append(f"<span style='margin-left:auto;color:var(--muted);font-size:.85em'>"
                   f"○ rejected · ● deployed · {n} runs</span>")
     legend.append("</div>")
     return "".join(legend) + "".join(parts)
@@ -2948,10 +2948,11 @@ def learning_page():
         rows.append((len(files), slug, files))
     rows.sort(key=lambda r: (r[0] > 0, r[0]))  # empty first, then ascending
     out.append("<style>"
-               ".bm-row{margin:8px 0;padding:8px;background:#222;border-radius:4px}"
+               ".bm-row{margin:8px 0;padding:8px;background:var(--stripe);"
+               "border-radius:4px}"
                ".bm-head{display:flex;align-items:baseline;gap:10px;margin-bottom:6px}"
                ".bm-slug{font-weight:bold;font-size:1.05em}"
-               ".bm-count{color:#888;font-size:.9em}"
+               ".bm-count{color:var(--muted);font-size:.9em}"
                ".bm-status{margin-left:auto;font-size:.9em}"
                ".bm-thumbs{display:flex;flex-wrap:wrap;gap:6px}"
                ".bm-thumb{position:relative;width:120px;border-radius:3px;overflow:hidden}"
@@ -2960,7 +2961,7 @@ def learning_page():
                "border:none;background:rgba(0,0,0,.7);color:#fff;cursor:pointer;"
                "border-radius:50%;font-size:14px;line-height:18px;padding:0}"
                ".bm-del:hover{background:#e74c3c}"
-               ".bm-name{font-size:.7em;color:#888;padding:3px;"
+               ".bm-name{font-size:.7em;color:var(--muted);padding:3px;"
                "white-space:nowrap;overflow:hidden;text-overflow:ellipsis}"
                "</style>")
     for n, slug, files in rows:
