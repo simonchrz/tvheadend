@@ -2333,6 +2333,31 @@ def _render_per_show_iou_trend():
     return "\n".join(out)
 
 
+def _render_status_filter(counts):
+    """Render the /recordings status-filter checkbox row. Skips
+    statuses with count==0 so empty filters don't add visual noise.
+    Each label includes a (N) badge showing the row count."""
+    items = [("live",      "● live"),
+             ("warming",   "⏳ remux"),
+             ("playable",  "▶ abspielbar"),
+             ("pending",   "◌ ausstehend"),
+             ("failed",    "⚠ fehlgeschlagen"),
+             ("scheduled", "⏱ geplant")]
+    out = []
+    for key, label in items:
+        n = counts.get(key, 0)
+        if n == 0:
+            continue
+        out.append(f"<label><input type='checkbox' value='{key}' checked>"
+                   f"{label} <span class='cnt'>({n})</span></label>")
+    if counts.get("unedited", 0) > 0:
+        out.append(f"<label style='margin-left:14px;border-style:dashed'>"
+                   f"<input type='checkbox' value='unedited-only'>"
+                   f"nur unbearbeitete "
+                   f"<span class='cnt'>({counts['unedited']})</span></label>")
+    return "".join(out)
+
+
 def _render_history_chart(history, width=860, height=280):
     """Inline SVG line-chart of train_acc / test_acc / test_iou over
     the run history. No external deps — scales sharp at any size,
@@ -6300,6 +6325,11 @@ def recordings_page():
     # the user's actual focus is the first row that's either currently
     # recording or already done — that's "today's section").
     now_anchor_set = {"hit": False}
+    # Per-status row counter — fills in during _render_row, used by
+    # the filter UI to show "(N)" next to each checkbox label.
+    status_counts = {"live": 0, "warming": 0, "playable": 0,
+                     "pending": 0, "failed": 0, "scheduled": 0,
+                     "unedited": 0}
 
     def _render_row(e, in_series=False):
         uuid = e.get("uuid", "")
@@ -6467,7 +6497,11 @@ def recordings_page():
         # Edited recordings (user adjusted ad cutlist) are a meaningful
         # secondary classification — the filter UI lets you show only
         # un-edited rows (= remaining review backlog).
-        edited_attr = ' data-edited="1"' if (HLS_DIR / f"_rec_{uuid}" / "ads_user.json").exists() else ''
+        is_edited = (HLS_DIR / f"_rec_{uuid}" / "ads_user.json").exists()
+        edited_attr = ' data-edited="1"' if is_edited else ''
+        status_counts[row_status] = status_counts.get(row_status, 0) + 1
+        if not is_edited:
+            status_counts["unedited"] += 1
         if in_series:
             return (f'<tr{anchor_attr} data-status="{row_status}"{edited_attr}>'
                     f'<td>{status_cell}</td>'
@@ -6699,21 +6733,27 @@ def recordings_page():
             f".rec-filter label:has(input:checked){{background:var(--code-bg);"
             f"border-color:var(--link);color:var(--link)}}"
             f".rec-filter input{{margin:0}}"
+            f".rec-filter .cnt{{color:var(--muted);font-size:.85em}}"
+            f".series-toggle{{padding:3px 10px;border:1px solid var(--border);"
+            f"border-radius:12px;background:var(--stripe);color:var(--fg);"
+            f"font-size:.85em;cursor:pointer;font-family:inherit}}"
+            f".series-toggle:hover{{background:var(--code-bg);"
+            f"border-color:var(--link);color:var(--link)}}"
             f"tr.row-hidden{{display:none}}"
             f"</style></head><body>"
             f"<div class='rec-header'>"
             f"<a class='home-link' href='{HOST_URL}/'>"
             f"<span class='arrow'>←</span><h1>Aufnahmen</h1></a>"
             f"</div>"
+            # Filter labels — only render statuses with ≥1 row, otherwise
+            # the "fehlgeschlagen (0)" pill is just visual noise.
             f"<div class='rec-filter' id='rec-filter'>"
-            f"<label><input type='checkbox' value='live' checked>● live</label>"
-            f"<label><input type='checkbox' value='warming' checked>⏳ remux</label>"
-            f"<label><input type='checkbox' value='playable' checked>▶ abspielbar</label>"
-            f"<label><input type='checkbox' value='pending' checked>◌ ausstehend</label>"
-            f"<label><input type='checkbox' value='failed' checked>⚠ fehlgeschlagen</label>"
-            f"<label><input type='checkbox' value='scheduled' checked>⏱ geplant</label>"
-            f"<label style='margin-left:14px;border-style:dashed'>"
-            f"<input type='checkbox' value='unedited-only'>nur unbearbeitete</label>"
+            f"{_render_status_filter(status_counts)}"
+            f"<button id='series-expand' class='series-toggle' "
+            f"style='margin-left:14px' title='Alle Serien aufklappen'>"
+            f"➕ alle</button>"
+            f"<button id='series-collapse' class='series-toggle' "
+            f"title='Alle Serien zuklappen'>➖ alle</button>"
             f"</div>"
             f"{_learning_health_banner()}"
             f"<div class='rec-body'>"
@@ -6751,6 +6791,14 @@ def recordings_page():
             f"        &&(!editedOnly||tr.dataset.edited!=='1');"
             f"      tr.classList.toggle('row-hidden',!ok);"
             f"    }});"
+            # Hide series wrappers whose every episode row is now
+            # filtered out — otherwise the user sees an empty Show
+            # title with a (5) badge but no episodes inside.
+            f"    document.querySelectorAll('tr.series-head').forEach(head=>{{"
+            f"      const visible=head.querySelector("
+            f"        'tr[data-status]:not(.row-hidden)');"
+            f"      head.classList.toggle('row-hidden',!visible);"
+            f"    }});"
             f"  }}"
             f"  cbs.forEach(cb=>cb.addEventListener('change',()=>{{"
             f"    saved[cb.value]=cb.checked;"
@@ -6759,6 +6807,27 @@ def recordings_page():
             f"    apply();"
             f"  }}));"
             f"  apply();"
+            f"}})();"
+            # Expand-all / Collapse-all series buttons. Updates the
+            # localStorage saved-state map so the choice persists
+            # through the auto-reload (otherwise the next reload
+            # would snap individual series back to their default).
+            f"(function(){{"
+            f"  const KEY='rec-series-open';"
+            f"  function setAll(open){{"
+            f"    let saved={{}};"
+            f"    try{{saved=JSON.parse(localStorage.getItem(KEY)||'{{}}');}}"
+            f"    catch(e){{}}"
+            f"    document.querySelectorAll('details[data-ar]').forEach(d=>{{"
+            f"      d.open=open;saved[d.dataset.ar]=open;"
+            f"    }});"
+            f"    try{{localStorage.setItem(KEY,JSON.stringify(saved));}}"
+            f"    catch(e){{}}"
+            f"  }}"
+            f"  const eb=document.getElementById('series-expand');"
+            f"  const cb=document.getElementById('series-collapse');"
+            f"  if(eb)eb.addEventListener('click',()=>setAll(true));"
+            f"  if(cb)cb.addEventListener('click',()=>setAll(false));"
             f"}})();"
             # Persist <details> open/closed state per series across reloads.
             # Key by autorec uuid (data-ar). User toggles win over the
