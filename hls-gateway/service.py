@@ -6361,10 +6361,23 @@ def recordings_page():
             mac_scanning = (mac_active and not pi_cskip_running
                             and has_endlist and not has_txt)
 
-            if playlist.exists() and not pi_remux_running and not mac_remuxing:
+            # Tvheadend-side failure: "completedError" means tvh never
+            # produced a usable file — typically "Time missed" (tuner
+            # didn't tune in time, EPG drift, signal glitch) or
+            # "File missing" (write target unreachable). Show this
+            # before the remux ladder so the user sees WHY there's
+            # nothing to play, instead of a perpetual "ausstehend".
+            if sched == "completedError":
+                tvh_msg = status or "fehlgeschlagen"
+                status_cell = (f'<span class="badge failed" '
+                               f'title="tvheadend: {tvh_msg}">'
+                               f'⚠ Aufnahme fehlgeschlagen</span>')
+                row_status = "failed"
+            elif playlist.exists() and not pi_remux_running and not mac_remuxing:
                 # Ready to stream → play button.
                 status_cell = (f'<a class="badge play-btn" href="{play_url}" '
                                f'title="Abspielen">▶ abspielen</a>')
+                row_status = "playable"
             elif pi_remux_running:
                 total = (proc_info or {}).get("total_segs", 0)
                 segs = 0
@@ -6374,12 +6387,15 @@ def recordings_page():
                 pct = (int(segs * 100 / total) if total > 0 else 0)
                 status_cell = (f'<span class="badge warming" '
                                f'title="Remux läuft">⏳ {pct}%</span>')
+                row_status = "warming"
             elif mac_remuxing:
                 status_cell = ('<span class="badge warming" '
                                'title="Mac remuxt">⏳ Mac</span>')
+                row_status = "warming"
             else:
                 status_cell = ('<span class="badge pending" '
                                'title="noch nicht remuxt">◌ ausstehend</span>')
+                row_status = "pending"
             if pi_cskip_running:
                 status_cell += (' <span class="badge scanning" '
                                 'title="comskip analysiert Werbeblöcke">🔍</span>')
@@ -6401,9 +6417,11 @@ def recordings_page():
         elif is_live:
             status_cell = (f'<a class="badge live" href="{play_url}" '
                            f'title="Live ansehen">● live</a>')
+            row_status = "live"
         else:
             status_cell = ('<span class="badge scheduled" '
                            'title="Sendung wird zur geplanten Zeit aufgenommen">⏱ geplant</span>')
+            row_status = "scheduled"
         # Watched-button only makes sense for completed recordings —
         # marking a scheduled (not-yet-recorded) episode as "watched"
         # is nonsensical and the green-check next to a "—" size cell
@@ -6446,12 +6464,18 @@ def recordings_page():
         if (is_done or is_live) and not now_anchor_set["hit"]:
             anchor_attr = ' id="now-anchor"'
             now_anchor_set["hit"] = True
+        # Edited recordings (user adjusted ad cutlist) are a meaningful
+        # secondary classification — the filter UI lets you show only
+        # un-edited rows (= remaining review backlog).
+        edited_attr = ' data-edited="1"' if (HLS_DIR / f"_rec_{uuid}" / "ads_user.json").exists() else ''
         if in_series:
-            return (f'<tr{anchor_attr}><td>{status_cell}</td>'
+            return (f'<tr{anchor_attr} data-status="{row_status}"{edited_attr}>'
+                    f'<td>{status_cell}</td>'
                     f'<td>{when}</td>'
                     f'<td>{dur_min} min</td>'
                     f'{tools_cell}</tr>')
-        return (f'<tr{anchor_attr}><td>{status_cell}</td>'
+        return (f'<tr{anchor_attr} data-status="{row_status}"{edited_attr}>'
+                f'<td>{status_cell}</td>'
                 f'<td>{title_cell}</td>'
                 f'<td>{when}</td>'
                 f'<td>{dur_min} min</td>'
@@ -6603,6 +6627,7 @@ def recordings_page():
             f".badge.ready{{background:#2980b9;color:#fff}}"
             f".badge.warming{{background:#f39c12;color:#fff}}"
             f".badge.pending{{background:var(--stripe);color:var(--muted)}}"
+            f".badge.failed{{background:#7f1d1d;color:#fecaca}}"
             f".badge.scanning{{background:#8e44ad;color:#fff;"
             f"animation:scanpulse 1.2s ease-in-out infinite}}"
             f".badge.ads-edited{{background:#16a085;color:#fff}}"
@@ -6664,10 +6689,31 @@ def recordings_page():
             f"tr.series-head .series-kill:hover{{color:#e74c3c}}"
             f"table.series-sub{{width:100%;border-collapse:collapse}}"
             f"table.series-sub td{{padding:4px 8px}}"
+            f"<style>"
+            f".rec-filter{{display:flex;flex-wrap:wrap;gap:6px;margin:8px 12px;"
+            f"font-size:.85em}}"
+            f".rec-filter label{{display:inline-flex;align-items:center;"
+            f"gap:4px;padding:3px 8px;border:1px solid var(--border);"
+            f"border-radius:12px;cursor:pointer;background:var(--stripe);"
+            f"user-select:none}}"
+            f".rec-filter label:has(input:checked){{background:var(--code-bg);"
+            f"border-color:var(--link);color:var(--link)}}"
+            f".rec-filter input{{margin:0}}"
+            f"tr.row-hidden{{display:none}}"
             f"</style></head><body>"
             f"<div class='rec-header'>"
             f"<a class='home-link' href='{HOST_URL}/'>"
             f"<span class='arrow'>←</span><h1>Aufnahmen</h1></a>"
+            f"</div>"
+            f"<div class='rec-filter' id='rec-filter'>"
+            f"<label><input type='checkbox' value='live' checked>● live</label>"
+            f"<label><input type='checkbox' value='warming' checked>⏳ remux</label>"
+            f"<label><input type='checkbox' value='playable' checked>▶ abspielbar</label>"
+            f"<label><input type='checkbox' value='pending' checked>◌ ausstehend</label>"
+            f"<label><input type='checkbox' value='failed' checked>⚠ fehlgeschlagen</label>"
+            f"<label><input type='checkbox' value='scheduled' checked>⏱ geplant</label>"
+            f"<label style='margin-left:14px;border-style:dashed'>"
+            f"<input type='checkbox' value='unedited-only'>nur unbearbeitete</label>"
             f"</div>"
             f"{_learning_health_banner()}"
             f"<div class='rec-body'>"
@@ -6678,6 +6724,42 @@ def recordings_page():
             f"<script>"
             f"if(document.querySelector('.badge.scanning,.badge.warming,.badge.live'))"
             f"  setTimeout(()=>location.reload(),15000);"
+            # Status filter — multi-select checkboxes hide rows whose
+            # data-status isn't in the selected set. State persists per
+            # tab via localStorage so the filter survives reloads + the
+            # 15s auto-reload above.
+            f"(function(){{"
+            f"  const KEY='rec-status-filter';"
+            f"  const box=document.getElementById('rec-filter');"
+            f"  if(!box)return;"
+            f"  const cbs=box.querySelectorAll('input[type=checkbox]');"
+            f"  let saved={{}};"
+            f"  try{{saved=JSON.parse(localStorage.getItem(KEY)||'{{}}');}}"
+            f"  catch(e){{}}"
+            f"  cbs.forEach(cb=>{{"
+            f"    if(cb.value in saved)cb.checked=!!saved[cb.value];"
+            f"  }});"
+            f"  function apply(){{"
+            f"    const allowed=new Set();"
+            f"    let editedOnly=false;"
+            f"    cbs.forEach(cb=>{{"
+            f"      if(cb.value==='unedited-only')editedOnly=cb.checked;"
+            f"      else if(cb.checked)allowed.add(cb.value);"
+            f"    }});"
+            f"    document.querySelectorAll('tr[data-status]').forEach(tr=>{{"
+            f"      const ok=allowed.has(tr.dataset.status)"
+            f"        &&(!editedOnly||tr.dataset.edited!=='1');"
+            f"      tr.classList.toggle('row-hidden',!ok);"
+            f"    }});"
+            f"  }}"
+            f"  cbs.forEach(cb=>cb.addEventListener('change',()=>{{"
+            f"    saved[cb.value]=cb.checked;"
+            f"    try{{localStorage.setItem(KEY,JSON.stringify(saved));}}"
+            f"    catch(e){{}}"
+            f"    apply();"
+            f"  }}));"
+            f"  apply();"
+            f"}})();"
             # Persist <details> open/closed state per series across reloads.
             # Key by autorec uuid (data-ar). User toggles win over the
             # server-default 'open if any episode active'.
