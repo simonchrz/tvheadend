@@ -9321,12 +9321,36 @@ def api_recording_bumper_capture(uuid):
     note = ""
     if skipped:
         note = f", skipped {len(skipped)} oversized (likely show)"
+    n_invalidated = _invalidate_detect_for_channel(slug)
     print(f"[bumper-capture {uuid[:8]}] {slug}: {len(files)} frames "
-          f"in [{s:.1f}, {e:.1f}]s{note}", flush=True)
+          f"in [{s:.1f}, {e:.1f}]s{note} — invalidated "
+          f"{n_invalidated} recording(s) for re-detect", flush=True)
     return _cors(Response(json.dumps({
         "ok": True, "slug": slug, "count": len(files), "files": files,
-        "skipped_oversized": skipped}),
+        "skipped_oversized": skipped, "invalidated": n_invalidated}),
         mimetype="application/json"))
+
+
+def _invalidate_detect_for_channel(slug):
+    """Mark every recording of the given channel as detect-pending so
+    the daemon re-runs detection with the new bumper template set.
+    Called after a bumper-template add/delete — old auto-cutlists
+    stale relative to the new templates would persist forever
+    otherwise. Returns count of invalidated recordings.
+    """
+    if not slug or not HLS_DIR.exists():
+        return 0
+    n = 0
+    for d in HLS_DIR.glob("_rec_*"):
+        uuid = d.name[5:]
+        try:
+            if _rec_channel_slug(uuid) != slug:
+                continue
+            (d / ".detect-requested").write_text("")
+            n += 1
+        except Exception:
+            continue
+    return n
 
 
 @app.route("/api/internal/detect-bumpers/<slug>")
@@ -9376,7 +9400,11 @@ def api_bumper_delete(slug, fname):
     except Exception as e:
         return Response(json.dumps({"ok": False, "error": str(e)}),
                         status=500, mimetype="application/json")
-    return _cors(Response(json.dumps({"ok": True}),
+    n_invalidated = _invalidate_detect_for_channel(slug)
+    print(f"[bumper-delete] {slug}/{fname} — invalidated "
+          f"{n_invalidated} recording(s) for re-detect", flush=True)
+    return _cors(Response(json.dumps({"ok": True,
+                                       "invalidated": n_invalidated}),
                             mimetype="application/json"))
 
 
