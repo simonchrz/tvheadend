@@ -8939,6 +8939,21 @@ def api_internal_detect_config(uuid):
         start_ext = float(learned.get("start_lag", 0))
         end_ext   = float(learned.get("sponsor_duration", 0))
     except Exception: pass
+    # Per-show drift overrides per-channel when present (= ≥5 confirmed
+    # episodes of THIS show with consistent drift). RTL Spielfilm needs
+    # +60 s sponsor-tail, RTL GZSZ needs 0 — averaging both as 'rtl'
+    # over-corrects GZSZ. Per-show wins where it has data.
+    if show_title:
+        try:
+            show_learned = json.loads(
+                (HLS_DIR / ".detection_learning_by_show.json").read_text()
+            ).get(show_title, {})
+            if "start_lag" in show_learned:
+                start_ext = float(show_learned["start_lag"])
+            if "sponsor_duration" in show_learned:
+                end_ext = float(show_learned["sponsor_duration"])
+        except Exception:
+            pass
     # Per-show prior wins over per-channel
     p = {}
     if show_title:
@@ -11101,6 +11116,102 @@ def _compute_feedback_stats():
 _feedback_cache = {"data": None, "computed_at": 0}
 _feedback_lock = threading.Lock()
 DETECTION_LEARNING_FILE = HLS_DIR / ".detection_learning.json"
+DETECTION_LEARNING_BY_SHOW_FILE = HLS_DIR / ".detection_learning_by_show.json"
+
+
+def _compute_feedback_stats_by_show():
+    """Same shape as _compute_feedback_stats but keyed by show_title
+    instead of channel slug. Per-show drift can differ a lot from the
+    channel mean — e.g. RTL Spielfilm has +60 s sponsor-tail while RTL
+    GZSZ has 0 s; averaging both as 'rtl' over-corrects GZSZ. Returns
+    {show: {n, matched, mean_dstart_s, mean_dend_s, sample_uuids}}.
+    """
+    stats = {}
+    if not HLS_DIR.exists():
+        return stats
+    for d in HLS_DIR.glob("_rec_*"):
+        uuid = d.name[5:]
+        user_p = d / "ads_user.json"
+        auto_p = d / "ads.json"
+        if not user_p.is_file():
+            continue
+        try:
+            user_raw = json.loads(user_p.read_text())
+            auto_ads = json.loads(auto_p.read_text()) if auto_p.is_file() else []
+        except Exception:
+            continue
+        if isinstance(user_raw, list):
+            user_ads = user_raw
+        elif isinstance(user_raw, dict):
+            user_ads = user_raw.get("ads") or []
+        else:
+            user_ads = []
+        show = _show_title_for_rec(d)
+        if not show:
+            continue
+        s = stats.setdefault(show, {
+            "n": 0, "dstart_sum": 0.0, "dend_sum": 0.0, "matched": 0,
+            "sample_uuids": [],
+        })
+        s["n"] += 1
+        if len(s["sample_uuids"]) < 3:
+            s["sample_uuids"].append(uuid)
+        used = set()
+        for us, ue in user_ads:
+            best = None; best_overlap = 0.0
+            for i, (as_, ae) in enumerate(auto_ads):
+                if i in used:
+                    continue
+                ov = max(0.0, min(ue, ae) - max(us, as_))
+                if ov > best_overlap:
+                    best_overlap = ov; best = i
+            if best is not None and best_overlap > 5.0:
+                used.add(best)
+                as_, ae = auto_ads[best]
+                s["dstart_sum"] += us - as_
+                s["dend_sum"] += ue - ae
+                s["matched"] += 1
+    out = {}
+    for show, s in stats.items():
+        if s["matched"] == 0:
+            continue
+        out[show] = {
+            "n": s["n"], "matched": s["matched"],
+            "mean_dstart_s": round(s["dstart_sum"] / s["matched"], 1),
+            "mean_dend_s":   round(s["dend_sum"]   / s["matched"], 1),
+            "sample_uuids":  s["sample_uuids"],
+        }
+    return out
+
+
+def _persist_detection_learning_by_show(stats):
+    """Same gating as _persist_detection_learning but per-show. Higher
+    sample threshold (5 vs 3) since per-show data is sparser — avoid
+    flip-flopping a show's correction on noisy 3-episode samples.
+    Writes {show: {start_lag, sponsor_duration, sample_n, computed_at}}.
+    """
+    learned = {}
+    for show, s in stats.items():
+        if s.get("matched", 0) < LEARNING_MIN_SAMPLES:
+            continue
+        entry = {}
+        ds = s["mean_dstart_s"]
+        de = s["mean_dend_s"]
+        if ds <= -8:
+            entry["start_lag"] = round(abs(ds), 1)
+        if de >= 8:
+            entry["sponsor_duration"] = round(de, 1)
+        if entry:
+            entry["sample_n"] = s["matched"]
+            entry["computed_at"] = int(time.time())
+            learned[show] = entry
+    try:
+        tmp = DETECTION_LEARNING_BY_SHOW_FILE.with_suffix(".tmp")
+        tmp.write_text(json.dumps(learned, indent=2))
+        tmp.replace(DETECTION_LEARNING_BY_SHOW_FILE)
+    except Exception as e:
+        print(f"[learning persist by-show]: {e}", flush=True)
+    return learned
 BLOCK_LENGTH_PRIOR_FILE = HLS_DIR / ".block_length_prior.json"
 BLOCK_LENGTH_PRIOR_BY_SHOW_FILE = HLS_DIR / ".block_length_prior_by_show.json"
 
@@ -11513,6 +11624,15 @@ def _get_feedback_stats(max_age_s=300):
                 _feedback_cache["data"] = stats
                 _feedback_cache["computed_at"] = time.time()
                 applied = _persist_detection_learning(stats)
+                # Per-show drift learning runs in parallel — same shape,
+                # different keying. Detect-config endpoint prefers the
+                # per-show entry over the per-channel one when both
+                # exist (analog to block-length priors).
+                try:
+                    show_stats = _compute_feedback_stats_by_show()
+                    _persist_detection_learning_by_show(show_stats)
+                except Exception as e:
+                    print(f"[learning by-show] {e}", flush=True)
                 # Block-length priors live in their own file so the
                 # consumer side (tv-detect-rec.sh, tv-live-detect.py)
                 # can read just the channels-with-enough-samples and
