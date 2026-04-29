@@ -2243,6 +2243,80 @@ def usage_stats():
     return {"ranking": rows}
 
 
+def _render_per_show_iou_trend():
+    """Render small per-show IoU sparklines from head.per-show-iou.jsonl.
+
+    Sorted by latest-IoU ascending so the worst shows surface at top
+    (= visual signal of where the model is regressing). Each sparkline
+    is a small SVG (180×40 px) with the most recent N=12 datapoints.
+    Color: green if last IoU > 0.85, orange 0.65-0.85, red < 0.65.
+
+    Returns empty string if no snapshot file exists yet.
+    """
+    p = HLS_DIR / ".tvd-models" / "head.per-show-iou.jsonl"
+    if not p.is_file():
+        return ""
+    series = {}  # show → [(ts, iou_mean, n), ...]
+    try:
+        for ln in p.read_text().splitlines():
+            ln = ln.strip()
+            if not ln:
+                continue
+            r = json.loads(ln)
+            series.setdefault(r["show"], []).append(
+                (r["ts"], float(r["iou_mean"]), int(r.get("n", 0))))
+    except Exception:
+        return ""
+    if not series:
+        return ""
+    # Sort each show's series chronologically.
+    for s in series.values():
+        s.sort(key=lambda x: x[0])
+    # Sort shows by LAST iou ascending (worst first).
+    shows = sorted(series.items(), key=lambda kv: kv[1][-1][1])
+
+    def _sparkline(points, w=180, h=40):
+        if len(points) < 2:
+            return f"<span class='muted'>(nur {len(points)} datenpunkt(e))</span>"
+        ious = [p[1] for p in points]
+        n = len(points)
+        xs = [int(i * (w - 8) / (n - 1)) + 4 for i in range(n)]
+        ys = [int((1 - iou) * (h - 8)) + 4 for iou in ious]  # iou=1 → top
+        path = "M" + " L".join(f"{x},{y}" for x, y in zip(xs, ys))
+        last = ious[-1]
+        if last > 0.85:    color = "#27ae60"
+        elif last > 0.65:  color = "#f39c12"
+        else:              color = "#e74c3c"
+        # 0.5 reference line
+        ref_y = int((1 - 0.5) * (h - 8)) + 4
+        return (f"<svg width='{w}' height='{h}' viewBox='0 0 {w} {h}' "
+                f"style='vertical-align:middle'>"
+                f"<line x1='0' y1='{ref_y}' x2='{w}' y2='{ref_y}' "
+                f"stroke='var(--border)' stroke-dasharray='2,2'/>"
+                f"<path d='{path}' fill='none' stroke='{color}' stroke-width='2'/>"
+                f"<circle cx='{xs[-1]}' cy='{ys[-1]}' r='3' fill='{color}'/>"
+                f"</svg>")
+
+    out = ["<h2>Per-Show IoU-Verlauf</h2>",
+           "<p class='muted'>letzte 12 Snapshots pro Sendung — sortiert nach "
+           "aktueller IoU aufsteigend (Problemkinder oben). Y-Achse: 0 unten, "
+           "1 oben; gestrichelte Linie = 0.5.</p>",
+           "<table style='font-size:0.9em'>",
+           "<tr><th>Show</th><th>n</th><th>IoU jetzt</th><th>Δ vs erste</th>"
+           "<th>Trend (letzte 12)</th></tr>"]
+    for show, pts in shows:
+        last = pts[-1][1]
+        first = pts[0][1]
+        delta = last - first
+        delta_str = f"<span style='color:{('#27ae60' if delta>0.01 else '#e74c3c' if delta<-0.01 else 'var(--muted)')}'>{delta:+.2f}</span>"
+        n_recs = pts[-1][2]
+        out.append(f"<tr><td>{show}</td><td>{n_recs}</td>"
+                   f"<td>{last*100:.0f}%</td><td>{delta_str}</td>"
+                   f"<td>{_sparkline(pts[-12:])}</td></tr>")
+    out.append("</table>")
+    return "\n".join(out)
+
+
 def _render_history_chart(history, width=860, height=280):
     """Inline SVG line-chart of train_acc / test_acc / test_iou over
     the run history. No external deps — scales sharp at any size,
@@ -2698,6 +2772,12 @@ def learning_page():
     if history:
         out.append("<h2>Verlauf</h2>")
         out.append(_render_history_chart(history))
+
+    # Per-show IoU trend (one sparkline per show, sorted by current IoU
+    # ascending so problem-shows surface at the top). Sourced from
+    # head.per-show-iou.jsonl which is appended after each train-head
+    # deploy via /api/internal/snapshot-per-show-iou.
+    out.append(_render_per_show_iou_trend())
 
     # History table (last 30)
     out.append("<h2>Modell-Historie (letzte 30 Runs)</h2>")
@@ -8633,6 +8713,34 @@ def api_internal_live_ads():
                             mimetype="application/json"))
 
 
+@app.route("/api/internal/snapshot-per-show-iou", methods=["POST"])
+def api_internal_snapshot_per_show_iou():
+    """Append one row per show to head.per-show-iou.jsonl with the
+    current Block-IoU (mean across episodes of that show, vs user truth).
+    Called by tv-train-head.sh after a successful deploy so each retrain
+    leaves a measurable trace per show — diagnostic input for the
+    /learning per-show trend chart.
+
+    Optional ?ts=YYYYMMDDTHHMMSS query param overrides 'now'. Returns
+    {ok: true, n_shows: N}.
+    """
+    import datetime as _dt
+    ts = request.args.get("ts") or _dt.datetime.now().strftime("%Y%m%dT%H%M%S")
+    by_show = _compute_per_show_iou()
+    out_path = HLS_DIR / ".tvd-models" / "head.per-show-iou.jsonl"
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with out_path.open("a") as f:
+        for show, agg in sorted(by_show.items()):
+            f.write(json.dumps({
+                "ts": ts,
+                "show": show,
+                "iou_mean": round(agg["mean_iou"], 4),
+                "n": agg["n"],
+            }) + "\n")
+    return _cors(Response(json.dumps({"ok": True, "n_shows": len(by_show), "ts": ts}),
+                          mimetype="application/json"))
+
+
 @app.route("/api/internal/recording-uuids")
 def api_internal_recording_uuids():
     """All currently-valid recording uuids (= those with an actual
@@ -10971,6 +11079,74 @@ def _rec_duration_s(rec_dir):
     except Exception:
         return 0.0
     return dur
+
+
+def _block_iou(a, b):
+    """Block-IoU between two cutlists (lists of [start,end] pairs).
+    Empty/empty = 1.0 (perfect agreement that there are no ads).
+    Empty/non-empty = 0.0. Used by per-show IoU snapshot.
+    """
+    if not a and not b:
+        return 1.0
+    if not a or not b:
+        return 0.0
+    ts = sorted({t for blk in (list(a) + list(b)) for t in blk})
+    inter = unio = 0.0
+    for i in range(len(ts) - 1):
+        s, e = ts[i], ts[i + 1]
+        ina = any(blk[0] <= s < blk[1] for blk in a)
+        inb = any(blk[0] <= s < blk[1] for blk in b)
+        d = e - s
+        if ina and inb: inter += d
+        if ina or inb:  unio += d
+    return (inter / unio) if unio else 1.0
+
+
+def _compute_per_show_iou():
+    """Walk every _rec_*/ads_user.json + ads.json and compute per-show
+    aggregate Block-IoU between user truth and current auto-detect.
+    Used by the per-show IoU trend chart on /learning.
+
+    Returns dict { show_title: {"mean_iou": float, "n": int, "ious": [...]} }.
+    Only edited recordings (ads_user.json present) AND with a NON-stale
+    auto-cutlist (ads.json mtime ≥ head.bin mtime) are counted —
+    otherwise the snapshot would record 0.0 IoU for every recording
+    while a head-update bulk-redetect is in flight (auto.json gets
+    cleared on head update before the new detect lands).
+    """
+    by_show = {}
+    if not HLS_DIR.exists():
+        return {}
+    head_p = HLS_DIR / ".tvd-models" / "head.bin"
+    head_mtime = head_p.stat().st_mtime if head_p.is_file() else 0
+    for d in HLS_DIR.glob("_rec_*"):
+        user_p = d / "ads_user.json"
+        if not user_p.is_file():
+            continue
+        auto_p = d / "ads.json"
+        # Skip stale auto — pending re-detect after the latest head update.
+        if not auto_p.is_file() or auto_p.stat().st_mtime < head_mtime:
+            continue
+        try:
+            user_raw = json.loads(user_p.read_text())
+            user = user_raw if isinstance(user_raw, list) else (user_raw.get("ads", []) or [])
+        except Exception:
+            continue
+        try:
+            auto_raw = json.loads(auto_p.read_text())
+            auto = auto_raw if isinstance(auto_raw, list) else (auto_raw.get("ads", []) or [])
+        except Exception:
+            auto = []
+        show = _show_title_for_rec(d)
+        if not show:
+            continue
+        iou = _block_iou(user, auto)
+        agg = by_show.setdefault(show, {"ious": [], "n": 0})
+        agg["ious"].append(iou)
+        agg["n"] += 1
+    for show, agg in by_show.items():
+        agg["mean_iou"] = sum(agg["ious"]) / len(agg["ious"])
+    return by_show
 
 
 def _aggregate_episodes_by_show():
