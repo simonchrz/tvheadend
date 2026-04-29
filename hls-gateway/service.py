@@ -6494,14 +6494,18 @@ def recordings_page():
         if (is_done or is_live) and not now_anchor_set["hit"]:
             anchor_attr = ' id="now-anchor"'
             now_anchor_set["hit"] = True
-        # Edited recordings (user adjusted ad cutlist) are a meaningful
-        # secondary classification — the filter UI lets you show only
-        # un-edited rows (= remaining review backlog).
-        is_edited = (HLS_DIR / f"_rec_{uuid}" / "ads_user.json").exists()
-        edited_attr = ' data-edited="1"' if is_edited else ''
+        # "Edited" only makes sense for playable rows — scheduled
+        # recordings haven't aired yet, live ones are mid-air. So we
+        # only tag is_edited on playable rows; the "nur unbearbeitete"
+        # filter then targets the actual review backlog (= ready to
+        # play but not yet user-confirmed).
+        edited_attr = ''
+        if row_status == "playable":
+            is_edited = (HLS_DIR / f"_rec_{uuid}" / "ads_user.json").exists()
+            edited_attr = ' data-edited="1"' if is_edited else ' data-edited="0"'
+            if not is_edited:
+                status_counts["unedited"] += 1
         status_counts[row_status] = status_counts.get(row_status, 0) + 1
-        if not is_edited:
-            status_counts["unedited"] += 1
         if in_series:
             return (f'<tr{anchor_attr} data-status="{row_status}"{edited_attr}>'
                     f'<td>{status_cell}</td>'
@@ -6787,8 +6791,11 @@ def recordings_page():
             f"      else if(cb.checked)allowed.add(cb.value);"
             f"    }});"
             f"    document.querySelectorAll('tr[data-status]').forEach(tr=>{{"
-            f"      const ok=allowed.has(tr.dataset.status)"
-            f"        &&(!editedOnly||tr.dataset.edited!=='1');"
+            f"      let ok=allowed.has(tr.dataset.status);"
+            # 'unedited-only' is a sub-filter on playable rows ONLY —
+            # scheduled/live rows naturally have no ads_user.json.
+            f"      if(ok&&editedOnly&&tr.dataset.status==='playable')"
+            f"        ok=tr.dataset.edited==='0';"
             f"      tr.classList.toggle('row-hidden',!ok);"
             f"    }});"
             # Hide series wrappers whose every episode row is now
