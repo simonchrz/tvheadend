@@ -8932,12 +8932,17 @@ def api_internal_detect_config(uuid):
         ).get("channels", {}).get(slug, {})
         smooth_s = float(ch_cfg.get("logo_smooth_s", 0))
     except Exception: pass
+    # Signed drift correction: start_lag (positive = pull start earlier)
+    # vs start_shrink (positive = push start later). Combine into one
+    # signed start_extend_s. Same for end direction.
+    def _signed_drift(d):
+        return (float(d.get("start_lag", 0)) - float(d.get("start_shrink", 0)),
+                float(d.get("sponsor_duration", 0)) - float(d.get("end_shrink", 0)))
     try:
         learned = json.loads(
             (HLS_DIR / ".detection_learning.json").read_text()
         ).get(slug, {})
-        start_ext = float(learned.get("start_lag", 0))
-        end_ext   = float(learned.get("sponsor_duration", 0))
+        start_ext, end_ext = _signed_drift(learned)
     except Exception: pass
     # Per-show drift overrides per-channel when present (= ≥5 confirmed
     # episodes of THIS show with consistent drift). RTL Spielfilm needs
@@ -8948,10 +8953,8 @@ def api_internal_detect_config(uuid):
             show_learned = json.loads(
                 (HLS_DIR / ".detection_learning_by_show.json").read_text()
             ).get(show_title, {})
-            if "start_lag" in show_learned:
-                start_ext = float(show_learned["start_lag"])
-            if "sponsor_duration" in show_learned:
-                end_ext = float(show_learned["sponsor_duration"])
+            if show_learned:
+                start_ext, end_ext = _signed_drift(show_learned)
         except Exception:
             pass
     # Per-show prior wins over per-channel
@@ -11197,10 +11200,16 @@ def _persist_detection_learning_by_show(stats):
         entry = {}
         ds = s["mean_dstart_s"]
         de = s["mean_dend_s"]
+        # Same symmetric handling as the per-channel persist (see
+        # _persist_detection_learning docstring).
         if ds <= -8:
             entry["start_lag"] = round(abs(ds), 1)
+        elif ds >= 8:
+            entry["start_shrink"] = round(ds, 1)
         if de >= 8:
             entry["sponsor_duration"] = round(de, 1)
+        elif de <= -8:
+            entry["end_shrink"] = round(abs(de), 1)
         if entry:
             entry["sample_n"] = s["matched"]
             entry["computed_at"] = int(time.time())
@@ -11587,7 +11596,15 @@ def _persist_detection_learning(stats):
     """Write the auto-applied subset of feedback to a JSON the live
     scanner reads on every scan. Only entries with enough samples and
     a meaningful drift get persisted — conservative threshold to
-    avoid flip-flopping the live constants on early data."""
+    avoid flip-flopping the live constants on early data.
+
+    Symmetric drift handling (signed):
+      mean_dstart ≤ -8 → start_lag    = abs(ds)  (auto too LATE  → pull START earlier)
+      mean_dstart ≥ +8 → start_shrink = ds       (auto too EARLY → push START later)
+      mean_dend   ≥ +8 → sponsor_duration = de   (auto too EARLY → push END later)
+      mean_dend   ≤ -8 → end_shrink   = abs(de)  (auto too LATE  → pull END earlier)
+    detect-config combines them: start_extend_s = start_lag - start_shrink
+    """
     learned = {}
     for slug, s in stats.items():
         if s.get("matched", 0) < LEARNING_MIN_SAMPLES:
@@ -11597,8 +11614,12 @@ def _persist_detection_learning(stats):
         de = s["mean_dend_s"]
         if ds <= -8:
             entry["start_lag"] = round(abs(ds), 1)
+        elif ds >= 8:
+            entry["start_shrink"] = round(ds, 1)
         if de >= 8:
             entry["sponsor_duration"] = round(de, 1)
+        elif de <= -8:
+            entry["end_shrink"] = round(abs(de), 1)
         if entry:
             entry["sample_n"] = s["matched"]
             entry["computed_at"] = int(time.time())
