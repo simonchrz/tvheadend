@@ -81,12 +81,27 @@ strand viewers.
 | `PUT /api/internal/hls-segment/<uuid>/<fname>` | Per-segment HLS upload (no tar parser overhead) |
 | `POST /api/internal/hls-done/<uuid>` | End-of-upload signal (atomic-ish: index.m3u8 sent last, player polls for it) |
 | `POST /api/internal/thumbs-uploaded/<uuid>` | Tar of JPGs (small bundle, ~600 KB) |
-| `POST /api/internal/cutlist-uploaded/<uuid>` | Raw cutlist .txt body |
+| `POST /api/internal/detect-started/<uuid>` | Daemon signals it picked up the job from the pool — gateway tracks in-memory (10-min stale-expiry) so /recordings can render the 🔍 "detect läuft" badge |
+| `POST /api/internal/cutlist-uploaded/<uuid>` | Raw cutlist .txt body — also clears the detect-running entry |
 | `GET /api/internal/detect-config/<uuid>` | Per-job config bundle (slug, show, logo URL, smoothing, boundary extends, block prior) |
 | `GET /api/internal/detect-logo/<slug>` | Per-channel logo template |
 | `GET /api/internal/detect-models/<head.bin\|backbone.onnx>` | Model files for daemon-side caching |
 | `GET /api/internal/recording-uuids` | All known recording UUIDs (Mac daemon uses for hourly source-cache orphan GC) |
 | `POST /api/recording/<uuid>/redetect` | Force a fresh tv-detect pass on this recording (truncates cutlist + writes `.detect-requested` marker) |
+| `POST /api/recording/<uuid>/bumper-capture` | Save a bumper template (start or end). Body: `{start_s, end_s, kind: "start"|"end"}`. Auto-aligns the nearest user-block boundary (±30s) to the captured frame. Channel-wide invalidation triggers re-detect across all recordings of that slug. |
+| `GET /api/internal/detect-bumpers/<slug>` | Returns `{templates: [...end...], start_templates: [...start...]}` — categorised template list for the daemon. End-bumpers from `.tvd-bumpers/<slug>/end/` AND legacy channel-root; start-bumpers from `.tvd-bumpers/<slug>/start/`. |
+
+## /learning page features (added 2026-04-29 / 30)
+
+- **Aktuelle Modell-Werte (Cards)**: Block-IoU, Test-Acc, Train-Acc, Letzter Deploy mit Ampel pro Metrik (🟢/🟡/🔴 nach kalibrierten Schwellen). Drift vs 7-d Median pro IoU. Overfit-Erkennung wenn Train >> Test.
+- **Failure-Mode-Analyse**: pro geprüfter Aufnahme klassifiziert in `good / runaway / washout / missed_bumper / boundary_drift / false_positive / false_negative`. Aggregation per Channel + per Show mit Stacked-Bar — zeigt deterministisch wo welche Optimierung am meisten bringt (Washout-Cluster auf einem Sender = Audio-RMS-Hebel, Missed-Bumper überall = Snap-Window-Tuning).
+- **Show-Lückenerkennung**: surface Shows mit N=0/1 Reviews als `stat_floor` (Test-IoU = Rauschen), N<5 als `drift_unlock` (Per-Show-Drift-Learning aktiviert sich bei ≥5), N≥5 + viele unreviewed als `velocity` (cheap labelling source). Action-Link öffnet die erste unreviewed Aufnahme der Show direkt im Player.
+
+## Training pipeline (`train-head.py`, runs 03:30 nightly)
+
+- Wrapper `tv-train-head.sh` mountet SMB via `mount-pi-tv.sh` falls weg (sleep/wake kann Mounts killen — bare existence-check reicht nicht weil "Pfad existiert aber Connection tot")
+- Platt-Calibration: nach `clf.fit` wird auf hold-out Test-Set ein 1-D Sigmoid σ(A·logit + B) gefittet, Brier-Score-Diff geloggt, Sidecar `head.calibration.json` neben head.bin
+- Kalibrierte Probs werden im `--surface-uncertain` Step verwendet damit Active-Learning-Targets (`head.uncertain.txt`) auf der TATSÄCHLICHEN Modell-Unsicherheit ranken statt auf der over-confident raw Linear-Head-Output. Phase-A/B Self-Training nutzt weiterhin raw Probs (Threshold-Tuning ist auf raw kalibriert)
 
 Why HTTP not SMB: macOS TCC restricts launchd Aqua agents from
 enumerating network mounts; `os.listdir(/Users/simon/mnt/pi-tv/hls)`

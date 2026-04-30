@@ -2358,6 +2358,118 @@ def _render_status_filter(counts):
     return "".join(out)
 
 
+def _render_current_metrics(history):
+    """Cards showing the currently-deployed model's headline metrics
+    (Block-IoU / Test Acc / Train Acc / Last Deploy) with an ampel
+    indicator per metric so the user immediately sees whether a value
+    is healthy. Quality bands are calibrated against actual per-show
+    IoU spread (good shows hit 0.80+, weak shows 0.20s; OVERALL
+    weighted average lives in the 0.60-0.65 range right now)."""
+    if not history:
+        return ""
+    last_dep = next((e for e in reversed(history) if e.get("deployed")), None)
+    if not last_dep:
+        last_dep = history[-1]  # show latest run even if rejected
+    iou = last_dep.get("test_iou")
+    acc = last_dep.get("test_acc")
+    train_acc = last_dep.get("train_acc")
+    ts = last_dep.get("ts", "")
+    deployed = last_dep.get("deployed", False)
+    age_h = None
+    if ts:
+        try:
+            t = time.mktime(time.strptime(ts, "%Y%m%dT%H%M%S"))
+            age_h = (time.time() - t) / 3600
+        except Exception:
+            pass
+
+    # Drift vs 7-day median (deployed-only) — same calculation as
+    # /api/learning/summary's drift_vs_7d_median, so the card matches
+    # what the daily-summary email mentions.
+    deployed_recent = [e.get("test_iou") for e in history
+                       if e.get("deployed") and e.get("test_iou") is not None]
+    drift = None
+    if iou is not None and len(deployed_recent) >= 7:
+        prev7 = sorted(deployed_recent[-8:-1])  # exclude current
+        if prev7:
+            median = prev7[len(prev7) // 2]
+            drift = iou - median
+
+    def ampel(value, thresholds, higher_is_better=True):
+        """Return (color, label) tuple based on value."""
+        if value is None:
+            return ("#7f8c8d", "—")
+        good, ok = thresholds
+        if higher_is_better:
+            if value >= good: return ("#27ae60", "sehr gut")
+            if value >= ok:   return ("#f39c12", "ok")
+            return ("#e74c3c", "schwach")
+        if value <= good: return ("#27ae60", "sehr gut")
+        if value <= ok:   return ("#f39c12", "ok")
+        return ("#e74c3c", "schwach")
+
+    iou_amp = ampel(iou, (0.70, 0.55))
+    acc_amp = ampel(acc, (0.92, 0.85))
+    # Overfit hint: if train>>test, the head memorised noise.
+    overfit_gap = (train_acc - acc) if (train_acc is not None and acc is not None) else None
+    train_amp = ("#27ae60", "balanced")
+    if overfit_gap is not None and overfit_gap > 0.10:
+        train_amp = ("#e74c3c", f"overfit (+{overfit_gap*100:.0f}pp)")
+    elif overfit_gap is not None and overfit_gap > 0.05:
+        train_amp = ("#f39c12", f"leichter overfit (+{overfit_gap*100:.0f}pp)")
+    age_amp = ("#7f8c8d", "—")
+    if age_h is not None:
+        age_amp = (("#27ae60", f"{age_h:.0f} h alt") if age_h < 30
+                   else ("#f39c12", f"{age_h:.0f} h alt") if age_h < 48
+                   else ("#e74c3c", f"{age_h:.0f} h alt — Training stockt"))
+
+    drift_html = ""
+    if drift is not None:
+        sym = "▲" if drift > 0.005 else ("▼" if drift < -0.005 else "→")
+        dcol = ("#27ae60" if drift > 0.005 else
+                "#e74c3c" if drift < -0.005 else "#7f8c8d")
+        drift_html = (f"<div class='metric-drift' style='color:{dcol}'>"
+                      f"{sym} {drift:+.3f} vs 7-d Median</div>")
+
+    def card(label, value_str, color, status, extra=""):
+        return (f"<div class='metric-card' "
+                f"style='border-left:4px solid {color}'>"
+                f"<div class='metric-label'>{label}</div>"
+                f"<div class='metric-value'>{value_str}</div>"
+                f"<div class='metric-status' style='color:{color}'>{status}</div>"
+                f"{extra}</div>")
+
+    return (
+        "<style>"
+        ".metrics-grid{display:grid;grid-template-columns:"
+        "repeat(auto-fit,minmax(180px,1fr));gap:10px;margin:6px 0 14px}"
+        ".metric-card{background:var(--code-bg);border-radius:4px;"
+        "padding:10px 14px;display:flex;flex-direction:column;gap:2px}"
+        ".metric-label{font-size:.8em;color:var(--muted);"
+        "text-transform:uppercase;letter-spacing:.5px}"
+        ".metric-value{font-size:1.7em;font-weight:600;line-height:1.1}"
+        ".metric-status{font-size:.85em;font-weight:500}"
+        ".metric-drift{font-size:.8em;margin-top:2px}"
+        "</style>"
+        "<div class='metrics-grid'>"
+        + card("Block-IoU (Test)",
+               f"{iou*100:.1f}%" if iou is not None else "—",
+               iou_amp[0], iou_amp[1], drift_html)
+        + card("Test Accuracy",
+               f"{acc*100:.1f}%" if acc is not None else "—",
+               acc_amp[0], acc_amp[1])
+        + card("Train Accuracy",
+               f"{train_acc*100:.1f}%" if train_acc is not None else "—",
+               train_amp[0], train_amp[1])
+        + card("Letzter Deploy",
+               ts[:8] + " " + ts[9:11] + ":" + ts[11:13] if len(ts) >= 13 else "—",
+               age_amp[0], age_amp[1],
+               "" if deployed else
+               "<div class='metric-status' style='color:#e74c3c'>letzter Run REJECTED</div>")
+        + "</div>"
+    )
+
+
 def _render_history_chart(history, width=860, height=280):
     """Inline SVG line-chart of train_acc / test_acc / test_iou over
     the run history. No external deps — scales sharp at any size,
@@ -2575,20 +2687,728 @@ def _learning_health():
     # Champion-Challenger only compares to the LAST deployed run —
     # 5pp/day drift over 2 weeks would never trip it. Compare
     # current IoU against the median of the last 7 deployed runs.
+    # Composition-aware: when the test set grew between the
+    # comparison runs (e.g. new user-reviewed recordings entered
+    # the test split), the metric isn't apples-to-apples — surface
+    # an info marker instead of a regression alert.
     out["trend_drift"] = None
-    deployed_recent = [e.get("test_iou") for e in h
-                       if e.get("deployed") and e.get("test_iou") is not None]
-    if len(deployed_recent) >= 7:
-        last7 = deployed_recent[-7:]
-        med = sorted(last7)[len(last7)//2]
-        cur_iou = last7[-1]
-        drift = cur_iou - med
+    out["test_composition_changed"] = False
+    deployed_runs = [e for e in h
+                     if e.get("deployed") and e.get("test_iou") is not None]
+    if len(deployed_runs) >= 7:
+        last7 = deployed_runs[-7:]
+        ious = [e["test_iou"] for e in last7]
+        med = sorted(ious)[len(ious)//2]
+        cur = last7[-1]
+        drift = cur["test_iou"] - med
         if drift < -0.05:
-            out["trend_drift"] = round(drift, 3)
-            if out["status"] == "ok":
-                out["status"] = "warn"
+            # Did the test set grow vs the median-era runs? Compare
+            # current n_test_recs to the modal value across the
+            # other 6 runs in the window.
+            other_n = [e.get("n_test_recs", 0) for e in last7[:-1]]
+            mode_n = max(set(other_n), key=other_n.count) if other_n else 0
+            cur_n = cur.get("n_test_recs", 0)
+            if cur_n > mode_n:
+                out["test_composition_changed"] = {
+                    "drift_pp": round(drift, 3),
+                    "n_added": cur_n - mode_n,
+                    "from_n": mode_n, "to_n": cur_n}
+                # Don't elevate to "warn" — composition change is
+                # expected when the user keeps labelling new shows.
+            else:
+                out["trend_drift"] = round(drift, 3)
+                if out["status"] == "ok":
+                    out["status"] = "warn"
 
     return out
+
+
+# ── Failure-mode taxonomy (feature 10) ─────────────────────────────
+# Each user-vs-auto mismatch on a recording slots into one of N
+# categories. Aggregating by show + by channel turns vague "bad IoU"
+# into concrete "85 % of sixx mismatches are washout — invest in
+# audio-RMS, not bumper-template tuning". Read-only over existing
+# ads.json/ads_user.json; no schema changes needed.
+
+FAILURE_MODES = [
+    ("good",            "🟢 IoU >0.85 (kein echter Mismatch)"),
+    ("runaway",         "🔴 State-Machine Runaway (Block >50% Aufnahme)"),
+    ("washout",         "🟠 Logo-Washout (kein Auto-Block trotz User-Block)"),
+    ("missed_bumper",   "🟡 Bumper-Snap fired nicht (Boundary >10s vom Bumper-Anker)"),
+    ("boundary_drift",  "🟡 Boundary-Drift >30s (Block existiert, Grenze daneben)"),
+    ("false_positive",  "🟠 False Positive (Auto-Block ohne User-Overlap)"),
+    ("false_negative",  "🟠 False Negative (User-Block ohne Auto-Overlap)"),
+]
+
+
+def _block_iou(a, b):
+    """IoU between two block lists (each a list of [start,end] pairs).
+    Treats blocks as time-intervals; intersection/union are computed
+    on the merged interval-set."""
+    def total(blocks):
+        return sum(max(0, e - s) for s, e in blocks)
+    def inter(a, b):
+        out = 0.0
+        for as_, ae in a:
+            for bs_, be in b:
+                lo = max(as_, bs_); hi = min(ae, be)
+                if hi > lo:
+                    out += hi - lo
+        return out
+    if not a and not b:
+        return 1.0
+    if not a or not b:
+        return 0.0
+    i = inter(a, b)
+    u = total(a) + total(b) - i
+    return i / u if u > 0 else 0.0
+
+
+def _classify_recording_failures(uuid):
+    """Classify the (auto, user) mismatch for one recording into the
+    primary failure mode. Returns None if the recording lacks user
+    review (= no ground truth) OR is currently mid-redetect (auto
+    blocks haven't been written yet — would otherwise misclassify as
+    "washout" en masse during a bulk re-detect after head.bin
+    update). Returns one of FAILURE_MODES keys."""
+    rec_dir = HLS_DIR / f"_rec_{uuid}"
+    user_p = rec_dir / "ads_user.json"
+    auto_p = rec_dir / "ads.json"
+    if not user_p.exists():
+        return None  # no ground truth, can't classify
+    # Re-detect in flight — auto blocks not yet computed for the
+    # current head. Skip until the daemon finishes; classifying now
+    # would falsely mark every reviewed recording as "washout".
+    if (rec_dir / ".detect-requested").exists() and not auto_p.exists():
+        return None
+    try:
+        user_raw = json.loads(user_p.read_text())
+    except Exception:
+        return None
+    if not isinstance(user_raw, dict):
+        return None
+    if not user_raw.get("reviewed_at"):
+        return None  # not reviewed — premature to call it a mismatch
+    user_blocks = user_raw.get("ads", []) or []
+    if auto_p.exists():
+        try:
+            auto_data = json.loads(auto_p.read_text())
+        except Exception:
+            auto_data = []
+        auto_blocks = (auto_data if isinstance(auto_data, list)
+                       else auto_data.get("auto", []))
+    else:
+        # ads.json missing but .txt cutlist may still be on disk —
+        # detection completed (possibly with 0 blocks) but the cache
+        # was never warmed because nobody opened /recording/<uuid>.
+        # Parse the .txt directly so classification reflects reality
+        # (= detect ran, this is its actual output) instead of falsely
+        # labelling everything as washout.
+        sidecars = (".logo.txt", ".trained.logo.txt", ".cskp.txt", ".tvd.txt")
+        txts = [p for p in rec_dir.glob("*.txt")
+                if not any(p.name.endswith(s) for s in sidecars)]
+        if not txts:
+            return None  # never detected, can't classify
+        auto_blocks = _rec_parse_comskip(rec_dir) or []
+
+    # Recording duration from playlist (sum of EXTINF lines).
+    dur = 0.0
+    pl = rec_dir / "index.m3u8"
+    if pl.is_file():
+        try:
+            for ln in pl.read_text().splitlines():
+                if ln.startswith("#EXTINF:"):
+                    try: dur += float(ln.split(":", 1)[1].rstrip(","))
+                    except Exception: pass
+        except Exception:
+            pass
+
+    # IoU first — anything above 0.85 is a "good" call, not a failure.
+    iou = _block_iou(auto_blocks, user_blocks)
+    if iou >= 0.85:
+        return "good"
+
+    # Runaway: any auto block spans >50% of the recording. The cap
+    # introduced today drops these going forward, but historical
+    # detections may still show this pattern.
+    if dur > 0:
+        for a in auto_blocks:
+            if (a[1] - a[0]) / dur > 0.5:
+                return "runaway"
+
+    # No auto blocks at all but user has them → state machine never
+    # opened a candidate. Almost always logo-washout (logo-conf too
+    # high throughout, no consecutive-absent stretch met threshold).
+    if not auto_blocks and user_blocks:
+        return "washout"
+
+    # Auto blocks exist but no overlap with any user block (and user
+    # has blocks) → false positives somewhere in the recording.
+    def overlaps(x, y):
+        return x[0] < y[1] and y[0] < x[1]
+    auto_with_user_overlap = [
+        a for a in auto_blocks
+        if any(overlaps(a, u) for u in user_blocks)]
+    if not auto_with_user_overlap and user_blocks:
+        return "false_positive"
+
+    # User blocks exist but no auto block overlaps any → state
+    # machine emitted some blocks but missed every real one (= miss
+    # in the wrong place, not just a drift).
+    user_with_auto_overlap = [
+        u for u in user_blocks
+        if any(overlaps(u, a) for a in auto_blocks)]
+    if not user_with_auto_overlap and user_blocks:
+        return "false_negative"
+
+    # Bumper-snap miss: did we have bumpers for this channel AND the
+    # nearest auto-block-end is >10s from the user-block-end?
+    slug = _rec_channel_slug(uuid) or ""
+    bdir = _TVD_BUMPER_DIR / slug if slug else None
+    has_bumpers = (bdir and bdir.is_dir() and
+                   (any(bdir.glob("*.png")) or
+                    any((bdir / "end").glob("*.png")) if (bdir / "end").is_dir()
+                    else False))
+    if has_bumpers:
+        for u in user_blocks:
+            for a in auto_with_user_overlap:
+                if overlaps(a, u) and abs(a[1] - u[1]) > 10:
+                    return "missed_bumper"
+
+    # Anything else: blocks exist on both sides with overlap, but
+    # boundaries are off by more than the 30s tolerance.
+    return "boundary_drift"
+
+
+# 30 s TTL cache for heavy aggregators on /learning. All of them
+# walk every _rec_* dir + read ads.json/ads_user.json/.txt per dir;
+# at 125+ recordings that adds 5-7 s to every page load. The caches
+# are invalidated by mtime — if any user just edited ads_user.json,
+# next request recomputes. TTL also bounds staleness on quiet ticks.
+_learning_agg_cache = {"ts": 0, "mtime": 0,
+                       "fm": None, "gaps": None,
+                       "episodes": None, "fingerprints": None}
+_LEARNING_CACHE_TTL_S = 30
+
+
+def _learning_agg_max_mtime():
+    """Cheapest staleness signal: largest mtime across the actual
+    files the aggregators read. Stat'ing the DIR mtime alone misses
+    in-place writes — e.g. clicking ✓ Geprüft a second time
+    overwrites ads_user.json without touching the dir entry, so on
+    ext4 the dir mtime doesn't bump and the cache served stale data
+    for up to 30s. Stating the JSON files directly catches both
+    overwrites and creates."""
+    m = 0
+    try:
+        for d in HLS_DIR.iterdir():
+            if not d.name.startswith("_rec_"):
+                continue
+            for fn in ("ads_user.json", "ads.json", ".detect-requested"):
+                try:
+                    ts = (d / fn).stat().st_mtime
+                    if ts > m:
+                        m = ts
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    return m
+
+
+def _aggregate_failure_modes_cached():
+    now = time.time()
+    cur_mtime = _learning_agg_max_mtime()
+    if (_learning_agg_cache["fm"] is not None
+            and now - _learning_agg_cache["ts"] < _LEARNING_CACHE_TTL_S
+            and cur_mtime == _learning_agg_cache["mtime"]):
+        return _learning_agg_cache["fm"]
+    result = _aggregate_failure_modes()
+    _learning_agg_cache["fm"] = result
+    _learning_agg_cache["ts"] = now
+    _learning_agg_cache["mtime"] = cur_mtime
+    return result
+
+
+def _aggregate_show_gaps_cached():
+    now = time.time()
+    cur_mtime = _learning_agg_max_mtime()
+    if (_learning_agg_cache["gaps"] is not None
+            and now - _learning_agg_cache["ts"] < _LEARNING_CACHE_TTL_S
+            and cur_mtime == _learning_agg_cache["mtime"]):
+        return _learning_agg_cache["gaps"]
+    result = _aggregate_show_gaps()
+    _learning_agg_cache["gaps"] = result
+    _learning_agg_cache["ts"] = now
+    _learning_agg_cache["mtime"] = cur_mtime
+    return result
+
+
+def _compute_show_fingerprints_cached(*args, **kwargs):
+    """Cached wrapper around _compute_show_fingerprints. Same TTL +
+    mtime-invalidation as the failure-mode and show-gap caches.
+    Skip the cache when the caller passes non-default arguments
+    (e.g. leave-one-out validation builds custom fingerprints — must
+    not poison the shared cache)."""
+    if args or kwargs:
+        return _compute_show_fingerprints(*args, **kwargs)
+    now = time.time()
+    cur_mtime = _learning_agg_max_mtime()
+    if (_learning_agg_cache["fingerprints"] is not None
+            and now - _learning_agg_cache["ts"] < _LEARNING_CACHE_TTL_S
+            and cur_mtime == _learning_agg_cache["mtime"]):
+        return _learning_agg_cache["fingerprints"]
+    result = _compute_show_fingerprints()
+    _learning_agg_cache["fingerprints"] = result
+    _learning_agg_cache["ts"] = now
+    _learning_agg_cache["mtime"] = cur_mtime
+    return result
+
+
+def _aggregate_failure_modes():
+    """Walk all reviewed recordings, tally failure modes per show
+    AND per channel. Each entry tracks total, mode counts, and the
+    UUID list per mode so the UI can drill from the stacked bar
+    into the actual broken recordings."""
+    per_show = {}
+    per_channel = {}
+    for d in HLS_DIR.glob("_rec_*"):
+        uuid = d.name[5:]
+        mode = _classify_recording_failures(uuid)
+        if not mode:
+            continue
+        show = _show_title_for_rec(d) or "(untitled)"
+        slug = _rec_channel_slug(uuid) or "(unknown)"
+        for bucket, key in ((per_show, show), (per_channel, slug)):
+            entry = bucket.setdefault(
+                key, {"total": 0, "modes": {}, "uuids": {}})
+            entry["total"] += 1
+            entry["modes"][mode] = entry["modes"].get(mode, 0) + 1
+            entry["uuids"].setdefault(mode, []).append(uuid)
+    return per_show, per_channel
+
+
+def _rec_date_from_filename(rec_dir):
+    """Derive the recording date suffix from the cutlist filename
+    (`Show $YYYY-MM-DD-HHMM.txt` → `2026-04-30 17:43`). Returns ""
+    when no parseable basename is found."""
+    for p in rec_dir.glob("*.txt"):
+        if any(p.name.endswith(s) for s in
+               (".logo.txt", ".cskp.txt", ".tvd.txt",
+                ".trained.logo.txt")):
+            continue
+        if " $" in p.stem:
+            stamp = p.stem.split(" $", 1)[1]
+            # "2026-04-30-1743" or "2026-04-30-1743-1" (counter suffix)
+            parts = stamp.split("-")
+            if len(parts) >= 4 and len(parts[3]) >= 4:
+                return f"{parts[0]}-{parts[1]}-{parts[2]} {parts[3][:2]}:{parts[3][2:4]}"
+        return ""
+    return ""
+
+
+def _render_failure_modes(per_show, per_channel):
+    """Two-table render: by-channel rollup first (broader patterns),
+    then by-show breakdown (where to focus). Each row shows the
+    dominant failure mode + a stacked-mini-bar of all modes."""
+    if not per_show and not per_channel:
+        return ""
+
+    # Color per failure mode (matches the FAILURE_MODES emoji).
+    mode_color = {
+        "good":           "#27ae60",
+        "runaway":        "#c0392b",
+        "washout":        "#e67e22",
+        "missed_bumper":  "#f1c40f",
+        "boundary_drift": "#f39c12",
+        "false_positive": "#e74c3c",
+        "false_negative": "#d35400",
+    }
+
+    def render_bar(modes, total, row_id):
+        """Stacked horizontal bar, 100 % wide split by mode shares.
+        Each segment is a clickable button that toggles the per-mode
+        recording-list panel beneath the row (= drill-down from bar
+        to actual broken recordings)."""
+        if total == 0:
+            return ""
+        parts = []
+        for key, _ in FAILURE_MODES:
+            n = modes.get(key, 0)
+            if n == 0:
+                continue
+            pct = n / total * 100
+            # Skip the click-to-expand for the "good" segment — those
+            # don't need fixing. Cursor stays default to signal that.
+            if key == "good":
+                cursor = "default"
+                onclick = ""
+            else:
+                cursor = "pointer"
+                onclick = (f" onclick=\"toggleFailDetails("
+                           f"'{row_id}','{key}')\"")
+            parts.append(
+                f"<div style='background:{mode_color[key]};"
+                f"width:{pct:.1f}%;height:14px;display:inline-block;"
+                f"cursor:{cursor}' "
+                f"title='{n}× {key} (klicken für Details)'"
+                f"{onclick}></div>")
+        return ("<div style='display:flex;width:100%;height:14px;"
+                "border-radius:3px;overflow:hidden'>"
+                + "".join(parts) + "</div>")
+
+    def dominant(modes):
+        non_good = {k: v for k, v in modes.items() if k != "good"}
+        if not non_good:
+            return ""
+        k = max(non_good, key=non_good.get)
+        return f"{k} ({non_good[k]}×)"
+
+    def _bumper_diagnostic(uuid, mode):
+        """For missed_bumper / boundary_drift cases, surface the
+        per-block deltas (user vs auto) so the user can tell at a
+        glance whether the snap-window (±90s default) or the match
+        threshold (0.85 default) is the actual limiter:
+          • |Δ| > 90s = window too narrow; widen to fix
+          • |Δ| < 90s = bumper conf below threshold; lower to fix
+                         (or capture more template variants)
+        Empty string for non-snap-related modes."""
+        if mode not in ("missed_bumper", "boundary_drift"):
+            return ""
+        d = HLS_DIR / f"_rec_{uuid}"
+        try:
+            user_raw = json.loads((d / "ads_user.json").read_text())
+            user_blocks = user_raw.get("ads", []) or []
+        except Exception:
+            return ""
+        try:
+            auto_raw = json.loads((d / "ads.json").read_text())
+            auto_blocks = (auto_raw if isinstance(auto_raw, list)
+                           else auto_raw.get("auto", []))
+        except Exception:
+            auto_blocks = _rec_parse_comskip(d) or []
+        if not user_blocks or not auto_blocks:
+            return ""
+        # For each user block, find its closest auto block by
+        # midpoint (= which auto block is the candidate match).
+        rows = []
+        for i, (us, ue) in enumerate(user_blocks):
+            best = None  # (auto_idx, mid_dist, as, ae)
+            for j, (as_, ae) in enumerate(auto_blocks):
+                d_mid = abs((us + ue) / 2 - (as_ + ae) / 2)
+                if best is None or d_mid < best[1]:
+                    best = (j, d_mid, as_, ae)
+            if best is None:
+                continue
+            j, _, as_, ae = best
+            d_start = us - as_   # +ve = auto starts EARLIER than user
+            d_end = ue - ae      # +ve = auto ends EARLIER than user
+            # Highlight the boundary off by >10s
+            def fmt(dx):
+                if abs(dx) <= 10:
+                    return f"<span style='color:#27ae60'>{dx:+.0f}s</span>"
+                if abs(dx) <= 90:
+                    return (f"<span style='color:#f39c12' "
+                            f"title='innerhalb Snap-Window — "
+                            f"Threshold dürfte limitieren'>"
+                            f"{dx:+.0f}s</span>")
+                return (f"<span style='color:#e74c3c' "
+                        f"title='außerhalb ±90s Snap-Window — "
+                        f"Window-Vergrößerung würde helfen'>"
+                        f"{dx:+.0f}s</span>")
+            rows.append(
+                f"User [{us:.0f}–{ue:.0f}] vs "
+                f"Auto [{as_:.0f}–{ae:.0f}] — "
+                f"ΔStart {fmt(d_start)}, ΔEnd {fmt(d_end)}")
+        if not rows:
+            return ""
+        return ("<div style='font-size:.78em;color:var(--muted);"
+                "padding:3px 0 0 4px;font-family:monospace'>"
+                + "<br>".join(rows) + "</div>")
+
+    def render_recordings_for_mode(uuids, mode):
+        """Per-recording mini-list inside an expanded drill-down
+        panel. Each row: title • date • action buttons + optional
+        per-block snap-delta diagnostic for missed_bumper cases."""
+        rows = []
+        for uuid in uuids:
+            d = HLS_DIR / f"_rec_{uuid}"
+            title = _show_title_for_rec(d) or uuid[:8]
+            date_s = _rec_date_from_filename(d)
+            diag = _bumper_diagnostic(uuid, mode)
+            rows.append(
+                f"<div class='fm-rec'>"
+                f"<div class='fm-rec-main'>"
+                f"<a href='{HOST_URL}/recording/{uuid}' "
+                f"class='fm-rec-link'>"
+                f"<b>{title}</b>"
+                f"{(' · ' + date_s) if date_s else ''}</a>"
+                f"<span class='fm-rec-actions'>"
+                f"<button class='fm-btn redet' "
+                f"onclick=\"failModeRedetect('{uuid}',this)\">"
+                f"🔄 Re-Detect</button>"
+                f"<a class='fm-btn check' "
+                f"href='{HOST_URL}/recording/{uuid}'>"
+                f"👁 Prüfen</a>"
+                f"<button class='fm-btn del' "
+                f"onclick=\"failModeDelete('{uuid}',this)\">"
+                f"🗑 Löschen</button>"
+                f"</span></div>"
+                f"{diag}"
+                f"</div>")
+        return "\n".join(rows)
+
+    def render_table(rows, label):
+        scope = label.split(' ')[-1].lower()
+        out = [f"<h3 style='margin-top:14px'>{label}</h3>"]
+        out.append("<div style='overflow-x:auto;"
+                   "-webkit-overflow-scrolling:touch'>")
+        out.append("<table style='width:100%;min-width:520px'><tr>"
+                   f"<th style='text-align:left'>{label.split(' ')[-1]}</th>"
+                   "<th>n</th><th>Dominant</th>"
+                   "<th style='width:40%'>Verteilung</th></tr>")
+        # Sort by failure-rate descending (most-broken first).
+        def fail_rate(entry):
+            non_good = sum(v for k, v in entry["modes"].items() if k != "good")
+            return non_good / entry["total"] if entry["total"] else 0
+        for key in sorted(rows, key=lambda k: -fail_rate(rows[k])):
+            r = rows[key]
+            row_id = f"{scope}-" + re.sub(r"[^a-z0-9]+", "-", key.lower()).strip("-")
+            out.append(f"<tr><td><b>{key}</b></td>"
+                       f"<td>{r['total']}</td>"
+                       f"<td class='muted' style='white-space:nowrap'>"
+                       f"{dominant(r['modes'])}</td>"
+                       f"<td>{render_bar(r['modes'], r['total'], row_id)}</td></tr>")
+            # Hidden drill-down: one inner panel per non-good mode.
+            for mode_key, _ in FAILURE_MODES:
+                if mode_key == "good":
+                    continue
+                uuids = r["uuids"].get(mode_key, [])
+                if not uuids:
+                    continue
+                out.append(
+                    f"<tr id='fm-detail-{row_id}-{mode_key}' "
+                    f"class='fm-detail' style='display:none'>"
+                    f"<td colspan='4' style='padding:8px 12px;"
+                    f"background:var(--code-bg)'>"
+                    f"<div class='fm-detail-head' "
+                    f"style='color:{mode_color[mode_key]};font-weight:600;"
+                    f"margin-bottom:6px'>"
+                    f"{mode_key} ({len(uuids)} Aufnahme{'n' if len(uuids)!=1 else ''})"
+                    f"</div>"
+                    f"{render_recordings_for_mode(uuids, mode_key)}"
+                    f"</td></tr>")
+        out.append("</table></div>")
+        return "\n".join(out)
+
+    # Legend + tables
+    parts = ["<p class='muted'>Wo das Modell stolpert — pro geprüfter "
+             "Aufnahme die häufigste Failure-Kategorie. Zeigt welche "
+             "Optimierung wo am meisten bringt: Washout-Cluster auf "
+             "einem Sender → Audio-RMS ergänzen; Boundary-Drift überall "
+             "→ Bumper-Templates nachpflegen; Runaway noch sichtbar → "
+             "MaxBlockFraction-Cap ist neu, nur historische Detektionen "
+             "betroffen.</p>"]
+    parts.append("<div style='display:flex;flex-wrap:wrap;gap:10px;"
+                 "margin:6px 0 10px;font-size:.85em'>")
+    for key, label in FAILURE_MODES:
+        parts.append(f"<span><span style='display:inline-block;width:12px;"
+                     f"height:12px;background:{mode_color[key]};"
+                     f"vertical-align:middle;margin-right:4px;"
+                     f"border-radius:2px'></span>{label}</span>")
+    parts.append("</div>")
+    if per_channel:
+        parts.append(render_table(per_channel, "Per Channel"))
+    if per_show:
+        parts.append(render_table(per_show, "Per Show"))
+    parts.append(
+        "<style>"
+        ".fm-rec{display:flex;flex-direction:column;gap:2px;"
+        "padding:5px 0;border-bottom:1px solid var(--border)}"
+        ".fm-rec:last-child{border-bottom:0}"
+        ".fm-rec-main{display:flex;flex-wrap:wrap;align-items:center;gap:6px}"
+        ".fm-rec-link{color:var(--fg);text-decoration:none;flex:1 1 auto;"
+        "min-width:200px}"
+        ".fm-rec-link:hover{text-decoration:underline}"
+        ".fm-rec-actions{display:flex;gap:4px;flex:0 0 auto}"
+        ".fm-btn{background:#fff2;color:var(--fg);border:0;"
+        "padding:3px 8px;border-radius:12px;font-size:.78em;"
+        "cursor:pointer;text-decoration:none;display:inline-flex;"
+        "align-items:center;line-height:1;white-space:nowrap}"
+        ".fm-btn.redet{background:#27ae6033}"
+        ".fm-btn.check{background:#3498db33}"
+        ".fm-btn.del{background:#e74c3c33;color:#e74c3c}"
+        ".fm-btn:hover{filter:brightness(1.2)}"
+        ".fm-btn:disabled{opacity:.5;cursor:wait}"
+        "</style>"
+        "<script>"
+        "function toggleFailDetails(rowId, mode){"
+        "  /* Close all OTHER drill-downs first so only one is open */"
+        "  document.querySelectorAll('.fm-detail').forEach(el=>{"
+        "    if(el.id !== 'fm-detail-'+rowId+'-'+mode) el.style.display='none';"
+        "  });"
+        "  const el = document.getElementById('fm-detail-'+rowId+'-'+mode);"
+        "  if(!el) return;"
+        "  el.style.display = el.style.display==='none' ? '' : 'none';"
+        "}"
+        "function failModeRedetect(uuid, btn){"
+        "  btn.disabled=true; const old=btn.textContent;"
+        "  btn.textContent='⏳ läuft…';"
+        f"  fetch('{HOST_URL}/api/recording/'+uuid+'/redetect',"
+        "    {method:'POST'}).then(r=>r.json()).then(d=>{"
+        "      btn.textContent = d && d.ok ? '✓ markiert' : '✗ Fehler';"
+        "      setTimeout(()=>{btn.textContent=old; btn.disabled=false;}, 3000);"
+        "  }).catch(()=>{btn.textContent='✗ Netz';"
+        "    setTimeout(()=>{btn.textContent=old; btn.disabled=false;}, 3000);});"
+        "}"
+        "function failModeDelete(uuid, btn){"
+        "  if(!confirm('Aufnahme komplett löschen?\\n\\n'+"
+        "    'Das löscht .ts + ads_user.json + HLS-Bundle. '+"
+        "    'Trainings-Daten gehen verloren.\\n\\nUUID: '+uuid)) return;"
+        "  btn.disabled=true; btn.textContent='⏳';"
+        f"  fetch('{HOST_URL}/recording/'+uuid+'/delete',{{redirect:'manual'}})"
+        "    .then(()=>{"
+        "      const row = btn.closest('.fm-rec');"
+        "      if(row){row.style.opacity='.4';row.style.textDecoration='line-through';"
+        "        btn.textContent='✓ gelöscht';}"
+        "      else btn.textContent='✓';"
+        "  }).catch(()=>{btn.textContent='✗ Fehler';btn.disabled=false;});"
+        "}"
+        "</script>"
+    )
+    return "\n".join(parts)
+
+
+# ── Show-gap detection (feature 11) ────────────────────────────────
+# Surface concrete labelling-leverage opportunities: shows with a
+# trailing-N=1 problem (= IoU is statistical noise), shows with many
+# unlabelled siblings of an already-confirmed episode (= cheap
+# velocity), shows where per-show drift learning could activate
+# (≥5 reviewed unlocks _persist_detection_learning_by_show).
+
+LEARNING_MIN_SAMPLES_FOR_DRIFT = 5  # mirrors the drift-learning gate
+
+
+def _aggregate_show_gaps():
+    """Returns a sorted list of (show, slug, n_total, n_reviewed,
+    n_unreviewed_playable, suggestion) tuples for shows that would
+    benefit from more labelling. Only shows with at least one
+    unreviewed playable recording are included — labelling something
+    you can't watch isn't actionable.
+
+    Suggestions are tiered:
+      "drift_unlock"  — N reviewed < threshold but ≥1 unreviewed exists
+                         → labelling 1-2 more activates per-show drift
+      "stat_floor"    — N reviewed = 1 (single-test-set sample, IoU is
+                         noise; getting to 3+ stabilises metrics)
+      "velocity"      — N reviewed ≥ threshold but ≥5 unreviewed sit
+                         around (= cheap source of fresh training data)
+    """
+    by_show = {}
+    for d in HLS_DIR.glob("_rec_*"):
+        uuid = d.name[5:]
+        show = _show_title_for_rec(d) or ""
+        if not show:
+            continue
+        slug = _rec_channel_slug(uuid) or ""
+        playable = (d / "index.m3u8").exists()
+        user_p = d / "ads_user.json"
+        reviewed = False
+        if user_p.exists():
+            try:
+                raw = json.loads(user_p.read_text())
+                if isinstance(raw, dict) and raw.get("reviewed_at"):
+                    reviewed = True
+            except Exception:
+                pass
+        entry = by_show.setdefault(show, {
+            "slug": slug, "n_total": 0, "n_reviewed": 0,
+            "n_unreviewed_playable": 0, "uuids_unreviewed": []})
+        entry["n_total"] += 1
+        if reviewed:
+            entry["n_reviewed"] += 1
+        elif playable:
+            entry["n_unreviewed_playable"] += 1
+            entry["uuids_unreviewed"].append(uuid)
+
+    out = []
+    for show, e in by_show.items():
+        if e["n_unreviewed_playable"] == 0:
+            continue  # nothing the user can act on
+        n_rev = e["n_reviewed"]
+        if n_rev == 0:
+            sugg = "stat_floor"
+            priority = 0  # unseen → highest
+        elif n_rev == 1:
+            sugg = "stat_floor"
+            priority = 1
+        elif n_rev < LEARNING_MIN_SAMPLES_FOR_DRIFT:
+            sugg = "drift_unlock"
+            priority = 2
+        elif e["n_unreviewed_playable"] >= 5:
+            sugg = "velocity"
+            priority = 3
+        else:
+            continue  # well-labelled, no slack worth surfacing
+        out.append((show, e["slug"], e["n_total"], n_rev,
+                    e["n_unreviewed_playable"], sugg, priority,
+                    e["uuids_unreviewed"]))
+    out.sort(key=lambda r: (r[6], -r[4]))  # priority asc, then slack desc
+    return out
+
+
+def _render_show_gaps(gaps):
+    """Render the show-gap suggestions as a table with action links
+    pointing to the first unreviewed UUID per show (= 'one-click
+    onboarding' for the user)."""
+    if not gaps:
+        return ("<p class='muted'>Keine offenen Label-Lücken — alle "
+                "Shows haben genug User-Reviews für stabile Metriken "
+                "und Per-Show-Drift-Learning.</p>")
+    sugg_label = {
+        "stat_floor":  ("🆕", "#e74c3c",
+                        "Statistische Stabilität: N=1 ist Rauschen, "
+                        "≥3 Reviews machen den Test-IoU verlässlich"),
+        "drift_unlock":("🔓", "#f39c12",
+                        f"Per-Show-Drift-Learning aktiviert sich bei "
+                        f"≥{LEARNING_MIN_SAMPLES_FOR_DRIFT} reviewed Folgen — "
+                        f"dann gilt show-spezifische start_lag/end_lag-Korrektur"),
+        "velocity":    ("🚀", "#27ae60",
+                        "Show ist gut gelabelt. Diese unbearbeiteten "
+                        "Folgen wären schnelle Trainings-Daten via "
+                        "Smart-Merge-Auto-Labels"),
+    }
+    out = ["<p class='muted'>Aufnahmen pro Show: wo ein paar weitere "
+           "Reviews den größten Hebel hätten. Klick auf eine Aufnahme "
+           "öffnet sie direkt im Player.</p>"]
+    # Horizontal scroll wrapper — on mobile the table is wider than
+    # the viewport (show titles + action button); without this the
+    # outer section gets clipped instead of letting the table scroll
+    # within its own bounds.
+    out.append("<div style='overflow-x:auto;-webkit-overflow-scrolling:touch'>")
+    out.append("<table style='width:100%;min-width:560px'><tr>"
+               "<th style='text-align:left'>Show</th>"
+               "<th>Sender</th><th>Total</th><th>Geprüft</th>"
+               "<th>Offen ⏵</th><th>Empfehlung</th><th>Action</th></tr>")
+    for (show, slug, n_total, n_rev, n_open, sugg, _prio,
+         uuids_open) in gaps:
+        emoji, color, hint = sugg_label[sugg]
+        first_uuid = uuids_open[0] if uuids_open else ""
+        action = (f"<a href='{HOST_URL}/recording/{first_uuid}' "
+                  f"class='pill' style='background:{color};color:#fff;"
+                  f"text-decoration:none;padding:3px 8px;font-size:.85em;"
+                  f"white-space:nowrap'>"
+                  f"➜ prüfen</a>"
+                  if first_uuid else "")
+        out.append(f"<tr><td><b>{show}</b></td>"
+                   f"<td>{slug}</td><td>{n_total}</td>"
+                   f"<td>{n_rev}</td>"
+                   f"<td><b style='color:{color}'>{n_open}</b></td>"
+                   f"<td title='{hint}' style='white-space:nowrap'>"
+                   f"{emoji} {sugg}</td>"
+                   f"<td style='white-space:nowrap'>{action}</td></tr>")
+    out.append("</table></div>")
+    return "\n".join(out)
 
 
 @app.route("/learning")
@@ -2772,6 +3592,12 @@ def learning_page():
         d = health["trend_drift"]
         out.append(f"<br><b>📉 IoU-Drift</b> {d*100:+.1f}% vs Median der letzten "
                    f"7 deployed Runs — schleichende Regression?")
+    cc = health.get("test_composition_changed")
+    if cc:
+        out.append(f"<br><b>ℹ Test-Set gewachsen</b>: "
+                   f"{cc['from_n']}→{cc['to_n']} Recordings "
+                   f"({cc['n_added']} neu) · IoU {cc['drift_pp']*100:+.1f}pp "
+                   f"vs Median — nicht apples-to-apples, kein echter Drift")
     out.append("</div>")
 
     # Daemon status banner — Mac-side detect / HLS-remux / thumbs
@@ -2867,6 +3693,7 @@ def learning_page():
     # History chart (visual trend before the table)
     if history:
         _section("Verlauf", default_open=True)
+        out.append(_render_current_metrics(history))
         out.append(_render_history_chart(history))
 
     # History table (last 30)
@@ -2917,12 +3744,15 @@ def learning_page():
                      "sat-1", "sixx", "kabel-eins", "kabel-eins-doku",
                      "vox", "vox-up", "tlc", "dmax"]
     _section("Bumper-Templates pro Sender")
-    out.append("<p class='muted'>Sender-Bumper (z.B. RTL's „Mein RTL"
-               "\" Karte am Werbeblock-Ende) sind das stärkste "
-               "deterministische Ad-Ende-Signal. Pro Sender "
-               "1-5 Templates reichen meist — mehrere Farb-Varianten "
-               "fangen alle Animationen ab. Markierung über den "
-               "Player: 🎯 Werbung → 🎬 Bumper, dann ⏵ Start / ⏹ Ende.</p>")
+    out.append("<p class='muted'>Sender-Bumper sind das stärkste "
+               "deterministische Boundary-Signal. Zwei Sorten: "
+               "<b>End-Bumper</b> (z.B. sixx „WIE SIXX IST DAS DENN?\", "
+               "RTL „Mein RTL\") snappen Werbeblock-Ende; "
+               "<b>Start-Bumper</b> (z.B. sixx „WERBUNG\"-Card) snappen "
+               "Werbeblock-Anfang. Pro Sender + Sorte 1-5 Templates "
+               "reichen meist. Markierung über den Player: "
+               "🎯 Werbung → 🎬 Bumper End → 🎬 Bumper Start (3-State-"
+               "Toggle), dann ⏵ Start / ⏹ Ende beim Bumper-Frame.</p>")
     bdir = HLS_DIR / ".tvd-bumpers"
     # Only list slugs we actually have recordings on — no point urging
     # the user to mark a kabel-eins-doku bumper if they've never recorded
@@ -2939,13 +3769,27 @@ def learning_page():
         # If tvh is unreachable, fall back to "show every PRIVATE_SLUG"
         # rather than producing an empty section.
         have_slugs = set(PRIVATE_SLUGS)
+    # Collect templates as (kind, path) tuples so the renderer can
+    # tag and link each thumb correctly. Channel-root *.png = legacy
+    # end-bumpers (captured before the start/end split).
     rows = []
     for slug in PRIVATE_SLUGS:
         if slug not in have_slugs:
             continue
         sd = bdir / slug
-        files = sorted(sd.glob("*.png")) if sd.is_dir() else []
-        rows.append((len(files), slug, files))
+        items = []
+        if sd.is_dir():
+            for p in sorted(sd.glob("*.png")):
+                items.append(("end", p))
+            end_dir = sd / "end"
+            if end_dir.is_dir():
+                for p in sorted(end_dir.glob("*.png")):
+                    items.append(("end", p))
+            start_dir = sd / "start"
+            if start_dir.is_dir():
+                for p in sorted(start_dir.glob("*.png")):
+                    items.append(("start", p))
+        rows.append((len(items), slug, items))
     rows.sort(key=lambda r: (r[0] > 0, r[0]))  # empty first, then ascending
     out.append("<style>"
                ".bm-row{margin:8px 0;padding:8px;background:var(--stripe);"
@@ -2964,7 +3808,9 @@ def learning_page():
                ".bm-name{font-size:.7em;color:var(--muted);padding:3px;"
                "white-space:nowrap;overflow:hidden;text-overflow:ellipsis}"
                "</style>")
-    for n, slug, files in rows:
+    for n, slug, items in rows:
+        n_end = sum(1 for k, _ in items if k == "end")
+        n_start = sum(1 for k, _ in items if k == "start")
         if n == 0:
             status = ("<span style='color:#e74c3c'>fehlt — bringt vermutlich "
                       "+0.05–0.13 IoU</span>")
@@ -2973,17 +3819,31 @@ def learning_page():
                       f"Varianten erfassen für bessere Match-Rate</span>")
         else:
             status = "<span style='color:#27ae60'>ausreichend</span>"
+        kind_breakdown = (f" <span class='muted' style='font-size:.85em'>"
+                          f"({n_end} End, {n_start} Start)</span>"
+                          if items else "")
         out.append(f"<div class='bm-row'>")
         out.append(f"<div class='bm-head'><span class='bm-slug'>{slug}</span>"
-                   f"<span class='bm-count'>{n} Templates</span>"
+                   f"<span class='bm-count'>{n} Templates{kind_breakdown}</span>"
                    f"<span class='bm-status'>{status}</span></div>")
-        if files:
+        if items:
             out.append("<div class='bm-thumbs'>")
-            for f in files:
-                fn = f.name
+            for kind, p in items:
+                fn = p.name
+                # URL: kind subdir if file lives under start/ or end/,
+                # legacy channel-root path otherwise.
+                if p.parent.name in ("start", "end"):
+                    img_url = f"/api/internal/detect-bumper/{slug}/{p.parent.name}/{fn}"
+                else:
+                    img_url = f"/api/internal/detect-bumper/{slug}/{fn}"
+                kind_tag = ("<span style='position:absolute;top:2px;left:2px;"
+                            "background:rgba(0,0,0,.7);color:#fff;font-size:.7em;"
+                            "padding:1px 5px;border-radius:3px'>"
+                            f"{'▶ Start' if kind == 'start' else '⏹ End'}</span>")
                 out.append(
                     f"<div class='bm-thumb'>"
-                    f"<img src='/api/internal/detect-bumper/{slug}/{fn}' loading='lazy' alt=''/>"
+                    f"<img src='{img_url}' loading='lazy' alt=''/>"
+                    f"{kind_tag}"
                     f"<button class='bm-del' onclick=\"deleteBumper('{slug}','{fn}',this)\" "
                     f"title='Template löschen'>×</button>"
                     f"<div class='bm-name' title='{fn}'>{fn}</div>"
@@ -2998,6 +3858,60 @@ def learning_page():
         "if(d.ok){btn.closest('.bm-thumb').remove();}"
         "else{alert('Fehler: '+(d.error||'unbekannt'));}"
         "}).catch(e=>alert('Netzwerk-Fehler'));}</script>")
+
+    # Failure-mode taxonomy — concrete categorisation of where the
+    # model struggles, broken down per channel + per show. Built from
+    # live ads.json/ads_user.json on disk, no precomputation needed.
+    _t0 = time.time()
+    try:
+        per_show_fm, per_chan_fm = _aggregate_failure_modes_cached()
+    except Exception as e:
+        per_show_fm, per_chan_fm = {}, {}
+        print(f"[learning-page] failure-mode aggregation err: {e}",
+              flush=True)
+    # Surface a banner if a bulk re-detect is in progress — those
+    # recordings are intentionally excluded from the classification
+    # (would otherwise swamp the washout bucket), and the user
+    # should know the analysis below is incomplete until it drains.
+    n_pending = sum(1 for _ in HLS_DIR.glob("_rec_*/.detect-requested"))
+    _ms = (time.time()-_t0)*1000
+    if _ms > 500:
+        print(f"[learning-page-prof] failure-mode-agg={_ms:.0f}ms n={n_pending}",
+              flush=True)
+    _t0 = time.time()
+    if per_show_fm or per_chan_fm:
+        _section("Failure-Mode-Analyse (wo das Modell stolpert)")
+        if n_pending > 0:
+            out.append(
+                f"<div style='background:#3498db22;border-left:4px solid "
+                f"#3498db;padding:8px 12px;margin-bottom:10px;"
+                f"border-radius:4px;font-size:.9em'>"
+                f"⏳ <b>{n_pending} Aufnahmen werden gerade re-detected</b> "
+                f"(Bulk-Re-Detect nach Head-Update läuft) und sind aus "
+                f"der Auswertung unten ausgeklammert. Tabelle vervoll"
+                f"ständigt sich automatisch sobald der Daemon durch ist."
+                f"</div>")
+        out.append(_render_failure_modes(per_show_fm, per_chan_fm))
+    _ms = (time.time()-_t0)*1000
+    if _ms > 500:
+        print(f"[learning-page-prof] failure-mode-render={_ms:.0f}ms", flush=True)
+    _t0 = time.time()
+
+    # Show-gap detection — proactive labelling recommendations.
+    try:
+        show_gaps = _aggregate_show_gaps_cached()
+    except Exception as e:
+        show_gaps = []
+        print(f"[learning-page] show-gap aggregation err: {e}",
+              flush=True)
+    if show_gaps:
+        _section("Show-Lücken (wo zusätzliche Reviews am meisten bringen)",
+                 default_open=True)
+        out.append(_render_show_gaps(show_gaps))
+    _ms = (time.time()-_t0)*1000
+    if _ms > 500:
+        print(f"[learning-page-prof] show-gaps={_ms:.0f}ms", flush=True)
+    _t0 = time.time()
 
     # Confusion summary
     if confusion:
@@ -3017,6 +3931,7 @@ def learning_page():
     # with low IoU (direct test-metric impact). Sorted by gap-to-threshold
     # so the cheapest wins (= 1 more recording flips a channel into having
     # its own prior) appear first.
+    _t0 = time.time()
     recommendations = []
     # (1) per-channel gates: count user-confirmed recordings + blocks per slug
     chan_user_recs = {}
@@ -3109,6 +4024,11 @@ def learning_page():
         r["n"] = remaining
         pruned.append(r)
     recommendations = pruned
+    _ms = (time.time()-_t0)*1000
+    if _ms > 500:
+        print(f"[learning-page-prof] recommendations={_ms:.0f}ms",
+              flush=True)
+    _t0 = time.time()
 
     if recommendations:
         _section("Empfehlungen — wo Labelling am meisten bringt")
@@ -3234,7 +4154,12 @@ if (planAllBtn) {
         _section("Per-Show IoU-Verlauf", default_open=True)
         out.append(per_show_html)
 
-    fingerprints = _compute_show_fingerprints()
+    _t0 = time.time()
+    fingerprints = _compute_show_fingerprints_cached()
+    _t_fp = time.time() - _t0
+    if _t_fp > 0.05:
+        print(f"[learning-page-prof] fingerprints={_t_fp*1000:.0f}ms",
+              flush=True)
     if fingerprints:
         _section(f"Show-Fingerprints ({len(fingerprints)})")
         out.append("<p class='muted'>Shows mit ≥3 user-bestätigten Episoden + "
@@ -3460,7 +4385,12 @@ body.ctrl-min #skipad{background:#0006;color:#ddd;padding:4px 9px;
  background:#fff;border:0;cursor:pointer}
 .pill{background:#fff2;color:#fff;border:0;padding:7px 12px;
  border-radius:16px;font-weight:600;font-size:.85em;cursor:pointer;
- display:inline-flex;align-items:center;gap:5px;flex:0 0 auto;line-height:1}
+ display:inline-flex;align-items:center;gap:5px;flex:0 0 auto;line-height:1;
+ /* Same Mobile-Safari guard as .iconbtn — rapid taps on the bumper
+  ±1s feinjustage buttons get interpreted as double-tap → zoom-in
+  without this. Manipulation also kills the 300ms tap-delay so the
+  buttons feel snappier. */
+ touch-action:manipulation;-webkit-touch-callout:none}
 .pill:active{opacity:.7}
 .pill:disabled{background:#555;color:#bbb;cursor:default}
 #skipad{display:none}
@@ -3751,6 +4681,12 @@ def watch_player(slug):
         info = channel_map.get(slug)
     if not info:
         abort(404, "unknown channel")
+    # Mediathek-live channels (das-erste-hd, etc) get the same VOD-style
+    # tap policy as the recordings player — only center-tap pauses, taps
+    # elsewhere just reveal/hide chrome. True tvheadend live channels keep
+    # the legacy tap-anywhere-pauses (occasionally useful to freeze a
+    # broadcast frame for a moment).
+    is_mediathek_live = "true" if slug in MEDIATHEK_LIVE else "false"
     return f"""<!doctype html>
 <html><head>{PLAYER_HEAD_META}<title>{info['name']}</title>
 <script src="https://cdn.jsdelivr.net/npm/hls.js@1/dist/hls.min.js"></script>
@@ -3835,6 +4771,47 @@ let channels=[];let idx=0;let current='{slug}';
 // double-tap seek handler. Mode-specific `function seek(d)` is defined
 // further down and reached at call-time via function hoisting.
 {PLAYER_BASE_JS}
+/* VOD-style tap policy override (mediathek-live channels only) — same
+   center-circle gate as the recordings player. PLAYER_BASE_JS toggles
+   play/pause on any tap, which is fine for live tvheadend channels but
+   wrong for mediathek-live where you typically tap to reveal/hide
+   chrome rather than pause. Only the central ~18 % radius zone (= iOS
+   native player's play-button area) toggles play/pause; outside taps
+   just toggle the chrome bar. */
+if({is_mediathek_live}){{
+  function _isCenterTap(clientX,clientY){{
+    const r=v.getBoundingClientRect();
+    const cx=r.left+r.width/2, cy=r.top+r.height/2;
+    const dx=clientX-cx, dy=clientY-cy;
+    const radius=Math.min(r.width,r.height)*0.18;
+    return dx*dx+dy*dy <= radius*radius;
+  }}
+  v.addEventListener('click',ev=>{{
+    ev.stopImmediatePropagation();
+    ev.preventDefault();
+    if(Date.now()-_lastTouchT<500)return;
+    if(v.muted&&!v.paused){{v.muted=false;show();return;}}
+    if(_isCenterTap(ev.clientX,ev.clientY)) togglePlay();
+    if(chromeBar.classList.contains('hidden'))show();
+    else {{chromeBar.classList.add('hidden');
+      topbar.classList.add('hidden');}}
+  }},true);
+  v.style.touchAction='manipulation';
+  v.addEventListener('dblclick',ev=>ev.preventDefault());
+  v.addEventListener('touchend',ev=>{{
+    if(!ev.changedTouches[0])return;
+    const cx=ev.changedTouches[0].clientX;
+    const cy=ev.changedTouches[0].clientY;
+    setTimeout(()=>{{
+      if(!_singleTapT)return;
+      if(_isCenterTap(cx,cy))return;
+      clearTimeout(_singleTapT);_singleTapT=null;
+      if(chromeBar.classList.contains('hidden'))show();
+      else {{chromeBar.classList.add('hidden');
+        topbar.classList.add('hidden');}}
+    }},0);
+  }});
+}}
 const chname=document.getElementById('chname');
 const epgEl=document.getElementById('epg');
 const unmuteBtn=document.getElementById('unmute');
@@ -6497,8 +7474,12 @@ def recordings_page():
                                 cskip_info["proc"].poll() is None)
             mac_remuxing = (mac_active and not pi_remux_running
                             and not has_endlist)
-            mac_scanning = (mac_active and not pi_cskip_running
-                            and has_endlist and not has_txt)
+            # Mac-detect-running is signalled directly by the daemon via
+            # /api/internal/detect-started — the old .scanning lockfile
+            # heuristic doesn't fire because tv-thumbs-daemon doesn't
+            # write that file.
+            mac_scanning = (_detect_is_running(uuid)
+                            and not pi_cskip_running and not has_txt)
 
             # Tvheadend-side failure: "completedError" means tvh never
             # produced a usable file — typically "Time missed" (tuner
@@ -7141,6 +8122,29 @@ _rec_hls_procs = {}  # uuid -> {"proc": Popen, "started": ts, "total_segs": int}
 _rec_cskip_lock = threading.Lock()
 _rec_cskip_procs = {}  # uuid -> {"proc": Popen, "started": ts}
 
+# Mac-side detect-running tracker. Mac daemon POSTs to
+# /api/internal/detect-started/<uuid> when it picks a job out of the
+# pending pool, and the cutlist-uploaded endpoint clears the entry on
+# completion. Recordings page reads this to render the 🔍 badge so the
+# user sees that detection is mid-flight rather than just "no ads yet".
+_detect_running_lock = threading.Lock()
+_detect_running = {}  # uuid -> started_at ts
+DETECT_RUNNING_STALE_S = 600  # daemon crash → entry expires after 10 min
+
+
+def _detect_is_running(uuid):
+    """True if the Mac daemon has signalled it picked up this detect job
+    and hasn't reported completion yet. Stale entries (>10 min) are
+    pruned in-place so a crashed daemon doesn't leave permanent badges."""
+    with _detect_running_lock:
+        ts = _detect_running.get(uuid)
+        if ts is None:
+            return False
+        if time.time() - ts > DETECT_RUNNING_STALE_S:
+            _detect_running.pop(uuid, None)
+            return False
+        return True
+
 
 def _rec_source_path(uuid):
     """Return the file path of the DVR recording inside this container
@@ -7178,18 +8182,33 @@ def _rec_source_path(uuid):
     return None
 
 
+_rec_slug_cache = {"ts": 0, "map": {}}
+_REC_SLUG_CACHE_TTL_S = 30
+
+
 def _rec_channel_slug(uuid):
-    """Look up which channel a DVR entry was recorded from, as a slug."""
-    try:
-        data = json.loads(urllib.request.urlopen(
-            f"{TVH_BASE}/api/dvr/entry/grid?limit=400",
-            timeout=6).read())
-        for e in data.get("entries", []):
-            if e.get("uuid") == uuid:
-                return slugify(e.get("channelname") or "")
-    except Exception:
-        pass
-    return ""
+    """Look up which channel a DVR entry was recorded from, as a slug.
+    The full uuid→slug mapping is cached for 30 s — without this every
+    caller (failure-mode aggregator, recommendations engine, etc.)
+    hits the tvh /api/dvr/entry/grid endpoint once per uuid, which
+    on the /learning page added up to hundreds of redundant calls
+    per render and dominated total page-load time."""
+    now = time.time()
+    if now - _rec_slug_cache["ts"] >= _REC_SLUG_CACHE_TTL_S:
+        try:
+            data = json.loads(urllib.request.urlopen(
+                f"{TVH_BASE}/api/dvr/entry/grid?limit=400",
+                timeout=6).read())
+            new_map = {}
+            for e in data.get("entries", []):
+                u = e.get("uuid")
+                if u:
+                    new_map[u] = slugify(e.get("channelname") or "")
+            _rec_slug_cache["map"] = new_map
+            _rec_slug_cache["ts"] = now
+        except Exception:
+            pass
+    return _rec_slug_cache["map"].get(uuid, "")
 
 
 _TVD_LOGO_DIR = HLS_DIR / ".tvd-logos"
@@ -8635,15 +9654,35 @@ def recording_ads(uuid):
             auto = _rec_parse_comskip(out_dir)
     else:
         auto = _rec_parse_comskip(out_dir)
-        if not running and auto:
-            src = _rec_source_path(uuid)
-            if src and Path(src).exists():
-                auto = _blackframe_extend_ads(
-                    src, auto, channel_slug=_rec_channel_slug(uuid))
+        if not running:
+            if auto:
+                src = _rec_source_path(uuid)
+                if src and Path(src).exists():
+                    auto = _blackframe_extend_ads(
+                        src, auto, channel_slug=_rec_channel_slug(uuid))
+            # Only cache when the .txt has the comskip "FILE
+            # PROCESSING COMPLETE" header — that's the marker the
+            # daemon writes ONLY after detect finishes. Without this
+            # check a parallel /ads poll during a bulk-invalidate
+            # window (.txt truncated to empty for a few seconds
+            # before daemon re-detects) caches an empty result that
+            # then sticks even after the daemon delivers real blocks
+            # (since both .txt and cache mtimes update within the
+            # same second on the next read). Truncated/empty .txt
+            # → skip cache → next /ads call after daemon delivery
+            # parses correctly.
+            txt_has_marker = False
             try:
-                ads_cache.write_text(json.dumps(auto))
+                if txts:
+                    head = txts[0].read_text(errors="ignore")[:200]
+                    txt_has_marker = "FILE PROCESSING COMPLETE" in head
             except Exception:
                 pass
+            if txt_has_marker:
+                try:
+                    ads_cache.write_text(json.dumps(auto))
+                except Exception:
+                    pass
 
     merged = _smart_merge_ads(auto, user_ads, deleted)
     # Surface the playlist duration so the client can render ads
@@ -9277,11 +10316,24 @@ def api_internal_detect_config(uuid):
     smooth_s = 0.0
     start_ext = end_ext = 0.0
     min_block_s = max_block_s = None
+    # Bumper match-threshold per channel. 0.75 catches ~73 % of
+    # missed_bumper cases that 0.85 gates out, but turned out to
+    # cause false-positive snaps on RTL (Lenßen −14.7pp, Wetzel
+    # −5.3pp in the 0.85→0.75 A/B). RTL has 100+ generic templates
+    # ("Heute 22:15 X" repeating across many recordings) so its
+    # template set is more prone to ambiguous matches at the lower
+    # threshold. Per-channel override in .channel-config.json keeps
+    # 0.75 as the default for the remaining channels (Charmed
+    # +18pp, Mein Lokal +17pp, Desperate Housewives +9pp wins) and
+    # raises RTL back to 0.85.
+    bumper_threshold = 0.75
     try:
         ch_cfg = json.loads(
             (HLS_DIR / ".channel-config.json").read_text()
         ).get("channels", {}).get(slug, {})
         smooth_s = float(ch_cfg.get("logo_smooth_s", 0))
+        if "bumper_threshold" in ch_cfg:
+            bumper_threshold = float(ch_cfg["bumper_threshold"])
     except Exception: pass
     # Signed drift correction: start_lag (positive = pull start earlier)
     # vs start_shrink (positive = push start later). Combine into one
@@ -9336,6 +10388,7 @@ def api_internal_detect_config(uuid):
         "end_extend_s": end_ext,
         "min_block_s": min_block_s,
         "max_block_s": max_block_s,
+        "bumper_threshold": bumper_threshold,
         "head_url":     "/api/internal/detect-models/head.bin",
         "backbone_url": "/api/internal/detect-models/backbone.onnx",
     }), mimetype="application/json"))
@@ -9356,11 +10409,15 @@ _TVD_BUMPER_DIR = HLS_DIR / ".tvd-bumpers"
 def api_recording_bumper_capture(uuid):
     """User marks a bumper window in the player. We extract one frame
     per second across [start_s, end_s] from the source .ts and write
-    them as PNGs into /mnt/tv/hls/.tvd-bumpers/<channel_slug>/. Each
-    PNG is an independent template for the matcher; max IoU wins.
+    them as PNGs into /mnt/tv/hls/.tvd-bumpers/<channel_slug>/<kind>/.
 
-    Body: {"start_s": float, "end_s": float}.
-    Returns: {ok, slug, count, files}."""
+    Body: {"start_s": float, "end_s": float, "kind": "start"|"end"}.
+    `kind` defaults to "end" for backward compatibility — the player's
+    capture button historically only produced end-bumpers (sixx
+    "WIE SIXX IST DAS DENN?"), but start-bumpers (sixx "WERBUNG"-card)
+    work too now. Each kind feeds an independent per-frame conf stream
+    in tv-detect and only snaps its own boundary.
+    Returns: {ok, slug, kind, count, files}."""
     out_dir = HLS_DIR / f"_rec_{uuid}"
     if not out_dir.exists():
         return Response(json.dumps({"ok": False, "error": "unknown recording"}),
@@ -9371,6 +10428,11 @@ def api_recording_bumper_capture(uuid):
         e = float(body.get("end_s"))
     except (TypeError, ValueError):
         return Response(json.dumps({"ok": False, "error": "start_s/end_s required"}),
+                        status=400, mimetype="application/json")
+    kind = (body.get("kind") or "end").lower()
+    if kind not in ("start", "end"):
+        return Response(json.dumps({"ok": False,
+            "error": "kind must be 'start' or 'end'"}),
                         status=400, mimetype="application/json")
     if e <= s or e - s > 30:
         return Response(json.dumps({"ok": False,
@@ -9384,7 +10446,7 @@ def api_recording_bumper_capture(uuid):
     if not src or not Path(src).exists():
         return Response(json.dumps({"ok": False, "error": "source .ts missing"}),
                         status=404, mimetype="application/json")
-    bdir = _TVD_BUMPER_DIR / slug
+    bdir = _TVD_BUMPER_DIR / slug / kind
     bdir.mkdir(parents=True, exist_ok=True)
     base = f"bumper-{uuid[:8]}-{int(s)}"
     pattern = str(bdir / f"{base}-%02d.png")
@@ -9413,13 +10475,75 @@ def api_recording_bumper_capture(uuid):
     note = ""
     if skipped:
         note = f", skipped {len(skipped)} oversized (likely show)"
+
+    # Auto-align: if the user has an ad-block whose matching boundary
+    # sits within ±30 s of the captured bumper window, snap it to the
+    # bumper position. The bumper is the precise transition frame the
+    # user just identified — leaving the rougher block boundary in
+    # place would waste that signal. For kind=start, snap the block
+    # START to the FIRST captured frame (= first ad frame for a
+    # WERBUNG-card); for kind=end, snap the block END to one frame
+    # after the LAST captured frame (= first show frame after the
+    # bumper window). Returns the alignment in the response so the
+    # player can show a confirmation toast.
+    aligned = None
+    user_cache = out_dir / "ads_user.json"
+    if user_cache.exists():
+        try:
+            raw = json.loads(user_cache.read_text())
+        except Exception:
+            raw = None
+        if isinstance(raw, dict) and isinstance(raw.get("ads"), list):
+            blocks = raw["ads"]
+            best = None  # (block_idx, dist, old_val, new_val)
+            for i, blk in enumerate(blocks):
+                if not (isinstance(blk, list) and len(blk) >= 2):
+                    continue
+                bs, be = float(blk[0]), float(blk[1])
+                if kind == "start":
+                    new_val = float(s)
+                    d = abs(bs - new_val)
+                    old_val = bs
+                else:
+                    new_val = float(e)
+                    d = abs(be - new_val)
+                    old_val = be
+                if d > 30:
+                    continue
+                if best is None or d < best[1]:
+                    best = (i, d, old_val, new_val)
+            if best:
+                i, d, old_val, new_val = best
+                # Refuse if the new boundary would invert or zero the
+                # block (start >= end). Better to bail than to corrupt
+                # the user's manual block.
+                bs, be = float(blocks[i][0]), float(blocks[i][1])
+                if kind == "start":
+                    if new_val < be:
+                        blocks[i][0] = new_val
+                        aligned = {"block": i, "boundary": "start",
+                                   "old": old_val, "new": new_val}
+                else:
+                    if new_val > bs:
+                        blocks[i][1] = new_val
+                        aligned = {"block": i, "boundary": "end",
+                                   "old": old_val, "new": new_val}
+                if aligned:
+                    raw["ads"] = blocks
+                    user_cache.write_text(json.dumps(raw))
+
     n_invalidated = _invalidate_detect_for_channel(slug)
-    print(f"[bumper-capture {uuid[:8]}] {slug}: {len(files)} frames "
-          f"in [{s:.1f}, {e:.1f}]s{note} — invalidated "
+    align_log = (f" — aligned block {aligned['block']} "
+                 f"{aligned['boundary']} {aligned['old']:.1f}→"
+                 f"{aligned['new']:.1f}s") if aligned else ""
+    print(f"[bumper-capture {uuid[:8]}] {slug}/{kind}: {len(files)} "
+          f"frames in [{s:.1f}, {e:.1f}]s{note}{align_log} — invalidated "
           f"{n_invalidated} recording(s) for re-detect", flush=True)
     return _cors(Response(json.dumps({
-        "ok": True, "slug": slug, "count": len(files), "files": files,
-        "skipped_oversized": skipped, "invalidated": n_invalidated}),
+        "ok": True, "slug": slug, "kind": kind, "count": len(files),
+        "files": files, "skipped_oversized": skipped,
+        "aligned": aligned,
+        "invalidated": n_invalidated}),
         mimetype="application/json"))
 
 
@@ -9448,21 +10572,38 @@ def _invalidate_detect_for_channel(slug):
 @app.route("/api/internal/detect-bumpers/<slug>")
 def api_internal_detect_bumpers(slug):
     """Lists per-channel bumper template PNGs for the Mac daemon to
-    download before invoking tv-detect. Templates live at
-    /mnt/tv/hls/.tvd-bumpers/<slug>/*.png — one or more per channel,
-    each a reference frame of a station-id card animation that recurs
-    at ad-block ends. Multiple PNGs cover color variants (RTL's "Mein
-    RTL" cycles through several palettes per appearance).
-    Returns {"templates": [{"name": "01.png", "url": "..."}, ...]}.
-    Empty list = no templates configured for this channel."""
+    download before invoking tv-detect. Two kinds:
+      - END   bumpers (e.g. sixx "WIE SIXX IST DAS DENN?", RTL "Mein
+        RTL") live in /mnt/tv/hls/.tvd-bumpers/<slug>/end/ AND in the
+        legacy channel-root /mnt/tv/hls/.tvd-bumpers/<slug>/*.png
+        (everything captured before the start/end split).
+      - START bumpers (e.g. sixx "WERBUNG"-announcer card) live in
+        /mnt/tv/hls/.tvd-bumpers/<slug>/start/.
+    Returns {"templates": [...end...], "start_templates": [...start...]}.
+    Each entry: {"name", "url"}. Daemon downloads both, passes them
+    to tv-detect via --bumper-templates / --bumper-templates-start so
+    a start-bumper hit can't pull a block end and vice versa."""
     d = _TVD_BUMPER_DIR / slug
-    out = []
+    end_out, start_out = [], []
     if d.is_dir():
         for p in sorted(d.glob("*.png")):
-            out.append({
+            end_out.append({
                 "name": p.name,
                 "url": f"/api/internal/detect-bumper/{slug}/{p.name}"})
-    return _cors(Response(json.dumps({"templates": out}),
+        end_dir = d / "end"
+        if end_dir.is_dir():
+            for p in sorted(end_dir.glob("*.png")):
+                end_out.append({
+                    "name": p.name,
+                    "url": f"/api/internal/detect-bumper/{slug}/end/{p.name}"})
+        start_dir = d / "start"
+        if start_dir.is_dir():
+            for p in sorted(start_dir.glob("*.png")):
+                start_out.append({
+                    "name": p.name,
+                    "url": f"/api/internal/detect-bumper/{slug}/start/{p.name}"})
+    return _cors(Response(json.dumps(
+        {"templates": end_out, "start_templates": start_out}),
                             mimetype="application/json"))
 
 
@@ -9476,15 +10617,33 @@ def api_internal_detect_bumper(slug, fname):
     return send_file(p, mimetype="image/png")
 
 
+@app.route("/api/internal/detect-bumper/<slug>/<kind>/<fname>")
+def api_internal_detect_bumper_kind(slug, kind, fname):
+    if kind not in ("start", "end"):
+        abort(404)
+    if not re.fullmatch(r"[\w.-]+\.png", fname):
+        abort(404)
+    p = _TVD_BUMPER_DIR / slug / kind / fname
+    if not p.is_file():
+        abort(404)
+    return send_file(p, mimetype="image/png")
+
+
 @app.route("/api/bumper/<slug>/<fname>", methods=["DELETE"])
 def api_bumper_delete(slug, fname):
     """Remove a bumper template that turned out to be a show frame.
-    Used by the /learning UI's per-template delete buttons."""
+    Used by the /learning UI's per-template delete buttons.
+    Looks in the kind subdirs first (start/, end/), then falls back
+    to the legacy channel-root location for templates captured before
+    the start/end split."""
     if not re.fullmatch(r"[\w.-]+\.png", fname):
         return Response(json.dumps({"ok": False, "error": "bad name"}),
                         status=400, mimetype="application/json")
-    p = _TVD_BUMPER_DIR / slug / fname
-    if not p.is_file():
+    candidates = [_TVD_BUMPER_DIR / slug / "end" / fname,
+                  _TVD_BUMPER_DIR / slug / "start" / fname,
+                  _TVD_BUMPER_DIR / slug / fname]
+    p = next((c for c in candidates if c.is_file()), None)
+    if p is None:
         return Response(json.dumps({"ok": False, "error": "not found"}),
                         status=404, mimetype="application/json")
     try:
@@ -9513,6 +10672,17 @@ def api_internal_detect_models(fname):
     return send_file(p, conditional=True)
 
 
+@app.route("/api/internal/detect-started/<uuid>", methods=["POST"])
+def api_internal_detect_started(uuid):
+    """Mac daemon signals it just picked up <uuid> from the pending
+    pool. Recorded in-memory so the recordings page can render a
+    "detect läuft" badge instead of leaving the row looking idle."""
+    with _detect_running_lock:
+        _detect_running[uuid] = time.time()
+    return _cors(Response(json.dumps({"ok": True}),
+                            mimetype="application/json"))
+
+
 @app.route("/api/internal/cutlist-uploaded/<uuid>", methods=["POST"])
 def api_internal_cutlist_uploaded(uuid):
     """Mac daemon POSTs the raw tv-detect cutlist .txt body here.
@@ -9531,6 +10701,8 @@ def api_internal_cutlist_uploaded(uuid):
     if marker.exists():
         try: marker.unlink()
         except Exception: pass
+    with _detect_running_lock:
+        _detect_running.pop(uuid, None)
     print(f"[rec-cskip {uuid[:8]}] Mac delivered cutlist "
           f"({len(body)} B)", flush=True)
     return _cors(Response(json.dumps({"ok": True, "bytes": len(body)}),
@@ -10090,6 +11262,45 @@ def _render_mediathek_player(uuid, entry):
             f"<script>"
             f"const PLAYER_HOME='{HOST_URL}/recordings';"
             f"{PLAYER_BASE_JS}"
+            f"/* Tap policy override — same center-circle gate as the"
+            f"   recordings player. PLAYER_BASE_JS toggles play/pause on"
+            f"   any tap (correct for live channels), but for VOD-style"
+            f"   playback (Mediathek) we want to be able to tap"
+            f"   anywhere to reveal/hide chrome WITHOUT pausing. Only"
+            f"   the central ~18 % radius zone (matching the iOS"
+            f"   native player's play-button area) toggles play/pause. */"
+            f"function _isCenterTap(clientX,clientY){{"
+            f"  const r=v.getBoundingClientRect();"
+            f"  const cx=r.left+r.width/2, cy=r.top+r.height/2;"
+            f"  const dx=clientX-cx, dy=clientY-cy;"
+            f"  const radius=Math.min(r.width,r.height)*0.18;"
+            f"  return dx*dx+dy*dy <= radius*radius;"
+            f"}}"
+            f"v.addEventListener('click',ev=>{{"
+            f"  ev.stopImmediatePropagation();"
+            f"  ev.preventDefault();"
+            f"  if(Date.now()-_lastTouchT<500)return;"
+            f"  if(v.muted&&!v.paused){{v.muted=false;show();return;}}"
+            f"  if(_isCenterTap(ev.clientX,ev.clientY)) togglePlay();"
+            f"  if(chromeBar.classList.contains('hidden'))show();"
+            f"  else {{chromeBar.classList.add('hidden');"
+            f"    topbar.classList.add('hidden');}}"
+            f"}},true);"
+            f"v.style.touchAction='manipulation';"
+            f"v.addEventListener('dblclick',ev=>ev.preventDefault());"
+            f"v.addEventListener('touchend',ev=>{{"
+            f"  if(!ev.changedTouches[0])return;"
+            f"  const cx=ev.changedTouches[0].clientX;"
+            f"  const cy=ev.changedTouches[0].clientY;"
+            f"  setTimeout(()=>{{"
+            f"    if(!_singleTapT)return;"
+            f"    if(_isCenterTap(cx,cy))return;"
+            f"    clearTimeout(_singleTapT);_singleTapT=null;"
+            f"    if(chromeBar.classList.contains('hidden'))show();"
+            f"    else {{chromeBar.classList.add('hidden');"
+            f"      topbar.classList.add('hidden');}}"
+            f"  }},0);"
+            f"}});"
             f"const cur=document.getElementById('cur');"
             f"const dur=document.getElementById('dur');"
             f"function fmt(s){{"
@@ -10539,23 +11750,34 @@ def play_recording(uuid):
             f"}}"
             f"/* Mark-mode wrapper: same buttons drive ad-block marking"
             f"   OR bumper-template capture, depending on the mode toggle."
-            f"   Default 'ad' preserves old behaviour; 'bumper' routes to"
-            f"   POST /api/recording/<uuid>/bumper-capture which extracts"
-            f"   one frame per second across [start,end] into the channel's"
-            f"   .tvd-bumpers/<slug>/ dir (auto-named). Mode persists across"
-            f"   page loads via localStorage. */"
+            f"   Three states cycle on tap:"
+            f"     'ad'           — Start/End mark a Werbung-block"
+            f"     'bumper-end'   — Start/End mark END-of-ad-break bumper"
+            f"                       (ad→show transition; e.g. sixx 'WIE SIXX"
+            f"                       IST DAS DENN?'). Snaps block.endS."
+            f"     'bumper-start' — Start/End mark START-of-ad-break bumper"
+            f"                       (show→ad transition; e.g. sixx 'WERBUNG'-"
+            f"                       announcer card). Snaps block.startS."
+            f"   The capture POST sends `kind` so the server writes to the"
+            f"   correct .tvd-bumpers/<slug>/<kind>/ subdir. Mode persists"
+            f"   in localStorage. */"
             f"const MARK_MODE_KEY='player-mark-mode';"
+            f"const MARK_MODES=['ad','bumper-end','bumper-start'];"
             f"let _markMode='ad';"
-            f"try{{_markMode=localStorage.getItem(MARK_MODE_KEY)||'ad';}}catch(e){{}}"
+            f"try{{const m=localStorage.getItem(MARK_MODE_KEY);"
+            f"     if(MARK_MODES.indexOf(m)>=0)_markMode=m;}}catch(e){{}}"
             f"let _bumperStaging=null;"
+            f"function _isBumperMode(){{return _markMode!=='ad';}}"
+            f"function _bumperKind(){{return _markMode==='bumper-start'?'start':'end';}}"
             f"function _renderMarkBtn(){{"
             f"  const b=document.getElementById('mark-mode');if(!b)return;"
-            f"  if(_markMode==='bumper'){{b.textContent='🎬 Bumper';b.classList.add('rec');}}"
+            f"  if(_markMode==='bumper-end'){{b.textContent='🎬 Bumper End';b.classList.add('rec');}}"
+            f"  else if(_markMode==='bumper-start'){{b.textContent='🎬 Bumper Start';b.classList.add('rec');}}"
             f"  else{{b.textContent='🎯 Werbung';b.classList.remove('rec');}}"
-            f"  /* Show step-buttons only in bumper mode — they're noisy"
+            f"  /* Show step-buttons only in bumper modes — they're noisy"
             f"     during normal ad-block marking and useless in playback. */"
             f"  document.querySelectorAll('.bumper-only').forEach(el=>{{"
-            f"    el.style.display=_markMode==='bumper'?'':'none';"
+            f"    el.style.display=_isBumperMode()?'':'none';"
             f"  }});"
             f"}}"
             f"/* Pause-on-click + delta-jump. Pausing first ensures the"
@@ -10570,18 +11792,22 @@ def play_recording(uuid):
             f"}}"
             f"_renderMarkBtn();"
             f"function toggleMarkMode(){{"
-            f"  _markMode=_markMode==='ad'?'bumper':'ad';"
+            f"  const i=MARK_MODES.indexOf(_markMode);"
+            f"  _markMode=MARK_MODES[(i+1)%MARK_MODES.length];"
             f"  try{{localStorage.setItem(MARK_MODE_KEY,_markMode);}}catch(e){{}}"
             f"  _renderMarkBtn();"
-            f"  _adShowToast(_markMode==='bumper'?"
-            f"    'Bumper-Modus: Start/Ende markieren das Bumper-Fenster':"
-            f"    'Werbe-Modus: Start/Ende markieren einen Werbeblock');"
+            f"  const msg=_markMode==='bumper-end'?"
+            f"    'Bumper-End-Modus: Werbung→Show Übergang markieren':"
+            f"    _markMode==='bumper-start'?"
+            f"      'Bumper-Start-Modus: Show→Werbung Übergang markieren':"
+            f"      'Werbe-Modus: Start/Ende markieren einen Werbeblock';"
+            f"  _adShowToast(msg);"
             f"}}"
             f"function markStart(){{"
-            f"  if(_markMode==='bumper'){{bumperMarkStart();}}else{{adMarkStart();}}"
+            f"  if(_isBumperMode()){{bumperMarkStart();}}else{{adMarkStart();}}"
             f"}}"
             f"function markEnd(){{"
-            f"  if(_markMode==='bumper'){{bumperMarkEnd();}}else{{adMarkEnd();}}"
+            f"  if(_isBumperMode()){{bumperMarkEnd();}}else{{adMarkEnd();}}"
             f"}}"
             f"function bumperMarkStart(){{"
             f"  const t=Math.max(0,v.currentTime||0);"
@@ -10597,10 +11823,17 @@ def play_recording(uuid):
             f"  _adShowToast('Speichere Bumper-Frames…');"
             f"  fetch('{HOST_URL}/api/recording/{uuid}/bumper-capture',"
             f"    {{method:'POST',headers:{{'Content-Type':'application/json'}},"
-            f"     body:JSON.stringify({{start_s:s,end_s:e}})}})"
+            f"     body:JSON.stringify({{start_s:s,end_s:e,kind:_bumperKind()}})}})"
             f"   .then(r=>r.json()).then(d=>{{"
             f"      if(d&&d.ok){{"
-            f"        let msg=d.count+' Frame(s) als Bumper für '+d.slug+' gespeichert';"
+            f"        let msg=d.count+' Frame(s) als Bumper-'+(d.kind||'end')+' für '+d.slug+' gespeichert';"
+            f"        if(d.aligned){{"
+            f"          msg+=' • Block '+d.aligned.boundary+' '+d.aligned.old.toFixed(1)+'s→'+d.aligned.new.toFixed(1)+'s justiert';"
+            f"          /* Reload merged ads view so the scrub-bar marker"
+            f"             jumps to the new boundary immediately. */"
+            f"          fetch('{HOST_URL}/recording/{uuid}/ads').then(r=>r.json())"
+            f"            .then(a=>{{ads=a.ads||[];renderAds();}}).catch(()=>{{}});"
+            f"        }}"
             f"        if(d.skipped_oversized&&d.skipped_oversized.length){{"
             f"          msg+=' ('+d.skipped_oversized.length+' Show-Frame'+"
             f"               (d.skipped_oversized.length===1?'':'s')+' verworfen)';"
