@@ -3289,6 +3289,36 @@ def _render_failure_modes(per_show, per_channel):
 LEARNING_MIN_SAMPLES_FOR_DRIFT = 5  # mirrors the drift-learning gate
 
 
+def _label_yield_score(uuid):
+    """Information-gain proxy for picking which unreviewed recording
+    is most worth the user's review time. Returns a non-negative
+    score; higher = more informative. Two components:
+
+      1. Sum of per-frame model uncertainty from head.uncertain.txt
+         (frames where train-head's active-learning surface flagged
+         the head as least confident). Recordings the model is
+         genuinely confused about score high.
+      2. Tiny recency tiebreaker — newer recordings preferred when
+         the uncertainty signal is identical (fresher schedule
+         patterns are usually more relevant).
+
+    Returns 0 for recordings the active-learning step never saw
+    (= bootstrap recordings without cached features). Those still
+    get reviewed eventually, just not first."""
+    items = _uncertain_for_recording(uuid)
+    if not items:
+        return 0.0
+    # Each entry's uncertainty: 1 at p=0.5, 0 at p=0/1.
+    score = sum(1.0 - 2.0 * abs(it["p"] - 0.5) for it in items)
+    # Recency: minute granularity is enough to break ties.
+    try:
+        mtime = (HLS_DIR / f"_rec_{uuid}" / "index.m3u8").stat().st_mtime
+        score += mtime / 1e12  # tiny epsilon, only breaks ties
+    except Exception:
+        pass
+    return score
+
+
 def _aggregate_show_gaps():
     """Returns a sorted list of (show, slug, n_total, n_reviewed,
     n_unreviewed_playable, suggestion) tuples for shows that would
@@ -3303,6 +3333,11 @@ def _aggregate_show_gaps():
                          noise; getting to 3+ stabilises metrics)
       "velocity"      — N reviewed ≥ threshold but ≥5 unreviewed sit
                          around (= cheap source of fresh training data)
+
+    For shows with multiple unreviewed siblings, the action-button
+    UUID is the one with highest label-yield score (= maximum model
+    uncertainty across its frames) — labelling THAT one gives the
+    biggest model-update per minute of user time.
     """
     by_show = {}
     for d in HLS_DIR.glob("_rec_*"):
@@ -3330,6 +3365,11 @@ def _aggregate_show_gaps():
         elif playable:
             entry["n_unreviewed_playable"] += 1
             entry["uuids_unreviewed"].append(uuid)
+    # Sort each show's unreviewed UUIDs by label-yield score so the
+    # action button targets the most informative one.
+    for entry in by_show.values():
+        entry["uuids_unreviewed"].sort(
+            key=_label_yield_score, reverse=True)
 
     out = []
     for show, e in by_show.items():
@@ -3380,7 +3420,12 @@ def _render_show_gaps(gaps):
     }
     out = ["<p class='muted'>Aufnahmen pro Show: wo ein paar weitere "
            "Reviews den größten Hebel hätten. Klick auf eine Aufnahme "
-           "öffnet sie direkt im Player.</p>"]
+           "öffnet sie direkt im Player. Bei Shows mit mehreren "
+           "ungeprüften Folgen wird die <b>informativste</b> als "
+           "Top-Pick angeboten — die Aufnahme wo das Modell die "
+           "höchste Unsicherheit zeigt (= eine Review dort bringt "
+           "dem Modell am meisten Verbesserung pro Minute deiner "
+           "Zeit).</p>"]
     # Horizontal scroll wrapper — on mobile the table is wider than
     # the viewport (show titles + action button); without this the
     # outer section gets clipped instead of letting the table scroll
@@ -3394,11 +3439,24 @@ def _render_show_gaps(gaps):
          uuids_open) in gaps:
         emoji, color, hint = sugg_label[sugg]
         first_uuid = uuids_open[0] if uuids_open else ""
+        # Top-Pick badge when there are siblings AND we have a label-
+        # yield signal (= the model surfaced uncertain frames for the
+        # picked UUID). Without that signal the order is just by
+        # recency, so don't oversell it as a "smart pick".
+        top_pick = (len(uuids_open) > 1 and first_uuid
+                    and _label_yield_score(first_uuid) > 0)
+        label = "🎯 Top-Pick prüfen" if top_pick else "➜ prüfen"
+        action_title = (
+            "Modell zeigt hier die höchste Unsicherheit "
+            f"({len(uuids_open)} ungeprüfte Folgen, beste Wahl voraus)"
+            if top_pick else
+            f"Eine von {len(uuids_open)} ungeprüften Folge(n)")
         action = (f"<a href='{HOST_URL}/recording/{first_uuid}' "
+                  f"title='{action_title}' "
                   f"class='pill' style='background:{color};color:#fff;"
                   f"text-decoration:none;padding:3px 8px;font-size:.85em;"
                   f"white-space:nowrap'>"
-                  f"➜ prüfen</a>"
+                  f"{label}</a>"
                   if first_uuid else "")
         out.append(f"<tr><td><b>{show}</b></td>"
                    f"<td>{slug}</td><td>{n_total}</td>"
