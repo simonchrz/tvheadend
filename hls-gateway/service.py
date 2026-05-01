@@ -7720,26 +7720,42 @@ def recordings_page():
 
     now_ts = int(time.time())
     # Bucket entries by autorec UUID so we can render a collapsible
-    # "series" group row + its children. Two-pass: first by real
-    # autorec, then synthesize an "orphan:title|channel" key for any
-    # remaining solo entries that share (title, channel) with another
-    # solo (= recordings whose autorec rule was deleted but the
-    # episodes themselves remain — tvh nulls the back-reference).
-    # Singletons stay in the "" solo bucket so a one-off recording
-    # doesn't render as a 1-episode series.
+    # "series" group row + its children. Three-pass:
+    #  1) Real autorec entries → by_autorec[ar]
+    #  2) Build a (title, channel) → ar_uuid lookup from pass 1 so
+    #     orphans can rejoin their old group (= autorec rule deleted
+    #     after some episodes already aired, OR rule replaced and the
+    #     old episodes lost their back-reference).
+    #  3) Orphans → join existing autorec group if (title, channel)
+    #     matches; else cluster orphans-with-orphans into a synthetic
+    #     "orphan:title|channel" group when ≥2 share a title; else
+    #     solo. Singletons stay in the "" solo bucket so a one-off
+    #     recording doesn't render as a 1-episode series.
     by_autorec = {}
-    orphan_buckets = {}
+    title_ch_to_ar = {}
     for e in data.get("entries", []):
         ar = e.get("autorec") or ""
         if ar:
             by_autorec.setdefault(ar, []).append(e)
-        else:
             title = (e.get("disp_title") or "").strip()
             ch = (e.get("channelname") or "").strip()
             if title:
-                orphan_buckets.setdefault((title, ch), []).append(e)
-            else:
-                by_autorec.setdefault("", []).append(e)
+                title_ch_to_ar.setdefault((title, ch), ar)
+    orphan_buckets = {}
+    for e in data.get("entries", []):
+        ar = e.get("autorec") or ""
+        if ar:
+            continue
+        title = (e.get("disp_title") or "").strip()
+        ch = (e.get("channelname") or "").strip()
+        if not title:
+            by_autorec.setdefault("", []).append(e)
+            continue
+        existing_ar = title_ch_to_ar.get((title, ch))
+        if existing_ar:
+            by_autorec[existing_ar].append(e)
+        else:
+            orphan_buckets.setdefault((title, ch), []).append(e)
     for (title, ch), eps in orphan_buckets.items():
         if len(eps) >= 2:
             by_autorec[f"orphan:{title}|{ch}"] = eps
