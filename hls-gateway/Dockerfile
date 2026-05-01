@@ -1,4 +1,4 @@
-FROM python:3.12-slim
+FROM python:3.13-slim
 
 # Static ffmpeg from BtbN (ffmpeg.org's linked provider). Debian
 # Trixie freezes at 7.1.x; we want 8.1+ for HLS PDT fixes and the
