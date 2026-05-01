@@ -7720,12 +7720,31 @@ def recordings_page():
 
     now_ts = int(time.time())
     # Bucket entries by autorec UUID so we can render a collapsible
-    # "series" group row + its children. Solo entries (no autorec)
-    # stay on their own.
+    # "series" group row + its children. Two-pass: first by real
+    # autorec, then synthesize an "orphan:title|channel" key for any
+    # remaining solo entries that share (title, channel) with another
+    # solo (= recordings whose autorec rule was deleted but the
+    # episodes themselves remain — tvh nulls the back-reference).
+    # Singletons stay in the "" solo bucket so a one-off recording
+    # doesn't render as a 1-episode series.
     by_autorec = {}
+    orphan_buckets = {}
     for e in data.get("entries", []):
         ar = e.get("autorec") or ""
-        by_autorec.setdefault(ar, []).append(e)
+        if ar:
+            by_autorec.setdefault(ar, []).append(e)
+        else:
+            title = (e.get("disp_title") or "").strip()
+            ch = (e.get("channelname") or "").strip()
+            if title:
+                orphan_buckets.setdefault((title, ch), []).append(e)
+            else:
+                by_autorec.setdefault("", []).append(e)
+    for (title, ch), eps in orphan_buckets.items():
+        if len(eps) >= 2:
+            by_autorec[f"orphan:{title}|{ch}"] = eps
+        else:
+            by_autorec.setdefault("", []).extend(eps)
     # The 3 next-to-start scheduled recordings get a "⏰ als nächstes"
     # badge so the user can see at a glance what's coming up next
     # without scanning through all the future entries (sorted
@@ -8034,10 +8053,16 @@ def recordings_page():
         parts.append(f"{upcoming} geplant")
         badge = (f'<span class="badge series">📺 Serie · '
                  f'{" · ".join(parts)}</span>')
-        kill_btn = (f'<button class="series-kill" '
-                    f'onclick="cancelSeries(event,\'{ar_uuid}\',\'{group_title}\',{upcoming})" '
-                    f'title="Serien-Aufzeichnungs-Regel löschen">'
-                    f'🗑</button>')
+        # No kill-button for orphan groups (= autorec rule already
+        # deleted; nothing left to cancel). The grouping is purely
+        # cosmetic for already-completed episodes.
+        if ar_uuid.startswith("orphan:"):
+            kill_btn = ""
+        else:
+            kill_btn = (f'<button class="series-kill" '
+                        f'onclick="cancelSeries(event,\'{ar_uuid}\',\'{group_title}\',{upcoming})" '
+                        f'title="Serien-Aufzeichnungs-Regel löschen">'
+                        f'🗑</button>')
         # Keep group expanded if any episode needs attention (recording
         # right now, being remuxed, or comskip is running on it).
         any_active = bool(live) or any(
