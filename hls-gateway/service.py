@@ -126,6 +126,7 @@ STATS_FILE       = HLS_DIR / ".usage_stats.json"
 EPG_ARCHIVE_FILE = HLS_DIR / ".epg_archive.jsonl"
 ALWAYS_WARM_FILE = HLS_DIR / ".always_warm.json"
 EPG_META_FILE    = HLS_DIR / ".epg_meta.json"  # tvmaze poster + rating cache
+USER_GROUPS_FILE = HLS_DIR / ".user-groups.json"  # manual recording groups (= cross-title franchise grouping like Rocky/Asterix)
 EPG_META_TTL_S   = 30 * 86400                  # re-fetch each title monthly
 CH_LOGO_DIR      = Path(__file__).parent / "static" / "ch-logos"
 TMDB_API_KEY     = os.environ.get("TMDB_API_KEY", "").strip()  # optional: better DE show coverage
@@ -7719,8 +7720,11 @@ def recordings_page():
         abort(502, f"tvheadend: {e}")
 
     now_ts = int(time.time())
-    # Bucket entries by autorec UUID so we can render a collapsible
-    # "series" group row + its children. Three-pass:
+    # Bucket entries into series groups. Four passes (priority order):
+    #  0) User-defined groups (= manual franchise grouping like Rocky
+    #     1-5 or Asterix-films, where each entry has a unique title so
+    #     autorec can't catch it). UUIDs in user groups are pre-claimed
+    #     and skipped by passes 1-3.
     #  1) Real autorec entries → by_autorec[ar]
     #  2) Build a (title, channel) → ar_uuid lookup from pass 1 so
     #     orphans can rejoin their old group (= autorec rule deleted
@@ -7731,9 +7735,23 @@ def recordings_page():
     #     "orphan:title|channel" group when ≥2 share a title; else
     #     solo. Singletons stay in the "" solo bucket so a one-off
     #     recording doesn't render as a 1-episode series.
+    user_groups = _load_user_groups()
+    uuid_to_user_group = {}
+    for g_name, g_uuids in user_groups.items():
+        for u in g_uuids:
+            uuid_to_user_group[u] = g_name
     by_autorec = {}
+    # Pre-create user group buckets in deterministic order so they
+    # render at a stable position (alphabetical by name).
+    for g_name in sorted(user_groups.keys()):
+        by_autorec[f"usergroup:{g_name}"] = []
     title_ch_to_ar = {}
     for e in data.get("entries", []):
+        u = e.get("uuid", "")
+        # Pass 0 — user-group has top priority over autorec/orphan.
+        if u in uuid_to_user_group:
+            by_autorec[f"usergroup:{uuid_to_user_group[u]}"].append(e)
+            continue
         ar = e.get("autorec") or ""
         if ar:
             by_autorec.setdefault(ar, []).append(e)
@@ -7741,8 +7759,16 @@ def recordings_page():
             ch = (e.get("channelname") or "").strip()
             if title:
                 title_ch_to_ar.setdefault((title, ch), ar)
+    # Drop any user-group bucket that ended up empty (= configured
+    # UUIDs no longer exist on the grid; recording was deleted from
+    # tvh).
+    by_autorec = {k: v for k, v in by_autorec.items()
+                  if not k.startswith("usergroup:") or v}
     orphan_buckets = {}
     for e in data.get("entries", []):
+        u = e.get("uuid", "")
+        if u in uuid_to_user_group:
+            continue
         ar = e.get("autorec") or ""
         if ar:
             continue
@@ -8038,8 +8064,16 @@ def recordings_page():
                     f'<td>{when}</td>'
                     f'<td>{dur_min} min</td>'
                     f'{tools_cell}</tr>')
+        # Edit-mode checkbox prepended to status cell. Hidden via CSS
+        # outside of edit-mode. Only top-level (solo) rows are
+        # selectable — series-children and series headers stay non-
+        # selectable (= can't pull an episode out of an autorec series
+        # into a manual group; dissolve-group is the way back).
+        sel_box = (f'<input type="checkbox" class="rec-select" '
+                   f'data-uuid="{uuid}" data-title="{title}" '
+                   f'aria-label="Auswählen">')
         return (f'<tr{anchor_attr} data-status="{row_status}"{edited_attr}>'
-                f'<td>{status_cell}</td>'
+                f'<td>{sel_box}{status_cell}</td>'
                 f'<td>{title_cell}</td>'
                 f'<td>{when}</td>'
                 f'<td>{dur_min} min</td>'
@@ -8056,7 +8090,13 @@ def recordings_page():
         key=lambda kv: max((e.get("start", 0) for e in kv[1]), default=0),
         reverse=True)
     for ar_uuid, eps in series_groups:
-        group_title = eps[0].get("disp_title", "?")
+        # User-group: synthetic key carries the user-chosen name.
+        # Display that as the group title rather than the first
+        # episode's disp_title (which would be one specific film).
+        if ar_uuid.startswith("usergroup:"):
+            group_title = ar_uuid[len("usergroup:"):]
+        else:
+            group_title = eps[0].get("disp_title", "?")
         live = sum(1 for e in eps
                    if e.get("start", 0) <= now_ts < e.get("stop", 0)
                    and e.get("sched_status") == "recording")
@@ -8069,11 +8109,21 @@ def recordings_page():
         parts.append(f"{upcoming} geplant")
         badge = (f'<span class="badge series">📺 Serie · '
                  f'{" · ".join(parts)}</span>')
-        # No kill-button for orphan groups (= autorec rule already
-        # deleted; nothing left to cancel). The grouping is purely
-        # cosmetic for already-completed episodes.
+        # Per-group-type buttons:
+        #   real autorec → "🗑" cancels the autorec rule (= future
+        #     scheduled entries gone, completed kept)
+        #   orphan       → no button (rule already gone, nothing
+        #     to cancel)
+        #   usergroup    → "🗑" dissolves the manual grouping (= just
+        #     removes the user-group entry, recordings stay)
         if ar_uuid.startswith("orphan:"):
             kill_btn = ""
+        elif ar_uuid.startswith("usergroup:"):
+            g = ar_uuid[len("usergroup:"):].replace("'", "\\'")
+            kill_btn = (f'<button class="series-kill" '
+                        f'onclick="dissolveUserGroup(event,\'{g}\')" '
+                        f'title="Manuelle Gruppe auflösen (Aufnahmen bleiben)">'
+                        f'🗑</button>')
         else:
             kill_btn = (f'<button class="series-kill" '
                         f'onclick="cancelSeries(event,\'{ar_uuid}\',\'{group_title}\',{upcoming})" '
@@ -8303,6 +8353,28 @@ def recordings_page():
             f".series-toggle:hover{{background:var(--code-bg);"
             f"border-color:var(--link);color:var(--link)}}"
             f"tr.row-hidden{{display:none}}"
+            # Edit-mode UI — checkboxes hidden by default, made
+            # visible by JS toggling body.edit-mode. Floating toolbar
+            # sits below the filter row when active.
+            f".rec-select{{display:none;margin-right:6px;"
+            f"vertical-align:middle;width:16px;height:16px;cursor:pointer}}"
+            f"body.edit-mode .rec-select{{display:inline-block}}"
+            f"body.edit-mode .series-kill,body.edit-mode .row-tools{{"
+            f"opacity:.4;pointer-events:none}}"
+            f".edit-toolbar{{display:flex;gap:10px;align-items:center;"
+            f"padding:8px 16px;background:var(--code-bg);"
+            f"border-bottom:1px solid var(--border);"
+            f"position:sticky;top:0;z-index:10}}"
+            f".edit-toolbar .sel-count{{color:var(--muted);font-size:.9em}}"
+            f".edit-toolbar button{{padding:5px 12px;"
+            f"border:1px solid var(--border);border-radius:6px;"
+            f"background:var(--stripe);color:var(--fg);cursor:pointer;"
+            f"font-family:inherit;font-size:.9em}}"
+            f".edit-toolbar button:hover:not(:disabled){{"
+            f"background:var(--code-bg);border-color:var(--link);"
+            f"color:var(--link)}}"
+            f".edit-toolbar button:disabled{{opacity:.4;cursor:default}}"
+            f".edit-toolbar #create-group-btn{{font-weight:600}}"
             f"</style></head><body>"
             f"<div class='rec-header'>"
             f"<a class='home-link' href='{HOST_URL}/'>"
@@ -8317,6 +8389,19 @@ def recordings_page():
             f"➕ alle</button>"
             f"<button id='series-collapse' class='series-toggle' "
             f"title='Alle Serien zuklappen'>➖ alle</button>"
+            f"<button id='edit-mode-toggle' class='series-toggle' "
+            f"style='margin-left:14px' "
+            f"title='Mehrere Aufnahmen für eine manuelle Gruppe auswählen'>"
+            f"✏️ Bearbeiten</button>"
+            f"</div>"
+            # Edit-mode toolbar — hidden by default, JS toggles
+            # display + manages selection state.
+            f"<div id='edit-toolbar' class='edit-toolbar' "
+            f"style='display:none'>"
+            f"<span class='sel-count'>0 ausgewählt</span>"
+            f"<button id='create-group-btn' disabled>"
+            f"📺 Neue Gruppe …</button>"
+            f"<button id='edit-mode-cancel'>Abbrechen</button>"
             f"</div>"
             f"{_learning_health_banner()}"
             f"<div class='rec-body'>"
@@ -8413,6 +8498,75 @@ def recordings_page():
             f"  if(eb)eb.addEventListener('click',()=>setAll(true));"
             f"  if(cb)cb.addEventListener('click',()=>setAll(false));"
             f"}})();"
+            # Edit-mode for manual user-groups (= Rocky/Asterix
+            # franchise grouping). Toggle adds body.edit-mode →
+            # checkboxes appear via CSS. "Neue Gruppe" merges the
+            # current /api/internal/user-groups with the new selection,
+            # POSTs back, reloads.
+            f"(function(){{"
+            f"  const tog=document.getElementById('edit-mode-toggle');"
+            f"  const cancel=document.getElementById('edit-mode-cancel');"
+            f"  const tb=document.getElementById('edit-toolbar');"
+            f"  const cnt=tb&&tb.querySelector('.sel-count');"
+            f"  const create=document.getElementById('create-group-btn');"
+            f"  if(!tog||!tb||!create)return;"
+            f"  function refresh(){{"
+            f"    const n=document.querySelectorAll('.rec-select:checked').length;"
+            f"    cnt.textContent=n+' ausgewählt';"
+            f"    create.disabled=(n<2);"
+            f"  }}"
+            f"  function setEdit(on){{"
+            f"    document.body.classList.toggle('edit-mode',on);"
+            f"    tb.style.display=on?'flex':'none';"
+            f"    if(!on)document.querySelectorAll('.rec-select:checked')"
+            f"      .forEach(cb=>cb.checked=false);"
+            f"    refresh();"
+            f"  }}"
+            f"  tog.addEventListener('click',()=>setEdit(true));"
+            f"  cancel.addEventListener('click',()=>setEdit(false));"
+            f"  document.addEventListener('change',ev=>{{"
+            f"    if(ev.target.classList.contains('rec-select'))refresh();"
+            f"  }});"
+            f"  create.addEventListener('click',async()=>{{"
+            f"    const sel=Array.from(document.querySelectorAll('.rec-select:checked'));"
+            f"    const name=prompt('Name der neuen Gruppe:'+"
+            f"' (z.B. Rocky, Asterix, Star Wars)');"
+            f"    if(!name||!name.trim())return;"
+            f"    const cleanName=name.trim();"
+            f"    try{{"
+            f"      const cur=await fetch('{HOST_URL}/api/internal/user-groups')"
+            f"        .then(r=>r.json());"
+            f"      const merged=Object.assign({{}},cur);"
+            f"      const existing=new Set(merged[cleanName]||[]);"
+            f"      sel.forEach(cb=>existing.add(cb.dataset.uuid));"
+            f"      merged[cleanName]=Array.from(existing);"
+            f"      const r=await fetch('{HOST_URL}/api/internal/user-groups',{{"
+            f"        method:'POST',headers:{{'Content-Type':'application/json'}},"
+            f"        body:JSON.stringify(merged)}}).then(r=>r.json());"
+            f"      if(r.ok)location.reload();"
+            f"      else alert('Fehler: '+(r.error||'unknown'));"
+            f"    }}catch(e){{alert('Netzwerkfehler: '+e.message);}}"
+            f"  }});"
+            f"}})();"
+            # Dissolve manual user-group: GET current map, drop the
+            # named entry, POST back. Recordings themselves untouched
+            # — they fall back to whatever the autorec/orphan/solo
+            # pass would have done for them.
+            f"window.dissolveUserGroup=async function(ev,name){{"
+            f"  ev&&ev.stopPropagation();"
+            f"  if(!confirm('Gruppe \"'+name+'\" auflösen?\\n'+"
+            f"'(Aufnahmen bleiben unverändert)'))return;"
+            f"  try{{"
+            f"    const cur=await fetch('{HOST_URL}/api/internal/user-groups')"
+            f"      .then(r=>r.json());"
+            f"    delete cur[name];"
+            f"    const r=await fetch('{HOST_URL}/api/internal/user-groups',{{"
+            f"      method:'POST',headers:{{'Content-Type':'application/json'}},"
+            f"      body:JSON.stringify(cur)}}).then(r=>r.json());"
+            f"    if(r.ok)location.reload();"
+            f"    else alert('Fehler: '+(r.error||'unknown'));"
+            f"  }}catch(e){{alert('Netzwerkfehler: '+e.message);}}"
+            f"}};"
             # Persist <details> open/closed state per series across reloads.
             # Key by autorec uuid (data-ar). User toggles win over the
             # server-default 'open if any episode active'.
@@ -10752,6 +10906,56 @@ def api_internal_snapshot_per_show_iou():
                 "n": agg["n"],
             }) + "\n")
     return _cors(Response(json.dumps({"ok": True, "n_shows": len(by_show), "ts": ts}),
+                          mimetype="application/json"))
+
+
+def _load_user_groups():
+    """Returns {group_name: [uuid, ...]} or {} on any error.
+    User-curated franchise groupings (Rocky/Asterix style — same
+    show, no autorec link because each title differs)."""
+    try:
+        return json.loads(USER_GROUPS_FILE.read_text())
+    except Exception:
+        return {}
+
+
+def _save_user_groups(groups: dict) -> bool:
+    """Atomic-rename write so a concurrent reader never sees a
+    half-written file. Returns True on success."""
+    try:
+        tmp = USER_GROUPS_FILE.with_suffix(".tmp")
+        tmp.write_text(json.dumps(groups, indent=1, ensure_ascii=False))
+        tmp.replace(USER_GROUPS_FILE)
+        return True
+    except Exception as e:
+        print(f"[user-groups] save err: {e}", flush=True)
+        return False
+
+
+@app.route("/api/internal/user-groups", methods=["GET", "POST"])
+def api_internal_user_groups():
+    """GET: current group → uuids mapping.
+    POST: replace whole mapping (atomic). Body = JSON dict, validated
+    only loosely — empty groups allowed (caller can clean up later),
+    UUIDs are not cross-checked against actual recordings (allows the
+    UI to optimistically save before a recording's rec_dir exists)."""
+    if request.method == "POST":
+        try:
+            data = json.loads(request.get_data().decode("utf-8"))
+            if not isinstance(data, dict):
+                raise ValueError("body must be a JSON object")
+            for k, v in data.items():
+                if not isinstance(v, list):
+                    raise ValueError(f"group {k!r}: value must be a list")
+        except Exception as e:
+            return Response(json.dumps({"ok": False, "error": str(e)}),
+                            status=400, mimetype="application/json")
+        if not _save_user_groups(data):
+            return Response(json.dumps({"ok": False, "error": "save failed"}),
+                            status=500, mimetype="application/json")
+        return _cors(Response(json.dumps({"ok": True, "n_groups": len(data)}),
+                              mimetype="application/json"))
+    return _cors(Response(json.dumps(_load_user_groups()),
                           mimetype="application/json"))
 
 
