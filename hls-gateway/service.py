@@ -2155,8 +2155,12 @@ def epg_grid():
             f"              syncScheduledFromUpcoming();"
             f"              const n=d.scheduled||0;"
             f"              const ep=n===1?'Folge':'Folgen';"
-            f"              lpDialog({{msg:'<b>'+d.title+'</b> auf '+d.channel+"
-            f"'<br><br>'+n+' '+ep+' aktuell geplant',"
+            f"              const msg=d.already_exists"
+            f"                ?'<b>'+d.title+'</b> auf '+d.channel+"
+            f"'<br><br>Serien-Aufnahme war bereits aktiv'"
+            f"                :'<b>'+d.title+'</b> auf '+d.channel+"
+            f"'<br><br>'+n+' '+ep+' aktuell geplant';"
+            f"              lpDialog({{msg:msg,"
             f"                buttons:[{{label:'OK',value:'',primary:true}}]}});"
             f"            }}"
             f"          }}).catch(()=>{{}});"
@@ -7307,6 +7311,32 @@ def record_series(event_id):
             print(f"[record-series] {title}: {siblings} sibling episode(s) "
                   f"on {ch_name} today — omitting start_window so all get "
                   f"scheduled", flush=True)
+    # Idempotency check: tvheadend doesn't dedup autorec rules by
+    # (title, channel) — calling /record-series twice on the same show
+    # produces two identical rules, doubling future scheduled entries
+    # (root cause of the SpongeBob 153-instead-of-75 incident
+    # 2026-05-01). Look up existing rules with same regex+channel and
+    # return early if already present.
+    try:
+        existing_grid = json.loads(urllib.request.urlopen(
+            f"{TVH_BASE}/api/dvr/autorec/grid?limit=500",
+            timeout=5).read())
+        for er in existing_grid.get("entries", []):
+            if (er.get("title") == title_regex
+                    and er.get("channel") == ch_uuid
+                    and er.get("enabled")):
+                return _cors(Response(json.dumps({
+                    "ok": True, "uuid": er.get("uuid"),
+                    "title": title, "channel": ch_name,
+                    "already_exists": True,
+                    "scheduled": 0,
+                    "tuner_conflicts": [],
+                    "tuner_total": TUNER_TOTAL}),
+                    mimetype="application/json"))
+    except Exception:
+        # Best-effort dedup; on failure we still create — duplicate is
+        # better than failing the user's recording request.
+        pass
     body = urllib.parse.urlencode({"conf": json.dumps(conf)}).encode()
     try:
         req = urllib.request.Request(
