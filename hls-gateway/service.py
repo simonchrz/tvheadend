@@ -13069,9 +13069,8 @@ def api_warm_status():
 
 
 # Mac-daemon heartbeats — synthesised from /api/internal/* endpoint
-# hits. Replace the old SMB-written .mac-{comskip,live-comskip}-alive
-# files (tv-detect-rec.sh + tv-live-detect.py launchd jobs) which
-# break under macOS TCC for launchd Aqua agents accessing network mounts.
+# hits. Replaces the old SMB-written .mac-*-alive files which break
+# under macOS TCC for launchd Aqua agents accessing network mounts.
 _daemon_last_poll = 0.0          # rec-side daemon (thumbs/hls/detect)
 _live_scanner_last_poll = 0.0    # live-detect script (active-channels)
 
@@ -13752,9 +13751,10 @@ def _get_feedback_stats(max_age_s=300):
                 except Exception as e:
                     print(f"[learning by-show] {e}", flush=True)
                 # Block-length priors live in their own file so the
-                # consumer side (tv-detect-rec.sh, tv-live-detect.py)
-                # can read just the channels-with-enough-samples and
-                # not misinterpret detection_learning entries.
+                # consumer side (tv-live-detect.py + daemon-spawned
+                # tv-detect runs) can read just the channels-with-
+                # enough-samples and not misinterpret detection_learning
+                # entries.
                 try:
                     by_show = _compute_block_length_priors_by_show()
                     tmp = BLOCK_LENGTH_PRIOR_BY_SHOW_FILE.with_suffix(".tmp")
