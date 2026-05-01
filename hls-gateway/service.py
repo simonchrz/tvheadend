@@ -11652,13 +11652,24 @@ def api_learning_fingerprint_scan():
         user = d / "ads_user.json"
         if user.is_file():
             continue  # already user-reviewed or fingerprint-confirmed
+        # Prefer ads.json (= already parsed); else parse the comskip
+        # .txt directly. Without this fallback, fingerprint-scan would
+        # skip every recording the user hasn't yet opened in /watch
+        # (ads.json is generated lazily by /recording/<uuid>/ads).
+        # Witnessed 2026-05-01: 4 SpongeBobs detect-done but ads.json
+        # missing → fingerprint-scan matched 0 of 4.
         auto = d / "ads.json"
-        if not auto.is_file():
-            continue
-        try:
-            auto_blocks = json.loads(auto.read_text())
-        except Exception:
-            continue
+        auto_blocks = None
+        if auto.is_file():
+            try:
+                auto_blocks = json.loads(auto.read_text())
+            except Exception:
+                auto_blocks = None
+        if auto_blocks is None:
+            try:
+                auto_blocks = _rec_parse_comskip(d)
+            except Exception:
+                auto_blocks = None
         if not isinstance(auto_blocks, list) or not auto_blocks:
             continue
         show = _show_title_for_rec(d)
