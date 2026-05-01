@@ -8419,8 +8419,18 @@ def recordings_page():
             f"</table>"
             f"</div>"
             f"<script>"
+            # 15-s auto-reload while there's active live/scanning/warming
+            # content. Pauses (re-arms in 15 s) if edit-mode is on so a
+            # multi-select for a manual user-group doesn't get wiped
+            # mid-pick.
+            f"function _maybeReload(){{"
+            f"  if(document.body.classList.contains('edit-mode')){{"
+            f"    setTimeout(_maybeReload,15000);return;"
+            f"  }}"
+            f"  location.reload();"
+            f"}}"
             f"if(document.querySelector('.badge.scanning,.badge.warming,.badge.live'))"
-            f"  setTimeout(()=>location.reload(),15000);"
+            f"  setTimeout(_maybeReload,15000);"
             # Live countdown for the .next-up badges — refreshed every
             # minute so users see "in 4 min" → "in 3 min" without
             # waiting for the full page reload (15s loop only fires
