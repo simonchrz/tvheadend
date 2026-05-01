@@ -7815,7 +7815,7 @@ def recordings_page():
                      "pending": 0, "failed": 0, "scheduled": 0,
                      "unedited": 0}
 
-    def _render_row(e, in_series=False):
+    def _render_row(e, in_series=False, show_title_in_series=False):
         uuid = e.get("uuid", "")
         title = e.get("disp_title", "?")
         start = e.get("start", 0)
@@ -8059,8 +8059,15 @@ def recordings_page():
                 status_counts["unedited"] += 1
         status_counts[row_status] = status_counts.get(row_status, 0) + 1
         if in_series:
+            # In an autorec series all episodes share the same title
+            # → showing it per-row is redundant. User-groups (Rocky/
+            # Asterix) bundle DIFFERENT titles → show the title so
+            # the user can tell Rocky 1 from Rocky 2.
+            title_html = (f'<td>{title_cell}</td>'
+                          if show_title_in_series else '')
             return (f'<tr{anchor_attr} data-status="{row_status}"{edited_attr}>'
                     f'<td>{status_cell}</td>'
+                    f'{title_html}'
                     f'<td>{when}</td>'
                     f'<td>{dur_min} min</td>'
                     f'{tools_cell}</tr>')
@@ -8182,8 +8189,10 @@ def recordings_page():
                    f' <small>({len(eps)})</small>{next_html}</span>'
                    f'{rating_html}{kill_btn}</summary>'
                    f'<table class="series-sub"><tbody>'
-                   + "".join(_render_row(e, in_series=True) for e in sorted(
-                       eps, key=lambda x: x.get("start", 0)))
+                   + "".join(_render_row(
+                       e, in_series=True,
+                       show_title_in_series=ar_uuid.startswith("usergroup:"))
+                     for e in sorted(eps, key=lambda x: x.get("start", 0)))
                    + '</tbody></table></details></td></tr>')
         rows.append(summary)
 
