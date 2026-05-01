@@ -2055,6 +2055,26 @@ def epg_grid():
             f"    document.body.appendChild(bg);"
             f"  }});"
             f"}}"
+            f"/* Refresh the green-dot indicator on every .epg-event"
+            f"   cell by querying the DVR upcoming list, indexing by"
+            f"   EPG event id, and matching against each cell's"
+            f"   data-eid. Idempotent — cells that lose their schedule"
+            f"   (e.g. user just cancelled a series) also drop the"
+            f"   class. Called after every record-event / record-series"
+            f"   so the user gets immediate visual feedback without a"
+            f"   page reload. */"
+            f"function syncScheduledFromUpcoming(){{"
+            f"  fetch('{HOST_URL}/api/internal/scheduled-events')"
+            f"    .then(r=>r.json()).then(d=>{{"
+            f"      const byEid={{}};"
+            f"      for(const e of (d.entries||[])) byEid[String(e.eid)]=e.uuid;"
+            f"      document.querySelectorAll('.epg-event[data-eid]').forEach(el=>{{"
+            f"        const u=byEid[el.dataset.eid];"
+            f"        if(u){{el.classList.add('scheduled');el.dataset.uuid=u;}}"
+            f"        else{{el.classList.remove('scheduled');delete el.dataset.uuid;}}"
+            f"      }});"
+            f"    }}).catch(()=>{{}});"
+            f"}}"
             f"function handleLP(el){{"
             f"  const ttl=(el.querySelector('.t')||{{}}).textContent||'diese Sendung';"
             f"  el.style.pointerEvents='none';"
@@ -2113,12 +2133,26 @@ def epg_grid():
             f"        release();"
             f"        if(v==='ep')fetch('{HOST_URL}/record-event/'+el.dataset.eid)"
             f"          .then(r=>r.json()).then(d=>{{"
-            f"            if(d.ok&&d.uuid){{el.classList.add('scheduled');"
-            f"              el.dataset.uuid=d.uuid;}}"
+            f"            if(d.ok){{"
+            f"              /* Update the long-pressed cell immediately"
+            f"                 (no wait for the upcoming-sync below). uuid"
+            f"                 may be null in rare tvh response shapes — we"
+            f"                 still want the green dot, the cancel-flow"
+            f"                 will pick up the uuid via syncScheduledFromUpcoming. */"
+            f"              el.classList.add('scheduled');"
+            f"              if(d.uuid)el.dataset.uuid=d.uuid;"
+            f"              syncScheduledFromUpcoming();"
+            f"            }}"
             f"          }}).catch(()=>{{}});"
             f"        else if(v==='series')fetch('{HOST_URL}/record-series/'+el.dataset.eid)"
             f"          .then(r=>r.json()).then(d=>{{"
             f"            if(d.ok){{"
+            f"              /* Series scheduling can plant green dots on"
+            f"                 multiple cells (every future episode). Pull"
+            f"                 the full upcoming list and walk the DOM so"
+            f"                 ALL matching cells light up, not just the"
+            f"                 one that was long-pressed. */"
+            f"              syncScheduledFromUpcoming();"
             f"              const n=d.scheduled||0;"
             f"              const ep=n===1?'Folge':'Folgen';"
             f"              lpDialog({{msg:'<b>'+d.title+'</b> auf '+d.channel+"
@@ -3748,6 +3782,67 @@ def learning_page():
         out.append(f"<summary><h2>{title}</h2></summary>")
         _section_open[0] = True
 
+    # Training-active banner — drops in from the very top so the
+    # user knows a fresh head is being trained right now (= the
+    # current Verlauf metrics will get a new datapoint shortly).
+    # Marker file written by tv-train-head.sh on script start, removed
+    # via shell trap on exit. Mtime tells us when training started.
+    # ETA derived from .training-durations.jsonl (median of recent
+    # completed runs); inherently bimodal (cold ~60 min vs warm
+    # ~4 min) so the median is approximate — flag it as such.
+    train_marker = HLS_DIR / ".tvd-models" / ".training-active"
+    if train_marker.exists():
+        try:
+            mtime = train_marker.stat().st_mtime
+            elapsed_s = max(0, int(time.time() - mtime))
+            elapsed_min = elapsed_s // 60
+            stale_min = elapsed_min > 180  # 3 h is well past worst-case
+            # ETA: median of recent successful run durations; only
+            # show when we have enough data points (≥3) to make the
+            # number meaningful. Cap at 10 most recent so the median
+            # tracks current cache state, not ancient cold runs.
+            eta_text = ""
+            try:
+                durs = []
+                dp = HLS_DIR / ".tvd-models" / ".training-durations.jsonl"
+                for ln in dp.read_text().splitlines()[-10:]:
+                    if not ln.strip():
+                        continue
+                    e = json.loads(ln)
+                    if e.get("rc") == 0 and e.get("dur_s"):
+                        durs.append(int(e["dur_s"]))
+                if len(durs) >= 3:
+                    durs.sort()
+                    med = durs[len(durs)//2]
+                    remaining = max(0, med - elapsed_s)
+                    if remaining > 0:
+                        eta_text = (f" · ETA ~{remaining // 60} min "
+                                    f"(median letzter {len(durs)} Runs: "
+                                    f"{med // 60} min)")
+                    elif elapsed_s > med * 1.5:
+                        eta_text = (f" · läuft länger als üblich "
+                                    f"({med // 60} min Median)")
+                    else:
+                        eta_text = " · gleich fertig"
+            except Exception:
+                pass
+            color = "#e74c3c" if stale_min else "#3498db"
+            note = ("⚠ stale marker (>3 h) — script may have crashed; "
+                    "delete .training-active manually if no train is running"
+                    if stale_min else
+                    "Modell wird gerade neu trainiert — neuer Eintrag in "
+                    "Verlauf folgt in Kürze. Während des Trainings bleibt "
+                    "die deployte head.bin unverändert; Detection läuft "
+                    "ungestört weiter.")
+            out.append(
+                f"<div style='background:{color}22;border-left:4px solid "
+                f"{color};padding:10px 14px;margin:0 0 14px;border-radius:4px;"
+                f"font-size:.95em'>"
+                f"🔄 <b>Training läuft</b> seit {elapsed_min} min{eta_text} · "
+                f"{note}</div>")
+        except Exception:
+            pass
+
     # History chart (visual trend before the table)
     if history:
         _section("Verlauf", default_open=True)
@@ -4212,6 +4307,57 @@ if (planAllBtn) {
         _section("Per-Show IoU-Verlauf", default_open=True)
         out.append(per_show_html)
 
+    # Test-Set membership — read from head.test-set.json sidecar
+    # written by train-head.py. Surfaces WHICH user-reviewed
+    # recordings count toward the per-show IoU snapshot (= the
+    # ones the bulk re-detect targets after a head deploy under
+    # the V1 test-set-only invalidation strategy).
+    ts_path = HLS_DIR / ".tvd-models" / "head.test-set.json"
+    if ts_path.is_file():
+        try:
+            ts_data = json.loads(ts_path.read_text())
+            ts_uuids = ts_data.get("uuids", []) or []
+        except Exception:
+            ts_uuids = []
+        if ts_uuids:
+            # Group by show for readability; UUIDs without a show
+            # title (= recording dir gone or .txt missing) bucket
+            # under "(unknown)".
+            by_show = {}
+            for u in ts_uuids:
+                d = HLS_DIR / f"_rec_{u}"
+                # Prefer the cutlist-derived show name (= what
+                # train-head actually keys on), fall back to the
+                # tvh DVR entry's disp_title for fresh recordings
+                # whose detect hasn't completed yet (.txt missing).
+                show = (_show_title_for_rec(d)
+                        or _rec_dvr_title(u)
+                        or "(unknown)")
+                slug = _rec_channel_slug(u) or ""
+                date_s = _rec_date_from_filename(d)
+                by_show.setdefault(show, []).append((u, slug, date_s))
+            _section(f"Test-Set ({len(ts_uuids)} Aufnahmen)")
+            out.append(
+                "<p class='muted'>Diese Aufnahmen werden vom Per-Show-IoU-"
+                "Snapshot ausgewertet und sind die einzigen die nach jedem "
+                "Modell-Deploy automatisch re-detected werden (V1: "
+                "Test-Set-only Bulk-Invalidate). Alle anderen Recordings "
+                "behalten ihre Cutlists vom alten Modell bis du sie öffnest "
+                "(=lazy regenerieren via /recording/&lt;uuid&gt;/ads).</p>")
+            out.append("<table style='width:100%'><tr>"
+                       "<th style='text-align:left'>Show</th>"
+                       "<th>n</th><th>Aufnahmen</th></tr>")
+            for show in sorted(by_show, key=lambda s: -len(by_show[s])):
+                recs = by_show[show]
+                links = " · ".join(
+                    f"<a href='{HOST_URL}/recording/{u}' "
+                    f"title='{slug}'>{date_s or u[:8]}</a>"
+                    for u, slug, date_s in recs)
+                out.append(f"<tr><td><b>{show}</b></td>"
+                           f"<td>{len(recs)}</td>"
+                           f"<td style='font-size:.9em'>{links}</td></tr>")
+            out.append("</table>")
+
     _t0 = time.time()
     fingerprints = _compute_show_fingerprints_cached()
     _t_fp = time.time() - _t0
@@ -4451,8 +4597,15 @@ body.ctrl-min #skipad{background:#0006;color:#ddd;padding:4px 9px;
  touch-action:manipulation;-webkit-touch-callout:none}
 .pill:active{opacity:.7}
 .pill:disabled{background:#555;color:#bbb;cursor:default}
-#skipad{display:none}
-#skipad.on{display:inline-flex}
+/* Skipad keeps its slot in flow at all times so the marker buttons
+   to its right (Mark-Mode, ⏵Start, ⏹Ende, ✓Geprüft) don't shift
+   left/right whenever the playhead enters/leaves an ad block. The
+   off-state is fully invisible (opacity 0 + pointer-events none) so
+   it can't be accidentally clicked, but takes up the same space as
+   the on-state. */
+#skipad{display:inline-flex;opacity:0;pointer-events:none;
+ transition:opacity .15s}
+#skipad.on{opacity:1;pointer-events:auto}
 .time{font-variant-numeric:tabular-nums;font-size:.85em;color:#ddd;
  min-width:44px;text-align:center;flex:0 0 auto}
 #scrub{position:relative;width:100%;height:22px;
@@ -4758,10 +4911,15 @@ body{{touch-action:pan-y}}
   opacity:.85;box-shadow:0 0 2px #000a;z-index:1;
   pointer-events:none}}
 .chapter.current{{background:#ffd84d;height:18px}}
+/* Same anti-jitter pattern as the recordings player: keep the
+   slot in flow, just hide via opacity when not active so the live
+   chrome doesn't reflow each time the player crosses an ad
+   boundary. */
 #skipad{{background:#e74c3c;color:#fff;padding:7px 12px;border:0;
   border-radius:16px;font-weight:600;font-size:.85em;cursor:pointer;
-  display:none;flex:0 0 auto}}
-#skipad.on{{display:inline-flex}}
+  display:inline-flex;opacity:0;pointer-events:none;flex:0 0 auto;
+  transition:opacity .15s}}
+#skipad.on{{opacity:1;pointer-events:auto}}
 .chname{{font-weight:600;color:#fff;margin-right:8px}}
 .epg{{color:#bbb;margin-left:8px}}
 #srcbadge{{display:inline-block;font-size:.75em;font-weight:600;
@@ -6740,6 +6898,44 @@ def record_channel(slug):
                         status=500, mimetype="application/json")
 
 
+@app.route("/api/internal/scheduled-events")
+def api_internal_scheduled_events():
+    """Lightweight list of DVR entries (scheduled OR currently
+    recording) keyed by EPG event id. Used by /epg's
+    syncScheduledFromUpcoming to refresh the green-dot indicator
+    after schedule actions without a full page reload.
+
+    Two endpoints needed because tvh splits them: grid_upcoming
+    contains future-scheduled entries, grid_recording is the
+    in-progress ones. Without the latter, an actively-recording
+    show loses its green dot the moment it starts."""
+    out = []
+    seen = set()
+    for ep in ("/api/dvr/entry/grid_upcoming",
+               "/api/dvr/entry/grid_recording"):
+        try:
+            data = json.loads(urllib.request.urlopen(
+                f"{TVH_BASE}{ep}?limit=500", timeout=5).read())
+            for e in data.get("entries", []):
+                eid = e.get("broadcast")
+                if eid is None:
+                    continue
+                u = e.get("uuid")
+                if u in seen:
+                    continue
+                seen.add(u)
+                out.append({
+                    "eid": eid,
+                    "uuid": u,
+                    "channel": e.get("channel"),
+                    "start": e.get("start"),
+                })
+        except Exception:
+            pass
+    return _cors(Response(json.dumps({"entries": out}),
+                            mimetype="application/json"))
+
+
 @app.route("/record-event/<event_id>")
 def record_event(event_id):
     """Schedule a DVR entry for a specific EPG event (whole programme)."""
@@ -7056,14 +7252,43 @@ def record_series(event_id):
     # on kabel eins is typically forward (slot fills with promos) but
     # can be backward by 1-2 min if a preceding programme finishes
     # early. 20-min total window stays well clear of any rerun slot.
+    #
+    # Exception: when the EPG already shows MULTIPLE same-title same-
+    # channel events today (= classic morning kid-block pattern with
+    # SpongeBob 06:25 + 06:50 + 07:15, or daytime Tröödeltrupp marathons),
+    # skip the time window entirely — the user wants every episode of
+    # the day, not just the one that happened to be the seed slot.
+    # The midnight-rerun concern was for prime-time singletons; not
+    # relevant once tvh sees siblings.
     seed_start = entry.get("start")
     if seed_start:
-        lt = time.localtime(seed_start)
-        seed_min = lt.tm_hour * 60 + lt.tm_min
-        start_min = (seed_min - 5) % (24 * 60)
-        end_min = (seed_min + 15) % (24 * 60)
-        conf["start"] = f"{start_min // 60:02d}:{start_min % 60:02d}"
-        conf["start_window"] = f"{end_min // 60:02d}:{end_min % 60:02d}"
+        siblings = 0
+        try:
+            day_end = seed_start - (seed_start % 86400) + 86400  # end of day
+            params = urllib.parse.urlencode({
+                "limit": 100, "channel": ch_uuid, "title": title})
+            grid = json.loads(urllib.request.urlopen(
+                f"{TVH_BASE}/api/epg/events/grid?{params}",
+                timeout=5).read())
+            for ev in grid.get("entries", []):
+                s = ev.get("start", 0)
+                if (s != seed_start and s < day_end
+                        and ev.get("channelUuid") == ch_uuid
+                        and ev.get("title") == title):
+                    siblings += 1
+        except Exception:
+            pass
+        if siblings == 0:
+            lt = time.localtime(seed_start)
+            seed_min = lt.tm_hour * 60 + lt.tm_min
+            start_min = (seed_min - 5) % (24 * 60)
+            end_min = (seed_min + 15) % (24 * 60)
+            conf["start"] = f"{start_min // 60:02d}:{start_min % 60:02d}"
+            conf["start_window"] = f"{end_min // 60:02d}:{end_min % 60:02d}"
+        else:
+            print(f"[record-series] {title}: {siblings} sibling episode(s) "
+                  f"on {ch_name} today — omitting start_window so all get "
+                  f"scheduled", flush=True)
     body = urllib.parse.urlencode({"conf": json.dumps(conf)}).encode()
     try:
         req = urllib.request.Request(
@@ -7433,8 +7658,14 @@ def recordings_page():
     spawned by the same autorec rule are collapsed into a series
     group with an episode count."""
     try:
+        # limit=600 covers ~131 completed + up to ~470 scheduled
+        # entries (today's library has 387 total; series-autorec
+        # rules can balloon scheduled fast — SpongeBob alone adds
+        # 7 future days × 4 episodes = 28). 200 was too tight: with
+        # sort=start DESC, future-scheduled entries crowded the 200
+        # slots and completed ones got dropped from the page entirely.
         data = json.loads(urllib.request.urlopen(
-            f"{TVH_BASE}/api/dvr/entry/grid?limit=200&sort=start&dir=DESC",
+            f"{TVH_BASE}/api/dvr/entry/grid?limit=600&sort=start&dir=DESC",
             timeout=10).read())
     except Exception as e:
         abort(502, f"tvheadend: {e}")
@@ -7580,9 +7811,46 @@ def recordings_page():
             elif mac_scanning:
                 status_cell += (' <span class="badge scanning" '
                                 'title="Mac comskip analysiert Werbeblöcke">🔍</span>')
-            if (out_dir / "ads_user.json").exists():
+            user_p_path = out_dir / "ads_user.json"
+            user_reviewed = False
+            if user_p_path.exists():
                 status_cell += (' <span class="badge ads-edited" '
                                 'title="Werbeblöcke manuell angepasst">✏️</span>')
+                try:
+                    user_reviewed = bool(json.loads(
+                        user_p_path.read_text()).get("reviewed_at"))
+                except Exception:
+                    pass
+            # Detect-done indicator: cutlist .txt with the comskip
+            # FILE PROCESSING COMPLETE marker means the daemon has
+            # actually run and written its result. Combined with
+            # !user_reviewed = "ready for your review". Surfaces a
+            # cheap "go look at this" badge so the user doesn't open
+            # recordings whose detect is still pending (= empty
+            # marker auto-redirects with no blocks shown).
+            if not user_reviewed and not pi_cskip_running and not mac_scanning:
+                detect_done = False
+                try:
+                    for t in out_dir.glob("*.txt"):
+                        if any(t.name.endswith(s) for s in
+                               (".logo.txt", ".cskp.txt", ".tvd.txt",
+                                ".trained.logo.txt")):
+                            continue
+                        if t.stat().st_size > 50:
+                            head = t.read_text(errors="ignore")[:200]
+                            if "FILE PROCESSING COMPLETE" in head:
+                                detect_done = True
+                                break
+                except Exception:
+                    pass
+                if detect_done:
+                    status_cell += (
+                        f' <a class="badge ads-ready" '
+                        f'href="{HOST_URL}/recording/{uuid}" '
+                        f'title="Detect ist durch — bitte Werbeblöcke '
+                        f'prüfen + ✓ Geprüft klicken (jede Review '
+                        f'verbessert das Modell)">'
+                        f'📋 prüfbar</a>')
             unc_n = _uncertain_count(uuid)
             if unc_n > 0:
                 status_cell += (
@@ -8240,8 +8508,34 @@ def _rec_source_path(uuid):
     return None
 
 
-_rec_slug_cache = {"ts": 0, "map": {}}
+_rec_slug_cache = {"ts": 0, "slug_map": {}, "title_map": {}}
 _REC_SLUG_CACHE_TTL_S = 30
+
+
+def _refresh_rec_dvr_cache():
+    """Pull tvh's DVR grid once per TTL and populate uuid→slug AND
+    uuid→title maps in one HTTP roundtrip. Called by the per-uuid
+    accessors below; both share the same cache because the source
+    of truth is the same endpoint."""
+    now = time.time()
+    if now - _rec_slug_cache["ts"] < _REC_SLUG_CACHE_TTL_S:
+        return
+    try:
+        data = json.loads(urllib.request.urlopen(
+            f"{TVH_BASE}/api/dvr/entry/grid?limit=400",
+            timeout=6).read())
+        slugs, titles = {}, {}
+        for e in data.get("entries", []):
+            u = e.get("uuid")
+            if not u:
+                continue
+            slugs[u] = slugify(e.get("channelname") or "")
+            titles[u] = e.get("disp_title") or ""
+        _rec_slug_cache["slug_map"] = slugs
+        _rec_slug_cache["title_map"] = titles
+        _rec_slug_cache["ts"] = now
+    except Exception:
+        pass
 
 
 def _rec_channel_slug(uuid):
@@ -8251,22 +8545,18 @@ def _rec_channel_slug(uuid):
     hits the tvh /api/dvr/entry/grid endpoint once per uuid, which
     on the /learning page added up to hundreds of redundant calls
     per render and dominated total page-load time."""
-    now = time.time()
-    if now - _rec_slug_cache["ts"] >= _REC_SLUG_CACHE_TTL_S:
-        try:
-            data = json.loads(urllib.request.urlopen(
-                f"{TVH_BASE}/api/dvr/entry/grid?limit=400",
-                timeout=6).read())
-            new_map = {}
-            for e in data.get("entries", []):
-                u = e.get("uuid")
-                if u:
-                    new_map[u] = slugify(e.get("channelname") or "")
-            _rec_slug_cache["map"] = new_map
-            _rec_slug_cache["ts"] = now
-        except Exception:
-            pass
-    return _rec_slug_cache["map"].get(uuid, "")
+    _refresh_rec_dvr_cache()
+    return _rec_slug_cache["slug_map"].get(uuid, "")
+
+
+def _rec_dvr_title(uuid):
+    """Look up the tvh DVR entry's `disp_title` for a uuid. Used as a
+    fallback when _show_title_for_rec returns empty (= recording's
+    cutlist .txt hasn't been written yet by detect, but the user
+    might have already reviewed it via fingerprint auto-confirm).
+    Same cache as _rec_channel_slug."""
+    _refresh_rec_dvr_cache()
+    return _rec_slug_cache["title_map"].get(uuid, "")
 
 
 _TVD_LOGO_DIR = HLS_DIR / ".tvd-logos"
@@ -9427,11 +9717,33 @@ def _rec_prewarm_once():
             try: marker.write_text(str(cur_mt))
             except Exception: pass
         elif cur_mt and cur_mt != last_mt:
+            # Test-set-only invalidate when train-head wrote a sidecar
+            # naming exactly which UUIDs need a fresh detect (= the
+            # ~20 reviewed test recordings whose IoU is sampled by
+            # /api/internal/snapshot-per-show-iou). Train + unreviewed
+            # recordings stay on the OLD cutlists; their ads.json gets
+            # lazy-regenerated by /recording/<uuid>/ads on next view.
+            # Cuts post-deploy compute from ~3 h to ~25 min on this
+            # 130-recording corpus. Falls back to full bulk when the
+            # sidecar is missing (e.g. legacy heads, train-head
+            # crashed before writing it).
+            test_uuids = None
+            ts_path = HLS_DIR / ".tvd-models" / "head.test-set.json"
+            if ts_path.is_file():
+                try:
+                    test_uuids = set(
+                        json.loads(ts_path.read_text()).get("uuids", []))
+                except Exception:
+                    test_uuids = None
+            scope = (f"test-set ({len(test_uuids)} uuids)"
+                     if test_uuids is not None else "all recordings")
             print(f"[rec-prewarm] head.bin changed "
-                  f"({last_mt} → {cur_mt}) — invalidating all cutlists",
+                  f"({last_mt} → {cur_mt}) — invalidating {scope}",
                   flush=True)
             n = 0
             for d in HLS_DIR.glob("_rec_*"):
+                if test_uuids is not None and d.name[5:] not in test_uuids:
+                    continue
                 # Truncate (don't delete) the cutlist .txt — its
                 # FILENAME encodes the recording basename, which the
                 # train-head loader uses to find the .ts source. Daemon
@@ -10435,6 +10747,17 @@ def api_internal_detect_config(uuid):
     if "min_block_s" in p and "max_block_s" in p:
         min_block_s = p["min_block_s"]
         max_block_s = p["max_block_s"]
+    # Tell the daemon whether the deployed head expects an audio
+    # RMS feature. Detection is by file size — see internal/signals/
+    # nn.go for the size→layout matrix. Avoids the daemon doing the
+    # ffmpeg audio pass when the head wouldn't use it anyway.
+    with_audio = False
+    try:
+        sz = (HLS_DIR / ".tvd-models" / "head.bin").stat().st_size
+        # 5132 = +LOGO+AUDIO, 5156 = +LOGO+CHAN+AUDIO
+        with_audio = sz in (5132, 5156)
+    except Exception:
+        pass
     return _cors(Response(json.dumps({
         "uuid": uuid,
         "src_url": f"/recording/{uuid}/source",
@@ -10447,6 +10770,7 @@ def api_internal_detect_config(uuid):
         "min_block_s": min_block_s,
         "max_block_s": max_block_s,
         "bumper_threshold": bumper_threshold,
+        "with_audio": with_audio,
         "head_url":     "/api/internal/detect-models/head.bin",
         "backbone_url": "/api/internal/detect-models/backbone.onnx",
     }), mimetype="application/json"))
@@ -13048,35 +13372,54 @@ def _compute_per_show_iou():
     Used by the per-show IoU trend chart on /learning.
 
     Returns dict { show_title: {"mean_iou": float, "n": int, "ious": [...]} }.
-    Only edited recordings (ads_user.json present) AND with a NON-stale
-    auto-cutlist (ads.json mtime ≥ head.bin mtime) are counted —
-    otherwise the snapshot would record 0.0 IoU for every recording
-    while a head-update bulk-redetect is in flight (auto.json gets
-    cleared on head update before the new detect lands).
+
+    Auto-source priority:
+      1. ads.json if its mtime ≥ head.bin mtime (= post-deploy fresh cache)
+      2. .txt cutlist parsed via _rec_parse_comskip when present + non-empty
+         (= daemon delivered fresh detect via cutlist-uploaded but no
+         /ads call has warmed the cache yet — the bulk-drain case under
+         the V1 test-set-only invalidation strategy where most recordings
+         never get a /ads call automatically)
+      3. Skip the recording entirely (snapshot won't include it)
+
+    Without the .txt fallback, the snapshot would only see ~10 % of
+    reviewed recordings after a head deploy under V1 — most have a
+    fresh .txt but a stale ads.json and would be silently dropped.
     """
     by_show = {}
     if not HLS_DIR.exists():
         return {}
     head_p = HLS_DIR / ".tvd-models" / "head.bin"
     head_mtime = head_p.stat().st_mtime if head_p.is_file() else 0
+    SIDECAR = (".logo.txt", ".trained.logo.txt", ".cskp.txt", ".tvd.txt")
     for d in HLS_DIR.glob("_rec_*"):
         user_p = d / "ads_user.json"
         if not user_p.is_file():
             continue
         auto_p = d / "ads.json"
-        # Skip stale auto — pending re-detect after the latest head update.
-        if not auto_p.is_file() or auto_p.stat().st_mtime < head_mtime:
-            continue
+        auto = None
+        if auto_p.is_file() and auto_p.stat().st_mtime >= head_mtime:
+            try:
+                auto_raw = json.loads(auto_p.read_text())
+                auto = (auto_raw if isinstance(auto_raw, list)
+                        else (auto_raw.get("ads", []) or []))
+            except Exception:
+                auto = None
+        if auto is None:
+            # Fall back to the cutlist .txt — reflects the daemon's
+            # latest detect even when /ads hasn't warmed the cache.
+            txts = [t for t in d.glob("*.txt")
+                    if not any(t.name.endswith(s) for s in SIDECAR)
+                    and t.stat().st_size > 50
+                    and "FILE PROCESSING COMPLETE" in t.read_text(errors="ignore")[:200]]
+            if not txts:
+                continue
+            auto = _rec_parse_comskip(d) or []
         try:
             user_raw = json.loads(user_p.read_text())
             user = user_raw if isinstance(user_raw, list) else (user_raw.get("ads", []) or [])
         except Exception:
             continue
-        try:
-            auto_raw = json.loads(auto_p.read_text())
-            auto = auto_raw if isinstance(auto_raw, list) else (auto_raw.get("ads", []) or [])
-        except Exception:
-            auto = []
         show = _show_title_for_rec(d)
         if not show:
             continue
@@ -13501,9 +13844,24 @@ def api_health():
 
 HEALTH_HTML = """<!doctype html><html><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="color-scheme" content="light dark">
 <title>Health</title>
 <style>
-:root{--bg:#1a1a1a;--fg:#eee;--muted:#888;--ok:#27ae60;--warn:#f39c12;--err:#e74c3c;--card:#252525;--border:#333}
+/* Default = light theme (tagsüber); dark override via prefers-
+   color-scheme matches the rest of /learning, /recordings, /epg. */
+:root{
+  --bg:#fafafa; --fg:#222; --muted:#666;
+  --card:#ffffff; --border:#e1e1e1; --th-bg:#f0f0f0;
+  --code-bg:#0001; --link:#0366d6;
+  --ok:#27ae60; --warn:#f39c12; --err:#e74c3c;
+}
+@media (prefers-color-scheme: dark){
+  :root{
+    --bg:#1a1a1a; --fg:#eee; --muted:#888;
+    --card:#252525; --border:#333; --th-bg:#2c2c2c;
+    --code-bg:#0006; --link:#5dade2;
+  }
+}
 body{margin:0;padding:16px;background:var(--bg);color:var(--fg);font-family:-apple-system,sans-serif;max-width:900px;margin:0 auto}
 h1{margin:0 0 16px;font-size:1.4em}
 h2{margin:20px 0 10px;font-size:1.1em;color:var(--muted);text-transform:uppercase;letter-spacing:.05em}
@@ -13514,11 +13872,11 @@ h2{margin:20px 0 10px;font-size:1.1em;color:var(--muted);text-transform:uppercas
 .ok{color:var(--ok)} .warn{color:var(--warn)} .err{color:var(--err)}
 table{width:100%;border-collapse:collapse;background:var(--card);border-radius:8px;overflow:hidden;margin-top:8px}
 th,td{padding:8px 12px;text-align:left;border-bottom:1px solid var(--border);font-size:.95em}
-th{background:#2c2c2c;color:var(--muted);font-weight:500;text-transform:uppercase;font-size:.75em}
+th{background:var(--th-bg);color:var(--muted);font-weight:500;text-transform:uppercase;font-size:.75em}
 tr:last-child td{border:0}
 .dot{display:inline-block;width:10px;height:10px;border-radius:50%;margin-right:6px;vertical-align:baseline}
 .refresh{color:var(--muted);font-size:.8em}
-a{color:#5dade2}
+a{color:var(--link)}
 </style></head><body>
 <h1>System Health <span class="refresh" id="refresh"></span></h1>
 <div id="root">Loading…</div>
@@ -13570,7 +13928,7 @@ async function load(){
       ?'<span class="ok">✓ aktiv</span>'
       :(fb.matched>=3?'<small style="color:var(--muted)">Vorschlag</small>':'<small style="color:var(--muted)">zu wenig Daten</small>');
     const sug=fb.suggestions.length
-      ?fb.suggestions.map(s=>'<code style="background:#0006;padding:2px 6px;border-radius:3px">'+s+'</code>').join('<br>')
+      ?fb.suggestions.map(s=>'<code style="background:var(--code-bg);padding:2px 6px;border-radius:3px">'+s+'</code>').join('<br>')
       :'<small style="color:var(--muted)">—</small>';
     fbRows.push('<tr><td>'+c.slug+'</td>'
       +'<td>'+fb.n+' rec, '+fb.matched+' matched</td>'

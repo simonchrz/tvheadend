@@ -35,7 +35,18 @@ processing. Pi CPU during full-recording processing dropped from
 | Deploying code (SIGHUP, NOT compose restart), iOS Safari quirks, SSD swap / EXT4 recovery / USB cable + power-cap diagnostics | [docs/operations.md](docs/operations.md) |
 | Mac-offload daemon (HTTP-based job pipeline, /api/internal/* endpoints, why HTTP not SMB, TCC trap) | [docs/mac-handlers.md](docs/mac-handlers.md) |
 | Mac-daemon scripts themselves (`tv-thumbs-daemon.py`, `tv-train-head.sh`, `mount-pi-tv.sh`) — symlinked from `~/bin/` so launchd paths stay valid | [mac-daemon/](mac-daemon/) |
+| **UI design tokens, components, mobile patterns** — read BEFORE editing any HTML/CSS in service.py | [DESIGN.md](DESIGN.md) |
 | Things deliberately not done + open backlog | [docs/history.md](docs/history.md) |
+
+## Python version
+
+All three execution contexts run **Python 3.13.13** (consolidated 2026-05-01):
+
+- **Gateway** (Pi docker container): base image `python:3.13-slim`, set in `hls-gateway/Dockerfile`
+- **Train-head ML venv** (Mac): `~/ml/tv-classifier/.venv` rebuilt with `python3.13 -m venv`. All ~160 ML deps (tensorflow 2.21, torch 2.11, onnxruntime 1.25 with CoreMLExecutionProvider, sklearn 1.8, numpy 2.4, librosa 0.11) have 3.13 wheels.
+- **tv-thumbs-daemon** (Mac launchd): plist pins `/opt/homebrew/bin/python3.13` explicitly. Was incidentally Xcode-bundled 3.9 before — change kills that brittleness.
+
+3.14 was tested + rejected: tensorflow has no 3.14 wheels yet, and numba (transitive via librosa) caps at <3.13. Re-evaluate Q4 2026 once those catch up. Don't write 3.14-only syntax (PEP 750 t-strings, etc) anywhere — code must stay 3.13-portable.
 
 ## Stack at a glance
 
@@ -90,6 +101,7 @@ strand viewers.
 | `POST /api/recording/<uuid>/redetect` | Force a fresh tv-detect pass on this recording (truncates cutlist + writes `.detect-requested` marker) |
 | `POST /api/recording/<uuid>/bumper-capture` | Save a bumper template (start or end). Body: `{start_s, end_s, kind: "start"|"end"}`. Auto-aligns the nearest user-block boundary (±30s) to the captured frame. Channel-wide invalidation triggers re-detect across all recordings of that slug. |
 | `GET /api/internal/detect-bumpers/<slug>` | Returns `{templates: [...end...], start_templates: [...start...]}` — categorised template list for the daemon. End-bumpers from `.tvd-bumpers/<slug>/end/` AND legacy channel-root; start-bumpers from `.tvd-bumpers/<slug>/start/`. |
+| `GET /api/internal/scheduled-events` | `[{eid, uuid, channel, start}, ...]` — DVR upcoming + recording entries keyed by EPG event id. Used by /epg's `syncScheduledFromUpcoming` JS to refresh the green-dot indicator after schedule actions without a page reload. |
 
 ## /learning page features (added 2026-04-29 / 30)
 
@@ -100,8 +112,12 @@ strand viewers.
 ## Training pipeline (`train-head.py`, runs 03:30 nightly)
 
 - Wrapper `tv-train-head.sh` mountet SMB via `mount-pi-tv.sh` falls weg (sleep/wake kann Mounts killen — bare existence-check reicht nicht weil "Pfad existiert aber Connection tot")
-- Platt-Calibration: nach `clf.fit` wird auf hold-out Test-Set ein 1-D Sigmoid σ(A·logit + B) gefittet, Brier-Score-Diff geloggt, Sidecar `head.calibration.json` neben head.bin
-- Kalibrierte Probs werden im `--surface-uncertain` Step verwendet damit Active-Learning-Targets (`head.uncertain.txt`) auf der TATSÄCHLICHEN Modell-Unsicherheit ranken statt auf der over-confident raw Linear-Head-Output. Phase-A/B Self-Training nutzt weiterhin raw Probs (Threshold-Tuning ist auf raw kalibriert)
+- **Active flags**: `--with-logo --with-audio --with-minute-prior --with-self-training --write-pseudo-labels` → produces a 1282-dim head (5132 B = backbone 1280 + logo + audio). `--with-channel` available but disabled (memory: feature ceiling at N≈50 → wait until N≥150 reviewed).
+- **Audio-RMS** (added 2026-04-30): per-second normalised RMS via ffmpeg astats, fed as the 1282nd feature in NN inference. Go side: `signals/audio_rms.go` mirrors the Python extraction; head sizes 5132 (+LOGO+AUDIO) and 5156 (+LOGO+CHAN+AUDIO) supported in `signals/nn.go`. Gateway's `detect-config` endpoint reports `with_audio: true` when the deployed head matches the audio sizes; daemon then passes `--with-audio` to tv-detect.
+- **Platt-Calibration**: nach `clf.fit` wird auf hold-out Test-Set ein 1-D Sigmoid σ(A·logit + B) gefittet, Brier-Score-Diff geloggt, Sidecar `head.calibration.json` neben head.bin. Kalibrierte Probs im `--surface-uncertain` Step → Active-Learning-Targets ranken auf TATSÄCHLICHER Modell-Unsicherheit. Phase-A/B Self-Training nutzt raw Probs (Threshold-Tuning ist auf raw kalibriert).
+- **Test-set sidecar** (added 2026-05-01): train-head writes `head.test-set.json` listing UUIDs in the test split. Used by gateway's prewarm-loop to scope the post-deploy bulk re-detect to ONLY the test recordings (= ~20) instead of all 134 — V1 strategy. Cuts post-deploy compute from ~3 h to ~25 min. Train + unreviewed recordings keep their old cutlists; their `ads.json` lazy-regenerates via `/recording/<uuid>/ads` on next view.
+- **Per-channel bumper threshold**: `.channel-config.json` per-slug `bumper_threshold` (default 0.75; RTL/SAT-1/ProSieben at 0.85 because their large generic template sets cause false-positive snaps at the lower bar). Diagnosed via the Failure-Mode-Analyse on /learning where missed_bumper deltas split 73 % threshold-bound vs 22 % window-bound.
+- **Training-active marker**: `tv-train-head.sh` writes `.training-active` on start (mtime = start), removes via shell trap on exit. /learning surfaces a banner with elapsed + ETA derived from `.training-durations.jsonl` (median of last 10 successful runs).
 
 Why HTTP not SMB: macOS TCC restricts launchd Aqua agents from
 enumerating network mounts; `os.listdir(/Users/simon/mnt/pi-tv/hls)`
