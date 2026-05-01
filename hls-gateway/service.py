@@ -10576,6 +10576,54 @@ def api_internal_live_config(slug):
     return _cors(Response(json.dumps(cfg), mimetype="application/json"))
 
 
+@app.route("/api/internal/training-active", methods=["POST", "DELETE"])
+def api_internal_training_active():
+    """tv-train-head.sh writes this marker on start (POST) and removes
+    it on exit via shell trap (DELETE). Mtime tells the /learning
+    banner WHEN training started; presence drives "Training läuft seit
+    N min". Stays SMB-free now — script curls these instead of
+    touch+rm on the bind-mounted .tvd-models dir."""
+    p = HLS_DIR / ".tvd-models" / ".training-active"
+    if request.method == "DELETE":
+        try: p.unlink()
+        except FileNotFoundError: pass
+        return _cors(Response(json.dumps({"ok": True, "removed": True}),
+                              mimetype="application/json"))
+    p.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        p.write_text(str(int(time.time())))
+    except Exception as e:
+        return Response(json.dumps({"ok": False, "error": str(e)}),
+                        status=500, mimetype="application/json")
+    return _cors(Response(json.dumps({"ok": True}),
+                          mimetype="application/json"))
+
+
+@app.route("/api/internal/training-duration", methods=["POST"])
+def api_internal_training_duration():
+    """Append one record to .training-durations.jsonl. Body is the
+    raw JSON object (gateway adds the trailing newline). Used by
+    tv-train-head.sh after each run to feed the /learning ETA median."""
+    try:
+        body = request.get_data().decode("utf-8").strip()
+        # Validate it's a single JSON object so we don't pollute the
+        # file with malformed lines that would break the median parse.
+        json.loads(body)
+    except Exception as e:
+        return Response(json.dumps({"ok": False, "error": str(e)}),
+                        status=400, mimetype="application/json")
+    p = HLS_DIR / ".tvd-models" / ".training-durations.jsonl"
+    p.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        with open(p, "a") as f:
+            f.write(body + "\n")
+    except Exception as e:
+        return Response(json.dumps({"ok": False, "error": str(e)}),
+                        status=500, mimetype="application/json")
+    return _cors(Response(json.dumps({"ok": True}),
+                          mimetype="application/json"))
+
+
 @app.route("/api/internal/live-ads", methods=["GET", "POST"])
 def api_internal_live_ads():
     """GET: return current `.live_ads.json` content (Mac daemon loads
