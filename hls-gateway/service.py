@@ -10546,7 +10546,8 @@ def api_internal_live_config(slug):
     path). Mac script uses these to build the tv-detect command line."""
     cfg = {"slug": slug, "logo_smooth_s": 0.0,
            "start_lag_s": 0.0, "sponsor_duration_s": 0.0,
-           "cached_logo_url": ""}
+           "cached_logo_url": "",
+           "min_block_s": 0.0, "max_block_s": 0.0}
     try:
         ch_cfg = json.loads(
             (HLS_DIR / ".channel-config.json").read_text()
@@ -10562,6 +10563,16 @@ def api_internal_live_config(slug):
     except Exception: pass
     if (_TVD_LOGO_DIR / f"{slug}.logo.txt").is_file():
         cfg["cached_logo_url"] = f"/api/internal/detect-logo/{slug}"
+    # Block-length prior — same lookup as detect-config/<uuid> but
+    # without the per-show fallback (live runs don't know the show).
+    try:
+        p = json.loads(
+            (HLS_DIR / ".block_length_prior.json").read_text()
+        ).get(slug, {})
+        if "min_block_s" in p and "max_block_s" in p:
+            cfg["min_block_s"] = float(p["min_block_s"])
+            cfg["max_block_s"] = float(p["max_block_s"])
+    except Exception: pass
     return _cors(Response(json.dumps(cfg), mimetype="application/json"))
 
 
