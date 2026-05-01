@@ -186,3 +186,16 @@ tv-detect. The 20-px constant is RTL-empirical (canonical case:
 Jungle Cruise on RTL Spielfilm — cropdetect=80, optimal offset=60).
 Same logic in `train-head.py` so cached training features match what
 inference produces.
+
+## Deferred work (read before re-suggesting)
+
+Significant ideas that were validated/built partially and intentionally
+left at a checkpoint. See [docs/history.md](docs/history.md) for full
+deferral rationale + revival conditions.
+
+- **Whisper Stage 4 (full Go-side NN-feature integration)** — current
+  Stage 2/3 post-processor is live (WHISPER_ENABLE=1, +5.4% Block-IoU
+  on n=9). Stage 4 would graduate `whisper-prob` from rule-based
+  cutlist refinement to a 6th NN-feature column in head.bin. Deferred
+  until N≥250-300 reviewed AND post-processor gains plateau. Don't
+  re-pitch without checking those conditions.
