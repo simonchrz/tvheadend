@@ -8941,10 +8941,6 @@ def recordings_page():
             f"    if(!tbody)return;"
             f"    const rows=Array.from(tbody.children).filter("
             f"      r=>r.tagName==='TR'&&r.dataset.sortStart!==undefined);"
-            f"    if(window._sortDebug){{"
-            f"      console.log('sort: tbody='+!!tbody+' rows='+rows.length"
-            f"        +' mode='+sel.value);"
-            f"    }}"
             f"    const mode=sel.value;"
             # Always prefer data-sort-start-all when present (= max of
             # ALL episodes including future-scheduled). Series-head rows
