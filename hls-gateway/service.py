@@ -4915,6 +4915,16 @@ if (planAllBtn) {
     if _t_fp > 0.05:
         print(f"[learning-page-prof] fingerprints={_t_fp*1000:.0f}ms",
               flush=True)
+    # Drop singletons (= movies, one-off specials). A "fingerprint"
+    # for a film aired twice is meaningless — same movie, same ad
+    # break pattern, no transferable signal. Auto-confirm via
+    # fingerprint-scan also wouldn't fire on movie titles since
+    # min_recs=2 + count_consensus rarely passes for film duplicates.
+    if fingerprints:
+        show_n = _show_review_counts()
+        autorec_t = _autorec_titles()
+        fingerprints = {s: fp for s, fp in fingerprints.items()
+                        if not _is_singleton_title(s, show_n, autorec_t)}
     if fingerprints:
         _section(f"Show-Fingerprints ({len(fingerprints)})")
         out.append("<p class='muted'>Shows mit ≥3 user-bestätigten Episoden + "
