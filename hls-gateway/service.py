@@ -11426,14 +11426,23 @@ def api_recording_ads_edit(uuid):
     except Exception as e:
         return Response(json.dumps({"ok": False, "error": str(e)}),
                         status=500, mimetype="application/json")
-    # Auto-refingerprint this recording's ad blocks for the cross-
-    # channel spot index. Background worker handles the actual
-    # extraction so the user's save round-trip stays fast.
+    # Auto-refingerprint signal: drop the existing fingerprints so
+    # this uuid surfaces in /api/internal/spot-fp/queue as "missing".
+    # Mac-side tv-spot-extract.py picks it up on its next sweep and
+    # re-uploads with fresh blocks. Pi no longer extracts.
     if cleaned:
         try:
-            _spot_fp_enqueue(uuid)
+            with _spot_fp_lock:
+                conn = _spot_fp_open()
+                try:
+                    conn.execute("DELETE FROM fingerprints WHERE uuid=?",
+                                 (uuid,))
+                    conn.commit()
+                finally:
+                    conn.close()
         except Exception as e:
-            print(f"[spot-fp] enqueue err {uuid[:8]}: {e}", flush=True)
+            print(f"[spot-fp] invalidate err {uuid[:8]}: {e}",
+                  flush=True)
     return _cors(Response(json.dumps({"ok": True, "ads": cleaned,
                                        "deleted": cleaned_deleted}),
                            mimetype="application/json"))
@@ -13015,6 +13024,124 @@ def _spot_fp_enqueue(uuid_str):
         if uuid_str not in SPOT_FP_QUEUE:
             SPOT_FP_QUEUE.append(uuid_str)
         _spot_fp_queue_cv.notify()
+
+
+@app.route("/api/internal/spot-fp/upload", methods=["POST"])
+def api_internal_spot_fp_upload():
+    """Mac-side extractor POSTs all spot fingerprints for one
+    recording here. Body: {"spots": [
+      {"window_start_s": ..., "block_idx": ..., "block_start_s": ...,
+       "block_end_s": ..., "fp_b64": "...", "dhashes_b64": "..."},
+      ...]}.
+    Replaces all existing fingerprints for the uuid. Triggers a
+    background family rebuild (debounced inside _spot_fp_worker is
+    not running on this path; we fire one directly)."""
+    import base64
+    uuid_str = (request.args.get("uuid") or "").strip()
+    if not uuid_str:
+        return Response(json.dumps({"ok": False, "error": "missing uuid"}),
+                        status=400, mimetype="application/json")
+    rec_dir = HLS_DIR / f"_rec_{uuid_str}"
+    if not rec_dir.is_dir():
+        return Response(json.dumps({"ok": False, "error": "rec_dir not found"}),
+                        status=404, mimetype="application/json")
+    try:
+        body = request.get_json(silent=True) or {}
+        spots = body.get("spots") or []
+        if not isinstance(spots, list):
+            raise ValueError("spots must be array")
+    except Exception as e:
+        return Response(json.dumps({"ok": False, "error": str(e)}),
+                        status=400, mimetype="application/json")
+    channel_slug = _rec_channel_slug(uuid_str) or ""
+    base = ""
+    sidecar_endings = (".logo.txt", ".cskp.txt", ".tvd.txt",
+                       ".trained.logo.txt")
+    for p in rec_dir.glob("*.txt"):
+        if any(p.name.endswith(s) for s in sidecar_endings):
+            continue
+        base = p.stem
+        break
+    rec_start_ts = _rec_start_s_from_base(base)
+    n = 0
+    with _spot_fp_lock:
+        conn = _spot_fp_open()
+        try:
+            conn.execute("DELETE FROM fingerprints WHERE uuid = ?",
+                         (uuid_str,))
+            for s in spots:
+                try:
+                    fp = base64.b64decode(s["fp_b64"]) if s.get("fp_b64") else b""
+                    dh = base64.b64decode(s["dhashes_b64"]) if s.get("dhashes_b64") else None
+                    if not fp:
+                        continue
+                    conn.execute(
+                        "INSERT INTO fingerprints(uuid, channel_slug, "
+                        "block_idx, block_start_s, block_end_s, "
+                        "window_start_s, recording_start_ts, fp, "
+                        "dhashes) "
+                        "VALUES (?,?,?,?,?,?,?,?,?)",
+                        (uuid_str, channel_slug,
+                         int(s.get("block_idx") or 0),
+                         float(s.get("block_start_s") or 0),
+                         float(s.get("block_end_s") or 0),
+                         float(s.get("window_start_s") or 0),
+                         rec_start_ts, sqlite3.Binary(fp),
+                         sqlite3.Binary(dh) if dh else None))
+                    n += 1
+                except Exception as ex:
+                    print(f"[spot-fp] upload row err: {ex}", flush=True)
+            conn.commit()
+        finally:
+            conn.close()
+    # Fire family rebuild in background — small DB so it's <1 min
+    threading.Thread(target=lambda: _spot_fp_rebuild_families(),
+                     daemon=True).start()
+    return _cors(Response(json.dumps({
+        "ok": True, "uuid": uuid_str, "n_spots": n,
+        "channel_slug": channel_slug,
+        "recording_start_ts": rec_start_ts}),
+        mimetype="application/json"))
+
+
+@app.route("/api/internal/spot-fp/queue")
+def api_internal_spot_fp_queue():
+    """Return list of uuids needing Mac-side spot extraction.
+
+      ?include_no_dhash=1 (default): also include uuids whose existing
+        fingerprints don't yet have dhashes (= partial-Pi-side extract,
+        Mac re-extract will give us full audio+visual)
+      ?missing_only=1: only uuids with NO fingerprints at all"""
+    include_no_dh = request.args.get("include_no_dhash", "1") in ("1","true")
+    missing_only  = request.args.get("missing_only") in ("1","true")
+    with _spot_fp_lock:
+        conn = _spot_fp_open()
+        try:
+            indexed = {r[0] for r in conn.execute(
+                "SELECT DISTINCT uuid FROM fingerprints").fetchall()}
+            no_dh = set()
+            if include_no_dh and not missing_only:
+                no_dh = {r[0] for r in conn.execute(
+                    "SELECT DISTINCT uuid FROM fingerprints "
+                    "WHERE dhashes IS NULL").fetchall()}
+        finally:
+            conn.close()
+    out_missing = []
+    out_partial = []
+    for d in HLS_DIR.glob("_rec_*"):
+        if not (d / "ads_user.json").is_file():
+            continue
+        u = d.name[5:]
+        if u not in indexed:
+            out_missing.append(u)
+        elif u in no_dh:
+            out_partial.append(u)
+    items = out_missing if missing_only else (out_missing + out_partial)
+    return _cors(Response(json.dumps({
+        "uuids": items,
+        "n_missing": len(out_missing),
+        "n_partial_no_dhash": len(out_partial)}),
+        mimetype="application/json"))
 
 
 @app.route("/api/internal/spot-fingerprints/rebuild", methods=["POST"])
@@ -17148,8 +17275,10 @@ if __name__ == "__main__":
             print(f"[auto-sched] init err: {e}", flush=True)
     threading.Thread(target=_auto_schedule_loop, daemon=True).start()
     threading.Thread(target=_adaptive_padding_loop, daemon=True).start()
-    threading.Thread(target=_spot_fp_worker, daemon=True).start()
-    _spot_fp_resume_at_boot()
+    # spot-fp extraction moved to Mac (tv-spot-extract.py) — Pi only
+    # stores + indexes via /api/internal/spot-fp/upload. Worker thread
+    # + resume-at-boot are no-ops now (kept callable for one-off
+    # diagnostics if needed; just don't start them automatically).
     threading.Thread(target=always_warm_loop, daemon=True).start()
     threading.Thread(target=_mediathek_rip_loop, daemon=True).start()
     threading.Thread(target=_mediathek_autorec_loop, daemon=True).start()
