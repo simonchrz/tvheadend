@@ -8917,8 +8917,11 @@ def recordings_page():
             f"  catch(e){{}}"
             f"  sel.value=saved;"
             f"  function apply(){{"
-            f"    const tbody=document.querySelector('.rec-body table tbody')"
-            f"      ||document.querySelector('.rec-body table');"
+            # Target the OUTER table directly. Without `>` the selector
+            # walks into the nested .series-sub <tbody>s and re-sorts
+            # the wrong children — bug seen 2026-05-02 where Neueste-
+            # zuerst order was scrambled.
+            f"    const tbody=document.querySelector('.rec-body > table');"
             f"    if(!tbody)return;"
             f"    const rows=Array.from(tbody.children).filter("
             f"      r=>r.tagName==='TR'&&r.dataset.sortStart!==undefined);"
