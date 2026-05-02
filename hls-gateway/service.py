@@ -12241,9 +12241,16 @@ def play_recording(uuid):
             f"#thumb-preview img{{width:100%;height:100%;object-fit:cover;"
             f"display:block}}"
             f"#thumb-preview.visible{{opacity:1}}"
+            # Loader z-index BELOW #chrome (= 10) so the bottom-bar
+            # scrub + already-rendered ad-markers stay visible during
+            # the ~6 s "Aufnahme wird vorbereitet" buffer-warmup. The
+            # /ads fetch fires immediately on page load and populates
+            # ads + adsDurationFallback within ~250 ms, so the markers
+            # are in the DOM long before the video itself is playable
+            # — they were just hidden under the full-screen overlay.
             f"#loader{{position:fixed;inset:0;display:flex;flex-direction:column;"
             f"align-items:center;justify-content:center;background:#000c;"
-            f"z-index:30;font-size:1.05em;gap:8px;transition:opacity .3s}}"
+            f"z-index:5;font-size:1.05em;gap:8px;transition:opacity .3s}}"
             f"#loader.hidden{{opacity:0;pointer-events:none}}"
             f".spinner{{width:40px;height:40px;border:4px solid #fff3;"
             f"border-top-color:#fff;border-radius:50%;"
