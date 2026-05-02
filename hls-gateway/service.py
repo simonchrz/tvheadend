@@ -4439,6 +4439,91 @@ async function toggleAutoSchedule() {
         print(f"[learning-page-prof] show-gaps={_ms:.0f}ms", flush=True)
     _t0 = time.time()
 
+    # Deletion candidates — collapsed by default since it's an
+    # opt-in housekeeping action. Lazy-loaded via /api/learning/
+    # deletion-candidates so the heavy DVR-grid fetch only happens
+    # when user opens the section.
+    _section("Sichere Löschkandidaten (Disk freigeben)")
+    out.append("<div id='del-cand-mount'><p class='muted'>Lade …</p></div>")
+    out.append("""<script>
+(function(){
+  const sec=document.getElementById('sec-sichere-loeschkandidaten-disk-freigeben')
+    ||document.querySelector("details[id^='sec-sichere-loeschkandidaten']");
+  if(!sec)return;
+  let loaded=false;
+  sec.addEventListener('toggle',async()=>{
+    if(!sec.open||loaded)return;
+    loaded=true;
+    const mount=document.getElementById('del-cand-mount');
+    try{
+      const r=await fetch('/api/learning/deletion-candidates').then(r=>r.json());
+      const fmt=(mb)=>mb>=1024?(mb/1024).toFixed(1)+' GB':mb+' MB';
+      const renderRow=(e,tier)=>'<tr><td><b>'+e.title+'</b><br>'
+        +'<span style="color:var(--muted);font-size:.85em">'+e.channel
+        +' · '+Math.round(e.age_days)+' Tage alt</span></td>'
+        +'<td style="text-align:right">'+fmt(e.filesize_mb)+'</td>'
+        +'<td><a href="/recording/'+e.uuid+'" target="_blank" '
+        +'style="color:var(--link)">prüfen</a></td>'
+        +'<td><button class="del-btn" data-uuid="'+e.uuid+'" '
+        +'data-title="'+e.title.replace(/"/g,'&quot;')+'" '
+        +'style="padding:4px 10px;border:1px solid #c0392b;'
+        +'background:transparent;color:#c0392b;border-radius:4px;'
+        +'cursor:pointer">🗑 Löschen</button></td></tr>';
+      let html='';
+      if(r.tier1.length){
+        html+='<h3 style="margin-top:14px">Tier 1 — unreviewed alt ('
+          +fmt(r.tier1_total_mb)+' frei machbar)</h3>'
+          +'<p class="muted" style="font-size:.85em">Recordings die du in 14+ Tagen'
+          +' nicht reviewed hast. Nichts geht im Training verloren.</p>'
+          +'<table style="width:100%"><tr><th style="text-align:left">Aufnahme</th>'
+          +'<th>Größe</th><th></th><th></th></tr>'
+          +r.tier1.slice(0,30).map(e=>renderRow(e,1)).join('')
+          +'</table>';
+        if(r.tier1.length>30)html+='<p class="muted">… und '
+          +(r.tier1.length-30)+' weitere</p>';
+      }
+      if(r.tier2.length){
+        html+='<h3 style="margin-top:14px">Tier 2 — reviewed aber alt ('
+          +fmt(r.tier2_total_mb)+' frei machbar)</h3>'
+          +'<p class="muted" style="font-size:.85em">≥30 Tage alt, Show hat ≥5 reviewed'
+          +' Episoden — Training-Beitrag minimal.</p>'
+          +'<table style="width:100%"><tr><th style="text-align:left">Aufnahme</th>'
+          +'<th>Größe</th><th></th><th></th></tr>'
+          +r.tier2.slice(0,30).map(e=>renderRow(e,2)).join('')
+          +'</table>';
+        if(r.tier2.length>30)html+='<p class="muted">… und '
+          +(r.tier2.length-30)+' weitere</p>';
+      }
+      if(!r.tier1.length&&!r.tier2.length){
+        html='<p>Keine sicheren Löschkandidaten. Test-Set: '+r.test_set_size+' Aufnahmen.</p>';
+      }
+      mount.innerHTML=html;
+      mount.querySelectorAll('.del-btn').forEach(btn=>{
+        btn.addEventListener('click',async()=>{
+          if(!confirm('Wirklich löschen?\\n\\n'+btn.dataset.title))return;
+          btn.disabled=true;btn.textContent='…';
+          try{
+            // /recording/<uuid>/delete handles dvr/entry/remove +
+            // HLS cleanup + ffmpeg kill in one shot. GET endpoint
+            // (legacy from when it was a hyperlink); redirect=manual
+            // so we don't follow back to /recordings.
+            const dr=await fetch('/recording/'+btn.dataset.uuid+'/delete',
+              {redirect:'manual'});
+            // tvh remove returns 200 or a 30x redirect; both = OK
+            if(dr.ok||dr.type==='opaqueredirect'){
+              btn.closest('tr').style.opacity=.3;
+              btn.textContent='✓ gelöscht';
+            }else{btn.disabled=false;btn.textContent='✗ Fehler '+dr.status;}
+          }catch(e){btn.disabled=false;btn.textContent='✗ '+e.message;}
+        });
+      });
+    }catch(e){
+      mount.innerHTML='<p style="color:#e74c3c">Fehler: '+e.message+'</p>';
+    }
+  });
+})();
+</script>""")
+
     # Confusion summary
     if confusion:
         _section("Confusion-Analyse (letzter Test-Set Run)")
@@ -11027,6 +11112,98 @@ def api_learning_summary():
 
     return _cors(Response(json.dumps(out),
                             mimetype="application/json"))
+
+
+@app.route("/api/learning/deletion-candidates")
+def api_learning_deletion_candidates():
+    """List recordings safe to delete, grouped by risk tier.
+
+    Tier 1 = unreviewed AND older than 14 days (= probably won't be
+             reviewed; safest to delete)
+    Tier 2 = reviewed AND older than 30 days AND not in current
+             test-set (= old training data, low impact on next run)
+
+    Excluded entirely: in current test-set, recent (<14 / <30 days
+    depending on review state), or shows-with-only-1-2 reviewed
+    siblings (= scarce data, hard to replace).
+
+    Each entry includes filesize_mb so the UI can show "delete N
+    recordings → frees X GB"."""
+    now_ts = int(time.time())
+    # Test-set membership
+    ts_uuids = set()
+    try:
+        ts = json.loads((HLS_DIR / ".tvd-models" / "head.test-set.json"
+                         ).read_text())
+        ts_uuids = set(ts.get("uuids", []) or [])
+    except Exception:
+        pass
+    # Per-show reviewed counts so we can flag scarce shows
+    show_n_rev = _show_review_counts()
+    # Tvh DVR grid for filesize + start_real
+    try:
+        data = json.loads(urllib.request.urlopen(
+            f"{TVH_BASE}/api/dvr/entry/grid?limit=2000",
+            timeout=10).read().decode("utf-8", errors="replace"))
+        by_uuid = {e.get("uuid"): e for e in data.get("entries", [])
+                   if e.get("uuid")}
+    except Exception:
+        by_uuid = {}
+    tier1, tier2 = [], []
+    for d in HLS_DIR.glob("_rec_*"):
+        uuid = d.name[5:]
+        if uuid in ts_uuids:
+            continue  # in active test-set, never recommend deletion
+        dvr = by_uuid.get(uuid, {})
+        # Skip in-progress / scheduled
+        if dvr.get("sched_status") in ("scheduled", "recording"):
+            continue
+        start = dvr.get("start_real") or dvr.get("start") or 0
+        if not start:
+            continue
+        age_days = (now_ts - start) / 86400
+        if age_days < 14:
+            continue  # too recent for any tier
+        title = dvr.get("disp_title") or _show_title_for_rec(d) or "?"
+        filesize_mb = (dvr.get("filesize", 0) or 0) // 1_000_000
+        ch = dvr.get("channelname") or ""
+        user_p = d / "ads_user.json"
+        reviewed = False
+        if user_p.is_file():
+            try:
+                raw = json.loads(user_p.read_text())
+                reviewed = (isinstance(raw, dict)
+                            and bool(raw.get("reviewed_at")))
+            except Exception:
+                pass
+        entry = {
+            "uuid": uuid, "title": title, "channel": ch,
+            "age_days": round(age_days, 1),
+            "filesize_mb": filesize_mb,
+            "start": start,
+        }
+        if not reviewed:
+            entry["reason"] = (f"unreviewed seit {int(age_days)} Tagen "
+                               f"— wahrscheinlich nicht mehr von Interesse")
+            tier1.append(entry)
+        elif age_days >= 30:
+            # Reviewed: only tier-2 if show has plenty of siblings
+            n_rev = show_n_rev.get(title, 0)
+            if n_rev >= 5:  # scarce-show guard
+                entry["reason"] = (f"reviewed vor {int(age_days)} Tagen, "
+                                   f"Show hat {n_rev} reviewed Episoden "
+                                   f"— älteste reviews werden vom Training "
+                                   f"weniger gewichtet")
+                entry["n_reviewed_for_show"] = n_rev
+                tier2.append(entry)
+    tier1.sort(key=lambda e: -e["filesize_mb"])
+    tier2.sort(key=lambda e: -e["filesize_mb"])
+    return _cors(Response(json.dumps({
+        "tier1": tier1, "tier2": tier2,
+        "tier1_total_mb": sum(e["filesize_mb"] for e in tier1),
+        "tier2_total_mb": sum(e["filesize_mb"] for e in tier2),
+        "test_set_size": len(ts_uuids),
+    }), mimetype="application/json"))
 
 
 @app.route("/api/learning/auto-schedule-trigger", methods=["POST"])
