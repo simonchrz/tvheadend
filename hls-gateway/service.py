@@ -10759,6 +10759,87 @@ def recording_source(uuid):
     return send_file(src, mimetype="video/mp2t", conditional=True)
 
 
+@app.route("/api/internal/training-snapshot")
+def api_internal_training_snapshot():
+    """Bulk metadata dump for tv-train-head.py — replaces SMB-mount
+    glob of hls_root with one HTTP roundtrip. Returns every recording
+    that has at least one of (ads_user.json, ads.json, *.txt cutlist,
+    pseudo_labels.json) so the trainer can build its working set
+    without touching SMB.
+
+    Per-recording payload:
+      uuid, base, title, channel_slug, channel_name, start_s,
+      ads_user (raw JSON or None), ads_auto (list or None),
+      pseudo_labels (raw JSON or None),
+      cutlist_basename (= filename stem of the *.txt without sidecar
+        suffixes), has_index_m3u8 (bool, gates the bootstrap path).
+
+    Plus one global: minute_prior_by_channel (= contents of
+    .minute_prior_by_channel.json or {}).
+
+    ~100 KB per recording × ~184 reviewed ≈ 18 MB total response.
+    HTTP gzip drops it to ~3 MB on the wire."""
+    out = {"recordings": [], "minute_prior_by_channel": {},
+           "ts": int(time.time())}
+    sidecar_endings = (".logo.txt", ".cskp.txt", ".tvd.txt",
+                       ".trained.logo.txt")
+    for d in sorted(HLS_DIR.glob("_rec_*")):
+        if not d.is_dir():
+            continue
+        uuid = d.name[5:]
+        # Pick the canonical cutlist .txt — same logic as
+        # _show_title_for_rec, but inline so we capture the full
+        # base (= "Show Name $YYYY-MM-DD-HHMM") for the .ts source
+        # lookup downstream.
+        txts = [p for p in d.glob("*.txt")
+                if not any(p.name.endswith(s) for s in sidecar_endings)]
+        if not txts:
+            continue
+        base = txts[0].stem
+        title = base.split(" $")[0]
+        cutlist_text = ""
+        try:
+            cutlist_text = txts[0].read_text(errors="replace")
+        except Exception:
+            pass
+        ads_user = None
+        try:
+            ads_user = json.loads((d / "ads_user.json").read_text())
+        except Exception:
+            pass
+        ads_auto = None
+        try:
+            x = json.loads((d / "ads.json").read_text())
+            ads_auto = x if isinstance(x, list) else x.get("ads", [])
+        except Exception:
+            pass
+        pseudo = None
+        try:
+            pseudo = json.loads((d / "pseudo_labels.json").read_text())
+        except Exception:
+            pass
+        out["recordings"].append({
+            "uuid": uuid,
+            "base": base,
+            "title": title,
+            "channel_slug": _rec_channel_slug(uuid) or "",
+            "channel_name": _rec_dvr_title(uuid) or "",
+            "start_s": 0,  # not needed by train-head; could query tvh DVR if ever
+            "ads_user": ads_user,
+            "ads_auto": ads_auto,
+            "pseudo_labels": pseudo,
+            "cutlist_text": cutlist_text,
+            "has_index_m3u8": (d / "index.m3u8").exists(),
+        })
+    try:
+        out["minute_prior_by_channel"] = json.loads(
+            (HLS_DIR / ".minute_prior_by_channel.json").read_text())
+    except Exception:
+        pass
+    return _cors(Response(json.dumps(out),
+                          mimetype="application/json"))
+
+
 @app.route("/api/internal/active-channels")
 def api_internal_active_channels():
     """List of channel slugs whose live HLS playlist has been touched
