@@ -8550,19 +8550,23 @@ def recordings_page():
                          f'· nächste {sd} ({rel})</small>')
         # Sort attrs on the series-head row. Two values:
         #   data-sort-start      = newest completed-or-recording episode
-        #   data-sort-start-all  = newest of ANY episode (incl. future-
-        #                          scheduled)
-        # JS picks data-sort-start-all when the status filter currently
-        # shows "scheduled" rows, else sort-start. Without this split,
-        # a series with one episode planned next week would always
-        # outrank a series with a recording from today — confusing
-        # when the user has scheduled rows hidden via the filter.
-        with_content = [e.get("start", 0) for e in eps
-                        if (e.get("sched_status") in ("completed", "recording")
-                            or now_ts >= e.get("stop", 0))]
-        max_start = (max(with_content) if with_content
+        #                          (= "what content do I have to watch")
+        #   data-sort-start-all  = "next activity" — soonest UPCOMING
+        #                          (= what the badge shows as "nächste")
+        #                          if any, else newest completed.
+        # Using MIN of upcoming (not max) matches what users see in the
+        # "nächste 04.05" badge. Earlier max-of-all version put a series
+        # with planned 11.05 above one with planned 04.05 — confusing
+        # because the visible badge said the opposite.
+        completed = [e.get("start", 0) for e in eps
+                     if (e.get("sched_status") in ("completed", "recording")
+                         or now_ts >= e.get("stop", 0))]
+        upcoming = [e.get("start", 0) for e in eps
+                    if e.get("start", 0) > now_ts]
+        max_start = (max(completed) if completed
                      else max((e.get("start", 0) for e in eps), default=0))
-        max_start_all = max((e.get("start", 0) for e in eps), default=0)
+        max_start_all = (min(upcoming) if upcoming
+                         else max_start)
         first_ch = (eps[0].get("channelname") or "").lower()
         head_sort = (f' data-sort-start="{max_start}"'
                      f' data-sort-start-all="{max_start_all}"'
