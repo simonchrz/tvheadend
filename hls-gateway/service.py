@@ -8940,20 +8940,16 @@ def recordings_page():
             f"    const rows=Array.from(tbody.children).filter("
             f"      r=>r.tagName==='TR'&&r.dataset.sortStart!==undefined);"
             f"    const mode=sel.value;"
-            # When the status filter currently shows "scheduled", series
-            # heads should sort by data-sort-start-all (= max-of-all-
-            # episodes including future). Otherwise use data-sort-start
-            # (= max-of-completed-only). Solo rows have no -all variant
-            # so we fall back to sort-start there.
-            f"    const fb=document.getElementById('rec-filter');"
-            f"    const schedCb=fb&&fb.querySelector("
-            f"      'input[type=checkbox][value=\"scheduled\"]');"
-            f"    const includeScheduled=schedCb?schedCb.checked:false;"
+            # Always prefer data-sort-start-all when present (= max of
+            # ALL episodes including future-scheduled). Series-head rows
+            # have no data-status attribute → they're always visible
+            # regardless of the status filter, so a series with an
+            # episode planned tomorrow visually IS "current activity"
+            # for that group. Solo rows have only data-sort-start;
+            # fall back to that.
             f"    function startOf(r){{"
-            f"      if(includeScheduled&&r.dataset.sortStartAll){{"
-            f"        return parseInt(r.dataset.sortStartAll);"
-            f"      }}"
-            f"      return parseInt(r.dataset.sortStart||0);"
+            f"      return parseInt(r.dataset.sortStartAll"
+            f"        ||r.dataset.sortStart||0);"
             f"    }}"
             f"    rows.sort((a,b)=>{{"
             f"      if(mode==='channel'){{"
@@ -8975,13 +8971,6 @@ def recordings_page():
             f"  sel.addEventListener('change',()=>{{"
             f"    try{{localStorage.setItem(KEY,sel.value);}}catch(e){{}}"
             f"    apply();"
-            f"  }});"
-            # Re-sort when the status filter changes (= scheduled checkbox
-            # toggled → which sort attr to use).
-            f"  document.addEventListener('change',ev=>{{"
-            f"    if(ev.target.matches('#rec-filter input[type=checkbox]')){{"
-            f"      apply();"
-            f"    }}"
             f"  }});"
             f"  apply();"
             f"}})();"
