@@ -4644,8 +4644,18 @@ async function toggleAutoSchedule() {
                 "msg": f"<b>{slug}</b> hat {n_blk} user-Block(s) — "
                        f"{need} mehr für eigenen Channel-Block-Prior",
                 "priority": need})
+    # Singletons (= movies, one-off specials) excluded — chasing
+    # +4 user-blocks for "Rocky II" or "Bohemian Rhapsody" is futile
+    # since the broadcaster won't repeat it 5 times. show_user_recs
+    # is the per-show review count (= same data _is_singleton_title
+    # uses). autorec_t fetched once per page render below.
+    _show_recs_for_check = {s: n for s, n in show_user_recs.items()}
+    _ar_titles_for_check = _autorec_titles()
     for show, n_blk in sorted(show_user_blocks.items(), key=lambda x: x[1]):
         if 0 < n_blk < 5:
+            if _is_singleton_title(show, _show_recs_for_check,
+                                    _ar_titles_for_check):
+                continue
             need = 5 - n_blk
             recommendations.append({
                 "kind": "show", "key": show, "n": need,
@@ -4660,6 +4670,11 @@ async function toggleAutoSchedule() {
             if missed + extra >= 1:
                 weak_shows.append((c["title"], missed, extra))
     for title, missed, extra in sorted(weak_shows, key=lambda x: -(x[1] + x[2])):
+        # Same singleton-skip — recommending the user "record more
+        # Rocky for IoU correction" is just as futile here.
+        if _is_singleton_title(title, _show_recs_for_check,
+                                _ar_titles_for_check):
+            continue
         recommendations.append({
             "kind": "test-iou", "key": title, "n": max(1, min(3, missed + extra)),
             "msg": f"Test-Show <b>{title}</b> hat {missed} verfehlt + "
