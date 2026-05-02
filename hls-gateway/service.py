@@ -3366,6 +3366,55 @@ def _label_yield_score(uuid):
     return score
 
 
+def _autorec_titles() -> set:
+    """Set of titles currently covered by an autorec rule. Used by
+    the singleton/movie heuristic — if a title has only 1 corpus
+    sample BUT user explicitly set up an autorec for it, treat it
+    as series-in-the-making, not a one-off film."""
+    out = set()
+    try:
+        d = json.loads(urllib.request.urlopen(
+            f"{TVH_BASE}/api/dvr/autorec/grid?limit=500",
+            timeout=5).read().decode("utf-8", errors="replace"))
+        for e in d.get("entries", []):
+            t = (e.get("title") or "")
+            # autorec stores title-regex like ^Show\\ Name$. Strip
+            # the anchors + un-escape backslashes for naive equality.
+            if t.startswith("^") and t.endswith("$"):
+                t = t[1:-1].replace("\\", "")
+            if t:
+                out.add(t)
+    except Exception:
+        pass
+    return out
+
+
+def _is_singleton_title(title: str, show_counts: dict,
+                        autorec_titles: set) -> bool:
+    """Is this title a one-off (= movie/special) we shouldn't chase
+    for N≥5 stat-floor or auto-schedule N more episodes for?
+
+    Authoritative: TMDB-fetched `kind` field on _epg_meta. Filled
+    by _fetch_tmdb when /search/tv misses + /search/movie hits.
+    Caches refresh per EPG_META_TTL_S=30d so existing cache entries
+    pre-dating the kind field auto-upgrade.
+
+    Fallback (= no meta yet, or unknown kind): count + autorec
+    heuristic — title with ≤1 corpus sample AND no autorec rule
+    is treated as singleton. False-positive on series pilots that
+    haven't been autorec'd yet; accepted cost."""
+    with _epg_meta_lock:
+        meta = _epg_meta.get(_normalize_title(title)) or {}
+    kind = meta.get("kind")
+    if kind == "movie":
+        return True
+    if kind == "tv":
+        return False
+    # Fallback: pre-meta or kind-less entry
+    return (show_counts.get(title, 0) <= 1
+            and title not in autorec_titles)
+
+
 def _show_review_counts() -> dict:
     """show_title → number of recordings on disk that user has reviewed
     (= ads_user.json with reviewed_at). Source of truth for the
@@ -3449,6 +3498,7 @@ def _auto_schedule_run(max_n: int = AUTO_SCHED_MAX_PER_DAY,
         return {"ok": True, "paused": True, "scheduled": [],
                 "skipped_reason": "auto-scheduler is paused"}
     show_n = _show_review_counts()
+    autorec_t = _autorec_titles()  # for the singleton/movie skip below
     # Channel filter — only schedule from channels the user has ≥1
     # reviewed recording on. Otherwise the scheduler picks "Frühshoppen
     # on sonnenklar.TV" because nobody's ever recorded a shopping
@@ -3536,6 +3586,12 @@ def _auto_schedule_run(max_n: int = AUTO_SCHED_MAX_PER_DAY,
         n_rev = show_n.get(title, 0)
         if n_rev >= 5:
             continue  # already enough labelled examples
+        # Singleton/movie skip — chasing N=5 for a one-off film is
+        # impossible (broadcaster won't repeat 5×) and just burns
+        # disk budget on titles we'll never have a training cluster
+        # for. Heuristic: ≤1 corpus sample AND no autorec rule.
+        if _is_singleton_title(title, show_n, autorec_t):
+            continue
         # Base priority by sample count gap
         priority = max(0, 5 - n_rev)
         if priority == 0:
@@ -3704,6 +3760,12 @@ def _aggregate_show_gaps():
         entry["uuids_unreviewed"].sort(
             key=_label_yield_score, reverse=True)
 
+    # Singleton/movie heuristic: don't nag the user to review more
+    # of a one-off film. show_n.get() uses reviewed counts; for
+    # _is_singleton_title we need the per-show TOTAL (reviewed +
+    # unreviewed), so feed n_total in via the dict.
+    show_total_n = {s: e["n_total"] for s, e in by_show.items()}
+    autorec_t = _autorec_titles()
     out = []
     for show, e in by_show.items():
         if e["n_unreviewed_playable"] == 0:
@@ -3723,6 +3785,12 @@ def _aggregate_show_gaps():
             priority = 3
         else:
             continue  # well-labelled, no slack worth surfacing
+        # Skip stat_floor for singletons — chasing N=3 of a movie
+        # is futile (= broadcaster won't repeat 5×). drift_unlock
+        # already requires n_rev≥2 so singletons can't reach it.
+        if sugg == "stat_floor" and _is_singleton_title(
+                show, show_total_n, autorec_t):
+            continue
         out.append((show, e["slug"], e["n_total"], n_rev,
                     e["n_unreviewed_playable"], sugg, priority,
                     e["uuids_unreviewed"]))
@@ -7915,47 +7983,56 @@ def _normalize_title(t):
 
 
 def _fetch_tmdb(title):
-    """Query TMDB /search/tv. Accepts both v4 bearer tokens (JWT,
-    starts with "eyJ") and v3 api_key values (32-char hex). TMDB has
-    much richer DE-TV coverage than TVmaze (Galileo, Geissens, Das
-    perfekte Dinner all indexed with posters). Returns None on miss.
-    TMDB reports vote_average=0.0 when a show has no user ratings —
-    treat that as "no rating" rather than a literal zero."""
-    try:
-        params = {"query": title, "language": "de-DE"}
-        headers = {"Accept": "application/json"}
-        if TMDB_API_KEY.startswith("eyJ"):
-            headers["Authorization"] = f"Bearer {TMDB_API_KEY}"
-        else:
-            params["api_key"] = TMDB_API_KEY
-        url = ("https://api.themoviedb.org/3/search/tv?"
-               + urllib.parse.urlencode(params))
-        req = urllib.request.Request(url, headers=headers)
-        with urllib.request.urlopen(req, timeout=8) as r:
-            d = json.loads(r.read())
-        results = d.get("results") or []
+    """Query TMDB. Accepts both v4 bearer tokens (JWT, starts with
+    "eyJ") and v3 api_key values (32-char hex). Tries /search/tv first
+    (= most German EPG content is series); falls back to /search/movie
+    for one-off films like Rocky/Asterix/Jungle Cruise. Stores `kind`
+    so downstream code (singleton heuristic, etc.) can distinguish
+    series from movies authoritatively. TMDB reports vote_average=0.0
+    when no user ratings — treat as "no rating" rather than literal 0."""
+    def _query(endpoint, name_field):
+        try:
+            params = {"query": title, "language": "de-DE"}
+            headers = {"Accept": "application/json"}
+            if TMDB_API_KEY.startswith("eyJ"):
+                headers["Authorization"] = f"Bearer {TMDB_API_KEY}"
+            else:
+                params["api_key"] = TMDB_API_KEY
+            url = (f"https://api.themoviedb.org/3/search/{endpoint}?"
+                   + urllib.parse.urlencode(params))
+            req = urllib.request.Request(url, headers=headers)
+            with urllib.request.urlopen(req, timeout=8) as r:
+                return (json.loads(r.read()).get("results") or [])
+        except Exception as e:
+            print(f"[epg-enrich tmdb {endpoint}] {title}: {e}", flush=True)
+            return []
+    def _pick(results, name_field):
         if not results:
             return None
-        # Prefer an exact-or-prefix title match over TMDB's default
-        # popularity ordering — "Das perfekte Dinner" should win over
-        # spin-offs like "Das perfekte Promi-Dinner".
         lc = title.lower()
-        best = next(
-            (r for r in results if (r.get("name") or "").lower() == lc),
-            None) or next(
-            (r for r in results if (r.get("name") or "").lower().startswith(lc)),
-            results[0])
-        poster = best.get("poster_path")
-        rating = best.get("vote_average") or 0.0
-        return {
-            "poster": (f"https://image.tmdb.org/t/p/w185{poster}"
-                         if poster else None),
-            "rating": round(rating, 1) if rating > 0 else None,
-            "tmdb_id": best.get("id"),
-        }
-    except Exception as e:
-        print(f"[epg-enrich tmdb] {title}: {e}", flush=True)
+        return (next((r for r in results
+                      if (r.get(name_field) or "").lower() == lc), None)
+                or next((r for r in results
+                         if (r.get(name_field) or "").lower().startswith(lc)),
+                        results[0]))
+    # TV first (covers ~95% of corpus)
+    best = _pick(_query("tv", "name"), "name")
+    kind = "tv" if best else None
+    if best is None:
+        # Fall back to movie search for Rocky/Asterix/Jungle Cruise/etc.
+        best = _pick(_query("movie", "title"), "title")
+        kind = "movie" if best else None
+    if best is None:
         return None
+    poster = best.get("poster_path")
+    rating = best.get("vote_average") or 0.0
+    return {
+        "poster": (f"https://image.tmdb.org/t/p/w185{poster}"
+                   if poster else None),
+        "rating": round(rating, 1) if rating > 0 else None,
+        "tmdb_id": best.get("id"),
+        "kind": kind,
+    }
 
 
 def _fetch_tvmaze(title):
