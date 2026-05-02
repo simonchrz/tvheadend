@@ -8928,17 +8928,23 @@ def recordings_page():
             f"  catch(e){{}}"
             f"  sel.value=saved;"
             f"  function apply(){{"
-            # Browsers auto-insert a <tbody> wrapper around <tr>s when
-            # the markup omits it. So .rec-body > table > tbody
-            # targets the OUTER table's auto-tbody (= our top-level
-            # rows) without descending into the nested .series-sub
-            # tables. Going `> table` alone gave .children=[tbody]
-            # not [tr,tr,…] — filter found 0 rows, no sort applied.
-            f"    const tbody=document.querySelector("
-            f"      '.rec-body > table > tbody');"
+            # Most-defensive way to find the outer table's tbody:
+            # walk via .tBodies[0] which is always populated (browser
+            # auto-creates a tbody when source HTML omits it). Selector
+            # `.rec-body > table > tbody` SHOULD work but had at least
+            # one user report of silent failure → use the JS API for
+            # certainty.
+            f"    const outerTable=document.querySelector("
+            f"      '.rec-body > table');"
+            f"    if(!outerTable)return;"
+            f"    const tbody=outerTable.tBodies[0];"
             f"    if(!tbody)return;"
             f"    const rows=Array.from(tbody.children).filter("
             f"      r=>r.tagName==='TR'&&r.dataset.sortStart!==undefined);"
+            f"    if(window._sortDebug){{"
+            f"      console.log('sort: tbody='+!!tbody+' rows='+rows.length"
+            f"        +' mode='+sel.value);"
+            f"    }}"
             f"    const mode=sel.value;"
             # Always prefer data-sort-start-all when present (= max of
             # ALL episodes including future-scheduled). Series-head rows
