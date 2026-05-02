@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """HLS Gateway on-demand for tvheadend. Spawns ffmpeg per channel on request,
 stops after idle timeout. Serves an HLS playlist with 2h DVR window."""
-import os, re, sys, signal, json, time, shutil, subprocess, threading, urllib.request
+import os, re, sys, signal, json, time, shutil, subprocess, threading, urllib.request, sqlite3
 import urllib.parse
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -1119,6 +1119,8 @@ def index():
             f'</li>')
     tools = [
         ("Alle Kanäle als M3U (für IPTV-Apps)", f"{HOST_URL}/playlist.m3u"),
+        ("Whisper-Suche (Volltext über alle Aufnahmen)",
+                                                f"{HOST_URL}/search"),
         ("Nutzungsstatistik / Top-Sender",      f"{HOST_URL}/stats"),
         ("Status (gerade aktive Streams)",      f"{HOST_URL}/status"),
         ("System-Health (Pi + Container)",      f"{HOST_URL}/health"),
@@ -2281,7 +2283,77 @@ def usage_stats():
                         f"<td>{r['starts']}</td>"
                         f"<td>{r['watch_hours']}</td>"
                         f"<td>{r['last_watched'] or '—'}</td></tr>")
-        html.append("</table></body></html>")
+        html.append("</table>")
+        # Audio+visual spot clusters from cross-channel fingerprint
+        # matching. Loads async — heavy compute (family rebuild)
+        # happens on the spot-fp worker thread; this just renders
+        # the cached result. Labelled "Cluster" not "Werbespots"
+        # because the matching catches some same-advertiser groupings
+        # (shared brand outros) in addition to true exact-spot
+        # repeats — refined further by the dHash visual confirmation
+        # path but not perfect.
+        html.append(
+            "<h2 style='margin-top:32px;font-size:1.1em'>"
+            "Wiederkehrende Werbe-Cluster "
+            "<small style='color:#888;font-weight:400;"
+            "font-size:.8em' id='spot-meta'></small></h2>"
+            "<p style='color:#888;font-size:.85em;margin:0 0 12px;"
+            "max-width:680px;line-height:1.45'>"
+            "Audio-Fingerprint (Chromaprint) + Visual-dHash Matching "
+            "über alle reviewten Werbeblöcke. Cluster ≈ wiederkehrende "
+            "Spots oder same-brand-Spotgruppen. ▶ springt zum "
+            "ersten Auftreten. Eine echte 1:1-Spot-Erkennung ist Audio "
+            "+ Video noch nicht 100&nbsp;%ig &mdash; same-brand-Outros "
+            "(z.&nbsp;B. shared IKEA-Tag) können Cluster aufblähen.</p>"
+            "<div id='spot-list'>Lade…</div>"
+            "<script>"
+            "function fmtAbsTs(s){if(!s)return'—';"
+            "const d=new Date(s*1000);"
+            "return d.toLocaleDateString('de-DE',{day:'2-digit',"
+            "month:'2-digit'})+' '+d.toLocaleTimeString('de-DE',"
+            "{hour:'2-digit',minute:'2-digit'});}"
+            "function fmtAge(s){if(!s)return'';const d=Math.max(0,"
+            "Date.now()/1000-s);if(d<3600)return Math.floor(d/60)+' min';"
+            "if(d<86400)return Math.floor(d/3600)+' h';"
+            "return Math.floor(d/86400)+' Tg';}"
+            "fetch('/api/internal/spot-fingerprints/families?min_size=2&limit=30')"
+            ".then(r=>r.json()).then(d=>{"
+            "const c=document.getElementById('spot-list');"
+            "const m=document.getElementById('spot-meta');"
+            "if(d.meta&&d.meta.rebuilt_at){"
+            "m.textContent='('+(d.meta.n_fp||0)+' Spot-Fingerprints, '"
+            "+(d.meta.n_families||0)+' Cluster · zuletzt '"
+            "+fmtAge(parseInt(d.meta.rebuilt_at))+' aufgebaut)';"
+            "}"
+            "if(!d.families||d.families.length===0){"
+            "c.innerHTML='<p style=\"color:#888\">Noch keine Cluster mit "
+            "≥ 2 Aufnahmen. Index füllt sich nach jedem ✓ Geprüft.</p>';"
+            "return;}"
+            "const rows=d.families.map(f=>{"
+            "const url='/recording/'+f.first_uuid+'?t='+Math.max(0,"
+            "Math.floor(f.first_t_s));"
+            "const chans=f.channels.slice(0,4).join(', ')+("
+            "f.n_channels>4?(' +'+(f.n_channels-4)):'');"
+            "return '<tr><td><a href=\"'+url+'\" title=\"Erste Stelle "
+            "anhören\">▶</a></td>'"
+            "+'<td><b>'+f.n_airings+'</b></td>'"
+            "+'<td>'+f.n_recordings+'</td>'"
+            "+'<td>'+f.n_channels+'</td>'"
+            "+'<td style=\"font-size:.85em;color:#666\">'+chans+'</td>'"
+            "+'<td style=\"font-size:.85em;color:#666\">'"
+            "+fmtAbsTs(f.first_rec_ts)+' → '+fmtAbsTs(f.last_rec_ts)+'</td>'"
+            "+'</tr>';}).join('');"
+            "c.innerHTML='<table><tr>"
+            "<th title=\"Springt zur ersten Stelle\"></th>"
+            "<th title=\"Anzahl Airings über alle Aufnahmen\">Airings</th>"
+            "<th title=\"In wie vielen Aufnahmen detektiert\">Aufn.</th>"
+            "<th title=\"Auf wie vielen Sendern gesehen\">Sender</th>"
+            "<th>Sender-Liste</th>"
+            "<th>Erste – Letzte Erscheinung</th></tr>'+rows+'</table>';"
+            "}).catch(e=>{document.getElementById('spot-list')"
+            ".textContent='Fehler beim Laden: '+e;});"
+            "</script>")
+        html.append("</body></html>")
         return "\n".join(html)
     return {"ranking": rows}
 
@@ -3737,6 +3809,155 @@ def _auto_schedule_loop():
             print(f"[auto-sched] error: {e}", flush=True)
 
 
+# ============================================================
+# Adaptive end-padding
+# Fixed stop_extra=10 still cut off recordings whose broadcaster
+# overran the EPG end (e.g. Davina & Shania ran 13 min long, lost
+# the cliffhanger). This loop watches every in-progress recording
+# in its final 90 s and, if the live ad-scanner sees an active ad
+# block on that channel right now, extends the recording by another
+# 5 min. Capped at 3 extensions per uuid (= +15 min total) so a
+# stuck/silent stream can't keep extending forever.
+# ============================================================
+ADAPTIVE_PADDING_FILE     = HLS_DIR / ".adaptive_padding.json"
+ADAPTIVE_PADDING_MAX_EXT  = 3
+ADAPTIVE_PADDING_STEP_MIN = 5
+ADAPTIVE_PADDING_WINDOW_S = 90
+_adaptive_padding_lock    = threading.Lock()
+_adaptive_padding_state   = {}
+
+
+def _adaptive_padding_load():
+    global _adaptive_padding_state
+    if not ADAPTIVE_PADDING_FILE.exists():
+        return
+    try:
+        _adaptive_padding_state = json.loads(
+            ADAPTIVE_PADDING_FILE.read_text())
+    except Exception as e:
+        print(f"[adaptive-pad] load err: {e}", flush=True)
+        _adaptive_padding_state = {}
+
+
+def _adaptive_padding_save():
+    try:
+        ADAPTIVE_PADDING_FILE.write_text(
+            json.dumps(_adaptive_padding_state))
+    except Exception as e:
+        print(f"[adaptive-pad] save err: {e}", flush=True)
+
+
+def _adaptive_padding_extend_tvh(uuid_str, current_stop_extra_min):
+    """Bump tvh's stop_extra (in minutes) for one DVR entry by
+    ADAPTIVE_PADDING_STEP_MIN. Returns the new value."""
+    new_extra = int(current_stop_extra_min) + ADAPTIVE_PADDING_STEP_MIN
+    body = urllib.parse.urlencode({
+        "node": json.dumps({"uuid": uuid_str, "stop_extra": new_extra})
+    }).encode()
+    req = urllib.request.Request(
+        f"{TVH_BASE}/api/idnode/save",
+        data=body, method="POST",
+        headers={"Content-Type": "application/x-www-form-urlencoded"})
+    urllib.request.urlopen(req, timeout=10).read()
+    return new_extra
+
+
+def _adaptive_padding_check_one(entry, now=None):
+    """Decide+apply for one in-progress entry. Returns (extended,
+    reason). Throttles to one extension per 60 s per uuid, caps at
+    ADAPTIVE_PADDING_MAX_EXT total."""
+    if now is None:
+        now = time.time()
+    uuid_str = entry.get("uuid")
+    if not uuid_str:
+        return (False, "no uuid")
+    # tvh's `stop_real` is the actual scheduled stop wall-clock
+    # (= stop + stop_extra*60). When we increase stop_extra,
+    # stop_real updates accordingly on the next grid query.
+    stop_real = int(entry.get("stop_real") or 0)
+    if stop_real <= 0:
+        return (False, "no stop_real")
+    until_end = stop_real - now
+    if until_end < -10 or until_end > ADAPTIVE_PADDING_WINDOW_S:
+        return (False, f"not in window ({until_end:.0f}s)")
+    with _adaptive_padding_lock:
+        st = dict(_adaptive_padding_state.get(uuid_str) or {})
+    if st.get("count", 0) >= ADAPTIVE_PADDING_MAX_EXT:
+        return (False, "cap reached")
+    if (now - (st.get("last_extend_ts") or 0)) < 60:
+        return (False, "throttled")
+    slug = slugify(entry.get("channelname") or "")
+    if not slug:
+        return (False, "no channel slug")
+    ads = _live_ads_payload(slug).get("ads", [])
+    active = None
+    for blk in ads:
+        if not (isinstance(blk, (list, tuple)) and len(blk) >= 2):
+            continue
+        s, e = float(blk[0]), float(blk[1])
+        # +30 s grace: if the block ends 25 s before scheduled stop,
+        # it's still effectively "running into" the recording boundary
+        # and the next one is plausibly imminent.
+        if s <= now <= e + 30:
+            active = (s, e)
+            break
+    if not active:
+        return (False, "no active ad block")
+    stop_extra_min = int(entry.get("stop_extra") or 0)
+    try:
+        new_extra = _adaptive_padding_extend_tvh(uuid_str, stop_extra_min)
+    except Exception as e:
+        return (False, f"tvh save err: {e}")
+    title = (entry.get("disp_title") or "")[:40]
+    with _adaptive_padding_lock:
+        prev = _adaptive_padding_state.get(uuid_str) or {}
+        _adaptive_padding_state[uuid_str] = {
+            "count": int(prev.get("count", 0)) + 1,
+            "last_extend_ts": now,
+            "title": title,
+            "channel": slug,
+            "stop_extra_min": new_extra,
+        }
+        _adaptive_padding_save()
+    print(f"[adaptive-pad] {uuid_str[:8]} '{title}' @{slug}: "
+          f"stop_extra {stop_extra_min}->{new_extra} min "
+          f"(active block ends in {int(active[1]-now)}s)", flush=True)
+    return (True, f"extended to {new_extra} min")
+
+
+def _adaptive_padding_loop():
+    """Every 60 s: scan in-progress recordings near their scheduled
+    end, extend if a live ad block is active on the channel."""
+    time.sleep(20)  # let live-ads cache populate after boot
+    while True:
+        try:
+            data = json.loads(urllib.request.urlopen(
+                f"{TVH_BASE}/api/dvr/entry/grid?limit=200"
+                f"&sort=start&dir=DESC", timeout=8).read())
+            now = time.time()
+            for e in data.get("entries", []):
+                if e.get("sched_status") != "recording":
+                    continue
+                try:
+                    _adaptive_padding_check_one(e, now=now)
+                except Exception as ex:
+                    print(f"[adaptive-pad] check err uuid={e.get('uuid','?')[:8]}: {ex}",
+                          flush=True)
+        except Exception as e:
+            print(f"[adaptive-pad] loop err: {e}", flush=True)
+        time.sleep(60)
+
+
+@app.route("/api/internal/adaptive-padding")
+def api_internal_adaptive_padding():
+    with _adaptive_padding_lock:
+        snap = dict(_adaptive_padding_state)
+    return _cors(Response(json.dumps({"entries": snap, "n": len(snap),
+                                       "max_ext": ADAPTIVE_PADDING_MAX_EXT,
+                                       "step_min": ADAPTIVE_PADDING_STEP_MIN}),
+                          mimetype="application/json"))
+
+
 def _aggregate_show_gaps():
     """Returns a sorted list of (show, slug, n_total, n_reviewed,
     n_unreviewed_playable, suggestion) tuples for shows that would
@@ -5083,6 +5304,58 @@ document.getElementById('fp-val-btn').addEventListener('click', async (ev) => {
         });
       })();
     </script>""")
+    # ── Per-Show EPG-Drift (Phase-4 manual show-start marks) ────
+    out.append(
+        "<details id='per-show-drift' style='margin-top:32px'>"
+        "<summary style='cursor:pointer;font-weight:600;font-size:1.05em'>"
+        "Per-Show EPG-Drift "
+        "<small style='color:#888;font-weight:400' id='psd-meta'></small>"
+        "</summary>"
+        "<p style='color:#666;font-size:.85em;margin:8px 0;line-height:1.45'>"
+        "Sender starten Sendungen oft 3-10 min vor dem EPG-Termin "
+        "(„Pre-Roll"
+        " mit Werbung + Sponsoring"
+        ", dann Show"
+        ")."
+        " Im Player den Mark-Mode 4× tappen → 🎬 Show-Start, dann auf "
+        "den ersten Show-Frame springen + tappen. System lernt pro "
+        "Sendung wie viel Vorlauf nötig ist."
+        "</p>"
+        "<div id='psd-list' style='font-size:.92em'>Lade…</div>"
+        "<script>"
+        "function fmtMin(s){const m=Math.abs(s)/60;"
+        "return (s<0?'-':'+')+m.toFixed(1)+' min';}"
+        "fetch('/api/internal/per-show-drift').then(r=>r.json()).then(d=>{"
+        "const c=document.getElementById('psd-list');"
+        "const m=document.getElementById('psd-meta');"
+        "const titles=Object.keys(d.shows||{});"
+        "if(titles.length===0){"
+        "c.innerHTML='<p style=\"color:#888\">Noch keine Show-Start-Marks. "
+        "Im Player jede Sendung einmal markieren — System lernt automatisch.</p>';return;}"
+        "m.textContent='('+titles.length+' Sendung'+(titles.length>1?'en':'')+')';"
+        "const rows=titles.sort((a,b)=>d.shows[b].n-d.shows[a].n).map(t=>{"
+        "const s=d.shows[t];"
+        "return '<tr><td>'+t+'</td>'"
+        "+'<td style=\"text-align:center\">'+s.n+'</td>'"
+        "+'<td>'+s.channelname+'</td>'"
+        "+'<td>'+fmtMin(s.mean_drift_s)+'</td>'"
+        "+'<td>'+fmtMin(s.min_drift_s)+'</td>'"
+        "+'<td><b>'+s.suggested_start_extra_min+' min</b>'"
+        "+(s.n>=2?'':' <small style=\"color:#888\">(n=1: noch unsicher)</small>')+'</td>'"
+        "+'</tr>';}).join('');"
+        "c.innerHTML='<table style=\"width:100%;border-collapse:collapse\">"
+        "<tr style=\"text-align:left;border-bottom:1px solid #ddd\">"
+        "<th>Sendung</th><th style=\"text-align:center\">n</th>"
+        "<th>Sender</th><th>Mean drift</th>"
+        "<th>Worst (frühster)</th>"
+        "<th>Vorschlag start_extra</th></tr>'+rows+'</table>'"
+        "+'<p style=\"color:#888;font-size:.8em;margin-top:8px\">"
+        "Anwenden: tvh autorec rule für die Sendung öffnen + start_extra "
+        "auf Vorschlag setzen. Auto-Apply via API ist Phase-4b.</p>';"
+        "}).catch(e=>document.getElementById('psd-list').textContent="
+        "'Fehler: '+e);"
+        "</script></details>")
+
     out.append("</body></html>")
     return Response("\n".join(out), mimetype="text/html")
 
@@ -8565,6 +8838,19 @@ def recordings_page():
         # badge + countdown. JS at the bottom of the page refreshes the
         # countdown text every minute so the page stays informative
         # between auto-reloads.
+        # Adaptive-padding badge: shown when this recording was
+        # auto-extended because an ad block was still running at its
+        # scheduled stop time. Applies to both live (still recording)
+        # and completed entries.
+        with _adaptive_padding_lock:
+            ap_st = _adaptive_padding_state.get(uuid)
+        if ap_st and ap_st.get("count", 0) > 0:
+            ap_min = ap_st["count"] * ADAPTIVE_PADDING_STEP_MIN
+            status_cell += (f' <span class="badge auto-extended" '
+                            f'title="Aufnahme wurde automatisch um '
+                            f'{ap_min} Min verlängert weil bei geplantem '
+                            f'Ende noch Werbung lief">'
+                            f'+{ap_min}m auto</span>')
         # Tuner-conflict warning (rendered alongside the status badge).
         # peak = how many unique muxes overlap THIS entry's window.
         # If > TUNER_TOTAL the recording WILL fail at start time.
@@ -8904,6 +9190,7 @@ def recordings_page():
             f".badge.ads-edited{{background:#16a085;color:#fff}}"
             f".badge.ads-uncertain{{background:#d35400;color:#fff;"
             f"text-decoration:none}}"
+            f".badge.auto-extended{{background:#0f766e;color:#ccfbf1}}"
             f"@keyframes scanpulse{{0%,100%{{opacity:.5}}50%{{opacity:1}}}}"
             f".badge.live{{animation:livepulse 1.5s ease-in-out infinite}}"
             f"@keyframes livepulse{{0%,100%{{opacity:1}}50%{{opacity:.6}}}}"
@@ -11108,6 +11395,14 @@ def api_recording_ads_edit(uuid):
     except Exception as e:
         return Response(json.dumps({"ok": False, "error": str(e)}),
                         status=500, mimetype="application/json")
+    # Auto-refingerprint this recording's ad blocks for the cross-
+    # channel spot index. Background worker handles the actual
+    # extraction so the user's save round-trip stays fast.
+    if cleaned:
+        try:
+            _spot_fp_enqueue(uuid)
+        except Exception as e:
+            print(f"[spot-fp] enqueue err {uuid[:8]}: {e}", flush=True)
     return _cors(Response(json.dumps({"ok": True, "ads": cleaned,
                                        "deleted": cleaned_deleted}),
                            mimetype="application/json"))
@@ -11887,6 +12182,938 @@ def api_internal_user_groups():
                               mimetype="application/json"))
     return _cors(Response(json.dumps(_load_user_groups()),
                           mimetype="application/json"))
+
+
+# ============================================================
+# Whisper full-text search (FTS5)
+# Index of every whisper-classify window across all recordings,
+# enabling "wann sagte X über Y" queries with sub-second response.
+# Index lives next to the recordings on the same volume that holds
+# the .whisper.json files, so reindexing is a local file walk.
+# ============================================================
+WHISPER_INDEX_PATH = HLS_DIR / ".whisper-search.sqlite"
+_whisper_idx_lock = threading.Lock()
+_whisper_refresh_state = {"last_full_scan_ts": 0.0}
+
+
+def _whisper_open():
+    conn = sqlite3.connect(str(WHISPER_INDEX_PATH))
+    conn.executescript("""
+        CREATE VIRTUAL TABLE IF NOT EXISTS whisper_fts USING fts5(
+            text,
+            uuid UNINDEXED,
+            t_start UNINDEXED,
+            prob_ad UNINDEXED,
+            tokenize='unicode61 remove_diacritics 2'
+        );
+        CREATE TABLE IF NOT EXISTS whisper_meta(
+            uuid TEXT PRIMARY KEY,
+            title TEXT,
+            channel_slug TEXT,
+            recording_start_s REAL,
+            json_path TEXT,
+            json_mtime REAL
+        );
+    """)
+    return conn
+
+
+def _rec_start_s_from_base(base):
+    """Parse 'Show $YYYY-MM-DD-HHMM' → unix-ts. Returns 0 on parse fail.
+    Used as the sort key for newest-first search results."""
+    if " $" not in base:
+        return 0.0
+    stamp = base.split(" $", 1)[1].split("-", 4)
+    if len(stamp) < 4 or len(stamp[3]) < 4:
+        return 0.0
+    try:
+        import datetime as _dt
+        dt = _dt.datetime(int(stamp[0]), int(stamp[1]), int(stamp[2]),
+                          int(stamp[3][:2]), int(stamp[3][2:4]))
+        return dt.timestamp()
+    except Exception:
+        return 0.0
+
+
+def _whisper_index_one(conn, uuid_str, json_path):
+    """(Re-)index a single recording's whisper.json. Idempotent —
+    always deletes existing rows for the uuid before inserting."""
+    try:
+        data = json.loads(Path(json_path).read_text())
+    except Exception as e:
+        print(f"[whisper-idx] parse fail {json_path}: {e}", flush=True)
+        return 0
+    rec_dir = HLS_DIR / f"_rec_{uuid_str}"
+    title = _show_title_for_rec(rec_dir) or _rec_dvr_title(uuid_str) or ""
+    channel_slug = _rec_channel_slug(uuid_str) or ""
+    # Recording start derived from the cutlist .txt basename
+    # (= "Show $YYYY-MM-DD-HHMM.txt"), since the .whisper.json
+    # filename is now hidden + uuid-keyed and carries no date.
+    base = ""
+    sidecar_endings = (".logo.txt", ".cskp.txt", ".tvd.txt",
+                       ".trained.logo.txt")
+    for p in rec_dir.glob("*.txt"):
+        if any(p.name.endswith(s) for s in sidecar_endings):
+            continue
+        base = p.stem
+        break
+    rec_start = _rec_start_s_from_base(base)
+
+    conn.execute("DELETE FROM whisper_fts WHERE uuid = ?", (uuid_str,))
+    rows = []
+    for w in data.get("windows", []):
+        text = (w.get("text") or "").strip()
+        if not text:
+            continue
+        rows.append((text, uuid_str, float(w.get("t", 0)),
+                     float(w.get("prob", 0))))
+    if rows:
+        conn.executemany(
+            "INSERT INTO whisper_fts(text, uuid, t_start, prob_ad) "
+            "VALUES (?,?,?,?)", rows)
+    conn.execute(
+        "INSERT OR REPLACE INTO whisper_meta(uuid, title, channel_slug, "
+        "recording_start_s, json_path, json_mtime) VALUES (?,?,?,?,?,?)",
+        (uuid_str, title, channel_slug, rec_start, str(json_path),
+         Path(json_path).stat().st_mtime))
+    return len(rows)
+
+
+def _whisper_lazy_refresh(force=False):
+    """Walk all whisper.json files; reindex any whose mtime differs
+    from what's in whisper_meta. Also drops index rows for recordings
+    whose .whisper.json or rec_dir has been deleted. Throttled to one
+    full scan per 30 s unless force=True."""
+    now = time.time()
+    if not force and (now - _whisper_refresh_state["last_full_scan_ts"]) < 30:
+        return
+    with _whisper_idx_lock:
+        conn = _whisper_open()
+        try:
+            cur = {row[0]: row[1] for row in
+                   conn.execute("SELECT uuid, json_mtime FROM whisper_meta")}
+            seen = set()
+            n_new = n_changed = 0
+            for jpath in HLS_DIR.glob("_rec_*/.whisper.json"):
+                try:
+                    uuid_str = jpath.parent.name[5:]
+                    seen.add(uuid_str)
+                    mtime = jpath.stat().st_mtime
+                    prev = cur.get(uuid_str)
+                    if prev is not None and abs(prev - mtime) < 1.0:
+                        continue
+                    _whisper_index_one(conn, uuid_str, jpath)
+                    if prev is None:
+                        n_new += 1
+                    else:
+                        n_changed += 1
+                except Exception as e:
+                    print(f"[whisper-idx] err {jpath}: {e}", flush=True)
+            stale = set(cur.keys()) - seen
+            for uuid_str in stale:
+                conn.execute("DELETE FROM whisper_fts WHERE uuid=?",
+                             (uuid_str,))
+                conn.execute("DELETE FROM whisper_meta WHERE uuid=?",
+                             (uuid_str,))
+            conn.commit()
+            if n_new or n_changed or stale:
+                print(f"[whisper-idx] +{n_new} new, ~{n_changed} updated, "
+                      f"-{len(stale)} stale", flush=True)
+            _whisper_refresh_state["last_full_scan_ts"] = now
+        finally:
+            conn.close()
+
+
+def _whisper_search(query, max_results=100, include_ads=False):
+    """FTS5 query → ordered list of {uuid, t_start, prob_ad, snippet,
+    title, channel_slug, recording_start_s}. Newest recordings first.
+    Default excludes windows with prob_ad >= 0.5 so search returns
+    show content, not ad transcripts (toggleable via include_ads)."""
+    _whisper_lazy_refresh()
+    if not query.strip():
+        return []
+    with _whisper_idx_lock:
+        conn = _whisper_open()
+        try:
+            sql = ("SELECT w.uuid, w.t_start, w.prob_ad, "
+                   "snippet(whisper_fts, 0, '<mark>', '</mark>', '…', 16) "
+                   "AS snip, m.title, m.channel_slug, m.recording_start_s "
+                   "FROM whisper_fts w "
+                   "JOIN whisper_meta m ON m.uuid = w.uuid "
+                   "WHERE whisper_fts MATCH ?")
+            params = [query]
+            if not include_ads:
+                sql += " AND w.prob_ad < 0.5"
+            sql += " ORDER BY m.recording_start_s DESC LIMIT ?"
+            params.append(max_results)
+            try:
+                rows = conn.execute(sql, params).fetchall()
+            except sqlite3.OperationalError as e:
+                # Malformed FTS query (e.g. lone quote or operator) →
+                # return empty rather than 500.
+                print(f"[whisper-search] bad query {query!r}: {e}", flush=True)
+                return []
+        finally:
+            conn.close()
+    out = []
+    for uuid_str, t_start, prob, snip, title, slug, rec_start in rows:
+        out.append({"uuid": uuid_str, "t_start": float(t_start),
+                    "prob_ad": float(prob), "snippet": snip,
+                    "title": title or "", "channel_slug": slug or "",
+                    "recording_start_s": float(rec_start)})
+    return out
+
+
+@app.route("/api/search")
+def api_search():
+    q = (request.args.get("q") or "").strip()
+    if not q:
+        return _cors(Response(json.dumps({"results": [], "n": 0}),
+                              mimetype="application/json"))
+    include_ads = request.args.get("include_ads") in ("1", "true")
+    try:
+        limit = max(1, min(200, int(request.args.get("limit") or 100)))
+    except Exception:
+        limit = 100
+    results = _whisper_search(q, max_results=limit, include_ads=include_ads)
+    return _cors(Response(json.dumps({"results": results, "n": len(results),
+                                       "q": q, "include_ads": include_ads}),
+                          mimetype="application/json"))
+
+
+@app.route("/api/internal/whisper-reindex", methods=["POST"])
+def api_internal_whisper_reindex():
+    """Called by the Mac whisper daemon after a classify completes.
+    The whisper.json itself lives in ~/.cache/tv-whisper/ on the Mac
+    (Mac-side detect orchestration), so the Mac POSTs the JSON bytes
+    here as the request body. We persist it next to the recording at
+    `_rec_<uuid>/.whisper.json` (hidden filename — different from any
+    cutlist .txt and sidecars) and index it synchronously."""
+    uuid_str = (request.args.get("uuid") or "").strip()
+    if not uuid_str:
+        return Response(json.dumps({"ok": False, "error": "missing uuid"}),
+                        status=400, mimetype="application/json")
+    rec_dir = HLS_DIR / f"_rec_{uuid_str}"
+    if not rec_dir.is_dir():
+        return Response(json.dumps({"ok": False, "error": "rec_dir not found"}),
+                        status=404, mimetype="application/json")
+    body = request.get_data() or b""
+    if not body:
+        return Response(json.dumps({"ok": False, "error": "empty body"}),
+                        status=400, mimetype="application/json")
+    # Validate it's parseable JSON with a 'windows' key — better to
+    # reject upload than corrupt the index with garbage.
+    try:
+        parsed = json.loads(body.decode("utf-8", errors="replace"))
+        if not isinstance(parsed, dict) or "windows" not in parsed:
+            raise ValueError("missing 'windows' key")
+    except Exception as e:
+        return Response(json.dumps({"ok": False, "error": f"bad json: {e}"}),
+                        status=400, mimetype="application/json")
+    jpath = rec_dir / ".whisper.json"
+    jpath.write_bytes(body)
+    with _whisper_idx_lock:
+        conn = _whisper_open()
+        try:
+            n = _whisper_index_one(conn, uuid_str, jpath)
+            conn.commit()
+        finally:
+            conn.close()
+    return _cors(Response(json.dumps({"ok": True, "uuid": uuid_str,
+                                       "n_windows": n}),
+                          mimetype="application/json"))
+
+
+# ============================================================
+# Cross-channel ad-spot fingerprinting (silence-aligned)
+#
+# For each user-confirmed ad block:
+#   1. ffmpeg silencedetect → list of silence intervals
+#   2. spots = audio runs BETWEEN silences (= the actual
+#      commercials separated by ~300-1000 ms of silence)
+#   3. fingerprint each spot starting at silence-aligned offset
+#
+# Why silence-aligned: chromaprint emits one hash per ~124 ms
+# of audio. Two airings of the same commercial produce IDENTICAL
+# hash sequences only if they start at the same audio offset.
+# Sliding-window approach failed because two windows shifted by
+# 10 s of the same audio still produced fingerprints that bytewise
+# diff ratio ≈ 0.46-0.48 — indistinguishable from random. With
+# silence-aligned starts, both airings of the same spot share the
+# same hash positions, and bit-by-bit Hamming compare works.
+#
+# Storage: /mnt/tv/hls/.spot-fingerprints.sqlite
+#   - fingerprints: one row per detected spot (not sliding window)
+#   - family_members: maintained by _spot_fp_rebuild_families()
+# ============================================================
+SPOT_FP_DB              = HLS_DIR / ".spot-fingerprints.sqlite"
+SPOT_SEG_DUR_S          = 6.0    # HLS target duration
+SPOT_SILENCE_DB         = -30    # silencedetect threshold (dBFS)
+SPOT_SILENCE_MIN_S      = 0.30   # min silence duration to count as boundary
+SPOT_MIN_DUR_S          = 12.0   # spots shorter than this = artifact / sponsor card
+SPOT_MAX_DUR_S          = 60.0   # spots longer than this = merged blocks / non-spot music
+SPOT_TRIM_EDGE_S        = 2.0    # skip this much at spot start AND end before
+                                 # fingerprinting — outros/intros are often
+                                 # shared across same-advertiser commercials
+                                 # (e.g. IKEA "Gemacht fürs Leben" tag) and
+                                 # would over-cluster otherwise.
+SPOT_VISUAL_FRAMES      = 5      # dHash samples per spot (evenly spaced)
+SPOT_VISUAL_BIT_BUDGET  = 12     # max ≤ this many bits diff (out of 64) for
+                                 # visual match — picked from per-frame
+                                 # consecutive-frame baseline (~11 bits) plus
+                                 # tolerance for compression noise across
+                                 # different DVB encodes of the same spot.
+SPOT_MATCH_THRESHOLD    = 0.20   # silence-aligned Hamming-ratio cutoff
+SPOT_FP_QUEUE           = []
+_spot_fp_lock           = threading.Lock()
+_spot_fp_queue_lock     = threading.Lock()
+_spot_fp_queue_cv       = threading.Condition(_spot_fp_queue_lock)
+
+
+def _spot_fp_open():
+    conn = sqlite3.connect(str(SPOT_FP_DB))
+    conn.executescript("""
+        CREATE TABLE IF NOT EXISTS fingerprints(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            uuid TEXT NOT NULL,
+            channel_slug TEXT,
+            block_idx INTEGER,
+            block_start_s REAL,
+            block_end_s REAL,
+            window_start_s REAL,
+            recording_start_ts REAL,
+            fp BLOB,
+            dhashes BLOB
+        );
+        CREATE INDEX IF NOT EXISTS ix_fp_uuid ON fingerprints(uuid);
+        CREATE TABLE IF NOT EXISTS family_members(
+            family_id INTEGER NOT NULL,
+            fp_id INTEGER NOT NULL UNIQUE
+        );
+        CREATE INDEX IF NOT EXISTS ix_fm_family
+            ON family_members(family_id);
+        CREATE TABLE IF NOT EXISTS rebuild_meta(
+            key TEXT PRIMARY KEY, val TEXT
+        );
+    """)
+    # Migrate: add dhashes column if it didn't exist already
+    cols = {r[1] for r in conn.execute(
+        "PRAGMA table_info(fingerprints)").fetchall()}
+    if "dhashes" not in cols:
+        conn.execute("ALTER TABLE fingerprints ADD COLUMN dhashes BLOB")
+        conn.commit()
+    return conn
+
+
+def _extract_dhashes(rec_dir, abs_start_s, dur_s,
+                     n_frames=SPOT_VISUAL_FRAMES):
+    """Single ffmpeg call: extract n_frames evenly-spaced 9×8 grayscale
+    frames over [abs_start_s+1, abs_start_s+dur_s-1], compute dHash for
+    each. Returns bytes (n_frames × 8 = 40 bytes packed) or None on
+    failure. Skips first/last 1 s to avoid transition flashes."""
+    inner_start = abs_start_s + 1.0
+    inner_dur = dur_s - 2.0
+    if inner_dur < 2.0:
+        return None
+    seg_paths, seek_s = _spot_block_seg_paths(rec_dir, inner_start,
+                                              inner_start + inner_dur)
+    if len(seg_paths) < 1:
+        return None
+    fps = max(0.5, n_frames / inner_dur)
+    try:
+        r = subprocess.run(
+            ["ffmpeg", "-loglevel", "error",
+             "-i", "concat:" + "|".join(seg_paths),
+             "-ss", f"{seek_s:.3f}", "-t", f"{inner_dur:.2f}",
+             "-vf", f"fps={fps:.4f},scale=9:8,format=gray",
+             "-f", "rawvideo", "-pix_fmt", "gray", "-"],
+            capture_output=True, timeout=30)
+        out = r.stdout
+    except Exception as e:
+        print(f"[spot-fp] dhash extract err: {e}", flush=True)
+        return None
+    hashes = []
+    for i in range(0, len(out), 72):
+        chunk = out[i:i + 72]
+        if len(chunk) != 72:
+            break
+        h = 0
+        for y in range(8):
+            row_off = y * 9
+            bit_off = y * 8
+            for x in range(8):
+                if chunk[row_off + x] > chunk[row_off + x + 1]:
+                    h |= 1 << (bit_off + x)
+        hashes.append(h)
+        if len(hashes) >= n_frames:
+            break
+    if not hashes:
+        return None
+    # Pack to bytes: each dHash = 8 bytes big-endian; varying-length
+    # blob since some spots produce fewer frames than requested.
+    return b"".join(h.to_bytes(8, "big") for h in hashes)
+
+
+def _dhashes_min_diff(a_blob, b_blob):
+    """Best-match Hamming bit-distance between any frame of a and any
+    frame of b. Returns int (0..64) or None if either is empty."""
+    if not a_blob or not b_blob:
+        return None
+    a_hs = [int.from_bytes(a_blob[i:i+8], "big")
+            for i in range(0, len(a_blob), 8) if len(a_blob[i:i+8]) == 8]
+    b_hs = [int.from_bytes(b_blob[i:i+8], "big")
+            for i in range(0, len(b_blob), 8) if len(b_blob[i:i+8]) == 8]
+    if not a_hs or not b_hs:
+        return None
+    best = 64
+    bit_count = int.bit_count
+    for ah in a_hs:
+        for bh in b_hs:
+            d = bit_count(ah ^ bh)
+            if d < best:
+                best = d
+                if best == 0:
+                    return 0
+    return best
+
+
+def _spot_block_seg_paths(rec_dir, block_start_s, block_end_s):
+    """Return (segment_paths, seek_s) covering a given block. seek_s
+    is the offset INTO the first segment to skip to reach
+    block_start_s."""
+    first_seg = max(0, int(block_start_s / SPOT_SEG_DUR_S))
+    last_seg  = int(block_end_s / SPOT_SEG_DUR_S) + 1
+    seg_paths = []
+    for i in range(first_seg, last_seg + 1):
+        p = rec_dir / f"seg_{i:05d}.ts"
+        if p.is_file():
+            seg_paths.append(str(p))
+    seek_s = max(0.0, block_start_s - first_seg * SPOT_SEG_DUR_S)
+    return seg_paths, seek_s
+
+
+def _spot_silence_intervals(rec_dir, block_start_s, block_end_s):
+    """Run ffmpeg silencedetect over [block_start_s, block_end_s].
+    Returns list of (silence_start, silence_end) intervals in
+    BLOCK-relative seconds (= 0 = block_start_s)."""
+    seg_paths, seek_s = _spot_block_seg_paths(rec_dir,
+                                              block_start_s,
+                                              block_end_s)
+    if len(seg_paths) < 1:
+        return []
+    dur = max(0.5, block_end_s - block_start_s)
+    try:
+        r = subprocess.run(
+            ["ffmpeg", "-i", "concat:" + "|".join(seg_paths),
+             "-ss", f"{seek_s:.3f}", "-t", f"{dur:.2f}",
+             "-vn",
+             "-af", f"silencedetect=n={SPOT_SILENCE_DB}dB:"
+                    f"d={SPOT_SILENCE_MIN_S}",
+             "-f", "null", "-"],
+            capture_output=True, timeout=120)
+    except Exception as e:
+        print(f"[spot-fp] silencedetect err: {e}", flush=True)
+        return []
+    intervals = []
+    cur_start = None
+    for line in r.stderr.decode("utf-8", errors="replace").splitlines():
+        if "silence_start:" in line:
+            try:
+                cur_start = float(line.split(
+                    "silence_start:", 1)[1].strip().split()[0])
+            except Exception:
+                cur_start = None
+        elif "silence_end:" in line and cur_start is not None:
+            try:
+                end_str = line.split("silence_end:", 1)[1]
+                end = float(end_str.split("|", 1)[0].strip().split()[0])
+                if end > cur_start:
+                    intervals.append((cur_start, end))
+            except Exception:
+                pass
+            cur_start = None
+    return intervals
+
+
+def _spot_intervals_from_silences(silences, block_dur_s):
+    """Compute spot intervals = audio between silences. Return list
+    of (spot_start_s, spot_end_s) in block-relative time, filtered
+    to SPOT_MIN_DUR_S ≤ dur ≤ SPOT_MAX_DUR_S."""
+    boundaries = [(0.0, 0.0)] + silences + [(block_dur_s, block_dur_s)]
+    spots = []
+    for i in range(len(boundaries) - 1):
+        ss = boundaries[i][1]      # spot starts at end-of-silence
+        se = boundaries[i + 1][0]  # spot ends at next silence-start
+        d = se - ss
+        if SPOT_MIN_DUR_S <= d <= SPOT_MAX_DUR_S:
+            spots.append((ss, se))
+    return spots
+
+
+def _spot_fp_extract_one(rec_dir, abs_start_s, dur_s):
+    """Extract chromaprint for one spot starting at abs_start_s (=
+    recording-relative seconds), for dur_s seconds. Trims
+    SPOT_TRIM_EDGE_S off both ends to avoid shared intros/outros
+    (= same-brand spots cluster falsely on shared "Qualität von X"
+    closing tags otherwise). Returns raw bytes or None."""
+    inner_dur = dur_s - 2 * SPOT_TRIM_EDGE_S
+    if inner_dur < (SPOT_MIN_DUR_S - 2 * SPOT_TRIM_EDGE_S):
+        return None
+    inner_start = abs_start_s + SPOT_TRIM_EDGE_S
+    seg_paths, seek_s = _spot_block_seg_paths(rec_dir, inner_start,
+                                              inner_start + inner_dur)
+    if len(seg_paths) < 1:
+        return None
+    try:
+        r = subprocess.run(
+            ["ffmpeg", "-loglevel", "error",
+             "-i", "concat:" + "|".join(seg_paths),
+             "-ss", f"{seek_s:.3f}", "-t", f"{inner_dur:.2f}",
+             "-vn", "-ac", "1", "-ar", "22050",
+             "-f", "chromaprint", "-fp_format", "raw", "-"],
+            capture_output=True, timeout=30)
+        if r.returncode != 0:
+            return None
+        # ~7-8 hashes/sec × 4 bytes; SPOT_MIN_DUR_S=8 → ≥ 224 bytes.
+        # Anything significantly smaller = audio dropout / decode fail.
+        if len(r.stdout) < 200:
+            return None
+        return r.stdout
+    except Exception as e:
+        print(f"[spot-fp] ffmpeg err: {e}", flush=True)
+        return None
+
+
+def _spot_fp_index_recording(uuid_str):
+    """(Re-)build fingerprints for one recording's confirmed ad blocks.
+    Per block: silence-detect → split into spots → fingerprint each
+    spot from its silence-aligned start. Returns # spots inserted."""
+    rec_dir = HLS_DIR / f"_rec_{uuid_str}"
+    user_p = rec_dir / "ads_user.json"
+    if not user_p.is_file():
+        return 0
+    try:
+        data = json.loads(user_p.read_text())
+        blocks = data.get("ads") if isinstance(data, dict) else data
+        blocks = blocks or []
+    except Exception:
+        return 0
+    channel_slug = _rec_channel_slug(uuid_str) or ""
+    base = ""
+    sidecar_endings = (".logo.txt", ".cskp.txt", ".tvd.txt",
+                       ".trained.logo.txt")
+    for p in rec_dir.glob("*.txt"):
+        if any(p.name.endswith(s) for s in sidecar_endings):
+            continue
+        base = p.stem
+        break
+    rec_start_ts = _rec_start_s_from_base(base)
+    n_inserted = 0
+    with _spot_fp_lock:
+        conn = _spot_fp_open()
+        try:
+            conn.execute("DELETE FROM fingerprints WHERE uuid = ?",
+                         (uuid_str,))
+            for bi, blk in enumerate(blocks):
+                try:
+                    bs, be = float(blk[0]), float(blk[1])
+                except Exception:
+                    continue
+                block_dur = be - bs
+                if block_dur < SPOT_MIN_DUR_S:
+                    continue
+                silences = _spot_silence_intervals(rec_dir, bs, be)
+                spots = _spot_intervals_from_silences(silences,
+                                                     block_dur)
+                if not spots:
+                    # No usable silences detected — fall back to a
+                    # single fingerprint of the whole block (= often
+                    # one continuous spot or a music-bed promo).
+                    if SPOT_MIN_DUR_S <= block_dur <= SPOT_MAX_DUR_S:
+                        spots = [(0.0, block_dur)]
+                for ss_rel, se_rel in spots:
+                    spot_dur = se_rel - ss_rel
+                    abs_start = bs + ss_rel
+                    fp = _spot_fp_extract_one(rec_dir, abs_start,
+                                              spot_dur)
+                    if fp is None:
+                        continue
+                    dh = _extract_dhashes(rec_dir, abs_start, spot_dur)
+                    conn.execute(
+                        "INSERT INTO fingerprints(uuid, channel_slug, "
+                        "block_idx, block_start_s, block_end_s, "
+                        "window_start_s, recording_start_ts, fp, "
+                        "dhashes) "
+                        "VALUES (?,?,?,?,?,?,?,?,?)",
+                        (uuid_str, channel_slug, bi, bs, be, abs_start,
+                         rec_start_ts, sqlite3.Binary(fp),
+                         sqlite3.Binary(dh) if dh else None))
+                    n_inserted += 1
+            conn.commit()
+        finally:
+            conn.close()
+    return n_inserted
+
+
+# Bit-count lookup table — each byte's popcount precomputed once
+_POPCNT = bytes(bin(b).count("1") for b in range(256))
+
+
+def _hamming_ratio(a, b):
+    """Bytewise bit-diff ratio between fp blobs, trimmed to shorter.
+    Returns float in [0.0, 1.0] or None if either is empty."""
+    n = min(len(a), len(b))
+    if n == 0:
+        return None
+    diff = 0
+    for x, y in zip(a[:n], b[:n]):
+        diff += _POPCNT[x ^ y]
+    return diff / (n * 8)
+
+
+def _spot_fp_rebuild_families(threshold=SPOT_MATCH_THRESHOLD,
+                              visual_bits=SPOT_VISUAL_BIT_BUDGET):
+    """Pairwise compare every fingerprint via BOTH audio (chromaprint
+    bytewise Hamming ratio ≤ threshold) AND visual (best-pair dHash
+    bit-diff ≤ visual_bits). Both must pass to merge. Visual is the
+    decisive complement that splits IKEA-outro audio clusters into
+    real per-spot groupings. Returns family count."""
+    with _spot_fp_lock:
+        conn = _spot_fp_open()
+        try:
+            rows = conn.execute(
+                "SELECT id, fp, dhashes FROM fingerprints").fetchall()
+        finally:
+            conn.close()
+    n = len(rows)
+    if n == 0:
+        return 0
+    # Pre-convert: audio fp as bignum_int + bit-length, dhashes as
+    # tuple of int64 hashes (or empty tuple if missing).
+    items = []
+    for fp_id, blob, dh_blob in rows:
+        b = bytes(blob)
+        dh_b = bytes(dh_blob) if dh_blob else b""
+        dh_list = tuple(
+            int.from_bytes(dh_b[i:i+8], "big")
+            for i in range(0, len(dh_b), 8) if len(dh_b[i:i+8]) == 8)
+        items.append((fp_id, int.from_bytes(b, "big"),
+                      len(b) * 8, dh_list))
+    parent = list(range(n))
+    def find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+    def union(x, y):
+        rx, ry = find(x), find(y)
+        if rx != ry:
+            parent[rx] = ry
+    bit_count = int.bit_count
+    for i in range(n):
+        _id_i, ai, bi, dh_i = items[i]
+        for j in range(i + 1, n):
+            _id_j, aj, bj, dh_j = items[j]
+            # --- Audio Hamming ratio ---
+            if bi == bj:
+                diff = bit_count(ai ^ aj)
+                total = bi
+            elif bi > bj:
+                diff = bit_count((ai >> (bi - bj)) ^ aj)
+                total = bj
+            else:
+                diff = bit_count(ai ^ (aj >> (bj - bi)))
+                total = bi
+            if total <= 0 or (diff / total) > threshold:
+                continue
+            # --- Visual confirmation (best frame-pair dHash match) ---
+            # If either spot has no dHash data (= partial backfill),
+            # fall back to audio-only so we don't lose pre-backfill
+            # matches entirely.
+            if dh_i and dh_j:
+                best = 64
+                for ah in dh_i:
+                    for bh in dh_j:
+                        d = bit_count(ah ^ bh)
+                        if d < best:
+                            best = d
+                            if best == 0:
+                                break
+                    if best == 0:
+                        break
+                if best > visual_bits:
+                    continue
+            union(i, j)
+    # Group + persist
+    groups = {}
+    for i in range(n):
+        groups.setdefault(find(i), []).append(items[i][0])
+    with _spot_fp_lock:
+        conn = _spot_fp_open()
+        try:
+            conn.execute("DELETE FROM family_members")
+            for fam_id, members in enumerate(groups.values(), start=1):
+                conn.executemany(
+                    "INSERT INTO family_members(family_id, fp_id) "
+                    "VALUES (?, ?)",
+                    [(fam_id, m) for m in members])
+            conn.execute(
+                "INSERT OR REPLACE INTO rebuild_meta(key, val) "
+                "VALUES ('rebuilt_at', ?)", (str(int(time.time())),))
+            conn.execute(
+                "INSERT OR REPLACE INTO rebuild_meta(key, val) "
+                "VALUES ('n_fp', ?)", (str(n),))
+            conn.execute(
+                "INSERT OR REPLACE INTO rebuild_meta(key, val) "
+                "VALUES ('n_families', ?)", (str(len(groups)),))
+            conn.commit()
+        finally:
+            conn.close()
+    return len(groups)
+
+
+def _spot_fp_top_families(min_size=2, limit=50):
+    """Return top families by airing count. With silence-aligned
+    spots each fingerprint is already one airing, so n_airings =
+    raw row count per family."""
+    with _spot_fp_lock:
+        conn = _spot_fp_open()
+        try:
+            rows = conn.execute("""
+                SELECT fm.family_id, fp.uuid, fp.channel_slug,
+                       fp.block_start_s, fp.window_start_s,
+                       fp.recording_start_ts
+                FROM family_members fm
+                JOIN fingerprints fp ON fp.id = fm.fp_id
+            """).fetchall()
+        finally:
+            conn.close()
+    by_fam = {}
+    for fam_id, uuid, slug, bs, ws, rs in rows:
+        e = by_fam.setdefault(fam_id, {
+            "id": fam_id, "raw": [],
+            "channels": set(), "uuids": set()})
+        e["raw"].append({
+            "uuid": uuid, "channel_slug": slug,
+            "block_start_s": bs, "window_start_s": ws,
+            "recording_start_ts": rs})
+        e["channels"].add(slug or "?")
+        e["uuids"].add(uuid)
+    out = []
+    for e in by_fam.values():
+        n_recs = len(e["uuids"])
+        if n_recs < min_size:
+            continue
+        airings = sorted(e["raw"],
+                         key=lambda o: o["recording_start_ts"])
+        first = airings[0]
+        out.append({
+            "id": e["id"],
+            "n_airings": len(airings),
+            "n_recordings": n_recs,
+            "n_channels": len(e["channels"]),
+            "channels": sorted(e["channels"]),
+            "first_uuid": first["uuid"],
+            "first_t_s": first["window_start_s"],
+            "first_rec_ts": first["recording_start_ts"],
+            "last_rec_ts": airings[-1]["recording_start_ts"],
+        })
+    out.sort(key=lambda x: (-x["n_airings"], -x["last_rec_ts"]))
+    return out[:limit]
+
+
+def _spot_fp_resume_at_boot():
+    """At startup, enqueue any recording with ads_user.json that has
+    no fingerprints in the index yet. Lets the worker resume after a
+    service.py reload (= queue is in-memory, lost across self-exec)."""
+    try:
+        with _spot_fp_lock:
+            conn = _spot_fp_open()
+            try:
+                indexed = {r[0] for r in conn.execute(
+                    "SELECT DISTINCT uuid FROM fingerprints").fetchall()}
+            finally:
+                conn.close()
+        n_q = 0
+        for d in HLS_DIR.glob("_rec_*"):
+            if not (d / "ads_user.json").is_file():
+                continue
+            uuid = d.name[5:]
+            if uuid in indexed:
+                continue
+            _spot_fp_enqueue(uuid)
+            n_q += 1
+        if n_q:
+            print(f"[spot-fp] resume-at-boot: enqueued {n_q} unindexed",
+                  flush=True)
+    except Exception as e:
+        print(f"[spot-fp] resume-at-boot err: {e}", flush=True)
+
+
+def _spot_fp_worker():
+    """Consume SPOT_FP_QUEUE: re-fingerprint queued uuids, then
+    rebuild families when the queue drains."""
+    while True:
+        with _spot_fp_queue_cv:
+            while not SPOT_FP_QUEUE:
+                _spot_fp_queue_cv.wait()
+            uuid_str = SPOT_FP_QUEUE.pop(0)
+        try:
+            n = _spot_fp_index_recording(uuid_str)
+            print(f"[spot-fp] indexed {uuid_str[:8]}: {n} windows",
+                  flush=True)
+        except Exception as e:
+            print(f"[spot-fp] index err {uuid_str[:8]}: {e}", flush=True)
+        # Rebuild families only when queue is empty (= avoid thrash
+        # during a bulk reindex).
+        with _spot_fp_queue_cv:
+            empty = (len(SPOT_FP_QUEUE) == 0)
+        if empty:
+            try:
+                t0 = time.time()
+                n_fam = _spot_fp_rebuild_families()
+                print(f"[spot-fp] families rebuilt: {n_fam} "
+                      f"in {time.time()-t0:.1f}s", flush=True)
+            except Exception as e:
+                print(f"[spot-fp] family rebuild err: {e}", flush=True)
+
+
+def _spot_fp_enqueue(uuid_str):
+    """Add a recording to the fingerprint worker's queue."""
+    with _spot_fp_queue_cv:
+        if uuid_str not in SPOT_FP_QUEUE:
+            SPOT_FP_QUEUE.append(uuid_str)
+        _spot_fp_queue_cv.notify()
+
+
+@app.route("/api/internal/spot-fingerprints/rebuild", methods=["POST"])
+def api_internal_spot_fp_rebuild():
+    """Bulk reindex: enqueue every recording with ads_user.json.
+    Background worker processes them in order, then rebuilds families
+    when the queue drains. Optional ?families_only=1 skips the
+    fingerprint extraction and only re-runs union-find (useful when
+    tuning threshold)."""
+    if request.args.get("families_only") in ("1", "true"):
+        try:
+            t_str = request.args.get("threshold")
+            thr = float(t_str) if t_str else SPOT_MATCH_THRESHOLD
+        except Exception:
+            thr = SPOT_MATCH_THRESHOLD
+        t0 = time.time()
+        n_fam = _spot_fp_rebuild_families(threshold=thr)
+        return _cors(Response(json.dumps({
+            "ok": True, "families_only": True,
+            "threshold": thr, "n_families": n_fam,
+            "rebuild_s": round(time.time() - t0, 1)}),
+            mimetype="application/json"))
+    n_q = 0
+    for d in HLS_DIR.glob("_rec_*"):
+        if (d / "ads_user.json").is_file():
+            _spot_fp_enqueue(d.name[5:])
+            n_q += 1
+    return _cors(Response(json.dumps({"ok": True, "queued": n_q}),
+                          mimetype="application/json"))
+
+
+def _spot_fp_backfill_dhashes():
+    """Walk fingerprints with NULL dhashes, extract from source HLS
+    segments, write back. Parallelised — each ffmpeg call is mostly
+    I/O bound, 4-way pool empirically saturates the Pi without
+    starving other gateway work."""
+    with _spot_fp_lock:
+        conn = _spot_fp_open()
+        try:
+            rows = conn.execute(
+                "SELECT id, uuid, window_start_s "
+                "FROM fingerprints WHERE dhashes IS NULL").fetchall()
+        finally:
+            conn.close()
+    print(f"[spot-fp] backfill: {len(rows)} fingerprints to dHash",
+          flush=True)
+    n_filled = n_failed = 0
+    n_done_lock = threading.Lock()
+
+    def _job(row):
+        nonlocal n_filled, n_failed
+        fp_id, uuid_str, ws = row
+        rec_dir = HLS_DIR / f"_rec_{uuid_str}"
+        if not rec_dir.is_dir():
+            with n_done_lock:
+                n_failed += 1
+            return None
+        # 25 s default spot length — most cluster 20-30 s and dHash
+        # is forgiving on overshoot (we just sample more frames from
+        # the next ad segment, still within the same spot family).
+        dh = _extract_dhashes(rec_dir, ws, 25.0)
+        if dh is None:
+            with n_done_lock:
+                n_failed += 1
+            return None
+        return (fp_id, dh)
+
+    BATCH = 64
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        for batch_start in range(0, len(rows), BATCH):
+            batch = rows[batch_start:batch_start + BATCH]
+            results = list(pool.map(_job, batch))
+            updates = [r for r in results if r is not None]
+            if updates:
+                with _spot_fp_lock:
+                    conn = _spot_fp_open()
+                    try:
+                        conn.executemany(
+                            "UPDATE fingerprints SET dhashes = ? "
+                            "WHERE id = ?",
+                            [(sqlite3.Binary(dh), fp_id)
+                             for fp_id, dh in updates])
+                        conn.commit()
+                    finally:
+                        conn.close()
+                n_filled += len(updates)
+            done = n_filled + n_failed
+            if done % 256 < BATCH:
+                print(f"[spot-fp] backfill: {done}/{len(rows)} "
+                      f"({n_filled} ok, {n_failed} fail)", flush=True)
+    return (n_filled, n_failed)
+
+
+@app.route("/api/internal/spot-fingerprints/backfill-dhashes",
+           methods=["POST"])
+def api_internal_spot_fp_backfill_dhashes():
+    """Run dHash backfill in a background thread (returns immediately)."""
+    def _runner():
+        try:
+            n_ok, n_err = _spot_fp_backfill_dhashes()
+            print(f"[spot-fp] backfill complete: ok={n_ok} err={n_err}",
+                  flush=True)
+            n_fam = _spot_fp_rebuild_families()
+            print(f"[spot-fp] post-backfill rebuild: {n_fam} families",
+                  flush=True)
+        except Exception as e:
+            print(f"[spot-fp] backfill thread err: {e}", flush=True)
+    threading.Thread(target=_runner, daemon=True).start()
+    return _cors(Response(json.dumps({"ok": True, "started": True}),
+                          mimetype="application/json"))
+
+
+@app.route("/api/internal/spot-fingerprints/families")
+def api_internal_spot_fp_families():
+    try:
+        min_size = max(2, int(request.args.get("min_size") or 2))
+        limit    = max(1, min(200, int(request.args.get("limit") or 50)))
+    except Exception:
+        min_size, limit = 2, 50
+    families = _spot_fp_top_families(min_size=min_size, limit=limit)
+    with _spot_fp_lock:
+        conn = _spot_fp_open()
+        try:
+            meta = dict(conn.execute(
+                "SELECT key, val FROM rebuild_meta").fetchall())
+        finally:
+            conn.close()
+    return _cors(Response(json.dumps({
+        "families": families, "n": len(families), "meta": meta}),
+        mimetype="application/json"))
 
 
 @app.route("/api/internal/recording-uuids")
@@ -12786,6 +14013,173 @@ def api_recording_mark_reviewed(uuid):
         mimetype="application/json"))
 
 
+def _dvr_entry_for_uuid(uuid_str):
+    """Fetch one tvh DVR entry by uuid. Returns dict or None."""
+    try:
+        d = json.loads(urllib.request.urlopen(
+            f"{TVH_BASE}/api/dvr/entry/grid?limit=2000",
+            timeout=8).read())
+        for e in d.get("entries", []):
+            if e.get("uuid") == uuid_str:
+                return e
+    except Exception:
+        pass
+    return None
+
+
+PER_SHOW_DRIFT_PATH = HLS_DIR / ".tvd-models" / "per-show-drift.json"
+_per_show_drift_lock = threading.Lock()
+
+
+def _aggregate_per_show_drift():
+    """Walk all reviewed recordings (= ads_user.json with show_start_s),
+    join with tvh DVR entries to derive EPG-vs-broadcast drift, group by
+    disp_title, persist to PER_SHOW_DRIFT_PATH.
+
+    drift_s = (start_real + show_start_s) - epg_start
+              = how many seconds the broadcaster ran ahead of EPG
+              (negative = early, positive = late).
+
+    Suggested start_extra = ceil(max(|drift|) / 60) + 2  (=2 min buffer)."""
+    try:
+        d = json.loads(urllib.request.urlopen(
+            f"{TVH_BASE}/api/dvr/entry/grid?limit=3000", timeout=10).read())
+    except Exception as e:
+        print(f"[show-drift] tvh fetch err: {e}", flush=True)
+        return {}
+    by_uuid = {e.get("uuid"): e for e in d.get("entries", []) if e.get("uuid")}
+    samples = {}  # title → [{drift_s, uuid, start_real, show_start_s}, ...]
+    for rec_dir in HLS_DIR.glob("_rec_*"):
+        user_p = rec_dir / "ads_user.json"
+        if not user_p.is_file():
+            continue
+        try:
+            data = json.loads(user_p.read_text())
+            if not isinstance(data, dict):
+                continue
+            ss = data.get("show_start_s")
+            if ss is None:
+                continue
+        except Exception:
+            continue
+        uuid_str = rec_dir.name[5:]
+        ent = by_uuid.get(uuid_str)
+        if not ent:
+            continue
+        epg_start = ent.get("start") or 0
+        start_real = ent.get("start_real") or 0
+        if not (epg_start and start_real):
+            continue
+        title = (ent.get("disp_title") or "").strip()
+        if not title:
+            continue
+        drift = (start_real + float(ss)) - epg_start
+        samples.setdefault(title, []).append({
+            "uuid": uuid_str, "drift_s": round(drift, 1),
+            "show_start_s": float(ss),
+            "start_real": int(start_real), "epg_start": int(epg_start),
+            "channelname": ent.get("channelname") or ""})
+    out = {}
+    for title, items in samples.items():
+        drifts = [s["drift_s"] for s in items]
+        n = len(drifts)
+        # Negative drift = broadcaster runs early. The amount of pre-roll
+        # we need to capture = MAX early-drift + a safety buffer.
+        min_drift = min(drifts)  # most negative (= earliest broadcaster)
+        suggested_extra_min = max(
+            5, int(-min(0, min_drift) / 60) + 3) if n >= 1 else 5
+        out[title] = {
+            "n": n,
+            "drifts_s": drifts,
+            "mean_drift_s": round(sum(drifts) / n, 1),
+            "min_drift_s": round(min_drift, 1),
+            "suggested_start_extra_min": suggested_extra_min,
+            "channelname": items[0]["channelname"],
+            "samples": items,
+            "computed_at": int(time.time()),
+        }
+    with _per_show_drift_lock:
+        try:
+            PER_SHOW_DRIFT_PATH.parent.mkdir(parents=True, exist_ok=True)
+            PER_SHOW_DRIFT_PATH.write_text(json.dumps(out, indent=1))
+        except Exception as e:
+            print(f"[show-drift] save err: {e}", flush=True)
+    return out
+
+
+@app.route("/api/recording/<uuid>/show-start", methods=["POST"])
+def api_recording_show_start(uuid):
+    """Mark the actual show-start time within the recording. Body
+    {"t": <seconds>}. Stored as show_start_s in ads_user.json. Returns
+    drift_s = (start_real + t) - epg_start so the player can confirm
+    "broadcaster ran X min early" inline. Triggers per-show drift
+    aggregation in background."""
+    out_dir = HLS_DIR / f"_rec_{uuid}"
+    if not out_dir.exists():
+        return Response(json.dumps({"ok": False, "error": "unknown recording"}),
+                        status=404, mimetype="application/json")
+    try:
+        body = request.get_json(silent=True) or {}
+        t_s = float(body.get("t"))
+        if not (t_s >= 0):
+            raise ValueError("t must be ≥ 0")
+    except Exception as e:
+        return Response(json.dumps({"ok": False, "error": str(e)}),
+                        status=400, mimetype="application/json")
+    user_cache = out_dir / "ads_user.json"
+    cur = {}
+    if user_cache.exists():
+        try:
+            cur = json.loads(user_cache.read_text())
+            if not isinstance(cur, dict):
+                cur = {}
+        except Exception:
+            cur = {}
+    cur["show_start_s"] = round(t_s, 2)
+    cur.setdefault("ads", [])
+    cur.setdefault("deleted", [])
+    try:
+        tmp = user_cache.with_suffix(".tmp")
+        tmp.write_text(json.dumps(cur))
+        tmp.replace(user_cache)
+    except Exception as e:
+        return Response(json.dumps({"ok": False, "error": str(e)}),
+                        status=500, mimetype="application/json")
+    drift = None
+    ent = _dvr_entry_for_uuid(uuid)
+    if ent:
+        epg = ent.get("start") or 0
+        sr = ent.get("start_real") or 0
+        if epg and sr:
+            drift = (sr + t_s) - epg
+    threading.Thread(target=_aggregate_per_show_drift, daemon=True).start()
+    return _cors(Response(json.dumps({
+        "ok": True, "show_start_s": round(t_s, 2),
+        "drift_s": round(drift, 1) if drift is not None else None}),
+        mimetype="application/json"))
+
+
+@app.route("/api/internal/per-show-drift")
+def api_internal_per_show_drift():
+    """Return current per-show drift snapshot. Recomputes if older
+    than 5 min (= picks up new show_start_s marks since last call)."""
+    fresh = False
+    try:
+        if not PER_SHOW_DRIFT_PATH.is_file() or \
+                (time.time() - PER_SHOW_DRIFT_PATH.stat().st_mtime) > 300:
+            _aggregate_per_show_drift()
+            fresh = True
+    except Exception as e:
+        print(f"[show-drift] refresh err: {e}", flush=True)
+    try:
+        data = json.loads(PER_SHOW_DRIFT_PATH.read_text())
+    except Exception:
+        data = {}
+    return _cors(Response(json.dumps({
+        "shows": data, "n": len(data), "freshly_computed": fresh}),
+        mimetype="application/json"))
+
+
 @app.route("/api/recording/<uuid>/redetect", methods=["POST"])
 def api_recording_redetect(uuid):
     """Force a fresh tv-detect pass on this recording.
@@ -13467,17 +14861,19 @@ def play_recording(uuid):
             f"   correct .tvd-bumpers/<slug>/<kind>/ subdir. Mode persists"
             f"   in localStorage. */"
             f"const MARK_MODE_KEY='player-mark-mode';"
-            f"const MARK_MODES=['ad','bumper-end','bumper-start'];"
+            f"const MARK_MODES=['ad','bumper-end','bumper-start','show-start'];"
             f"let _markMode='ad';"
             f"try{{const m=localStorage.getItem(MARK_MODE_KEY);"
             f"     if(MARK_MODES.indexOf(m)>=0)_markMode=m;}}catch(e){{}}"
             f"let _bumperStaging=null;"
-            f"function _isBumperMode(){{return _markMode!=='ad';}}"
+            f"function _isBumperMode(){{return _markMode==='bumper-start'||_markMode==='bumper-end';}}"
+            f"function _isShowStartMode(){{return _markMode==='show-start';}}"
             f"function _bumperKind(){{return _markMode==='bumper-start'?'start':'end';}}"
             f"function _renderMarkBtn(){{"
             f"  const b=document.getElementById('mark-mode');if(!b)return;"
             f"  if(_markMode==='bumper-end'){{b.textContent='🎬 Bumper End';b.classList.add('rec');}}"
             f"  else if(_markMode==='bumper-start'){{b.textContent='🎬 Bumper Start';b.classList.add('rec');}}"
+            f"  else if(_markMode==='show-start'){{b.textContent='🎬 Show-Start';b.classList.add('rec');}}"
             f"  else{{b.textContent='🎯 Werbung';b.classList.remove('rec');}}"
             f"  /* Show step-buttons only in bumper modes — they're noisy"
             f"     during normal ad-block marking and useless in playback. */"
@@ -13505,14 +14901,38 @@ def play_recording(uuid):
             f"    'Bumper-End-Modus: Werbung→Show Übergang markieren':"
             f"    _markMode==='bumper-start'?"
             f"      'Bumper-Start-Modus: Show→Werbung Übergang markieren':"
-            f"      'Werbe-Modus: Start/Ende markieren einen Werbeblock';"
+            f"      _markMode==='show-start'?"
+            f"        'Show-Start-Modus: Tap markiert wo die Sendung TATSÄCHLICH beginnt'"
+            f"        +' (lernt EPG-Drift pro Show)':"
+            f"        'Werbe-Modus: Start/Ende markieren einen Werbeblock';"
             f"  _adShowToast(msg);"
             f"}}"
             f"function markStart(){{"
+            f"  if(_isShowStartMode()){{showStartMark();return;}}"
             f"  if(_isBumperMode()){{bumperMarkStart();}}else{{adMarkStart();}}"
             f"}}"
             f"function markEnd(){{"
+            f"  if(_isShowStartMode()){{showStartMark();return;}}"
             f"  if(_isBumperMode()){{bumperMarkEnd();}}else{{adMarkEnd();}}"
+            f"}}"
+            f"/* One-tap: capture playhead as the actual show-start time."
+            f"   Persisted as show_start_s in ads_user.json. Per-show drift"
+            f"   aggregator on the gateway then suggests start_extra. */"
+            f"function showStartMark(){{"
+            f"  const t=Math.max(0,v.currentTime||0);"
+            f"  fetch('{HOST_URL}/api/recording/{uuid}/show-start',"
+            f"    {{method:'POST',headers:{{'Content-Type':'application/json'}},"
+            f"     body:JSON.stringify({{t:t}})}}"
+            f"   ).then(r=>r.json()).then(d=>{{"
+            f"     if(d&&d.ok){{"
+            f"       let m='Show-Start @ '+fmt(t)+' gespeichert';"
+            f"       if(d.drift_s!==undefined&&d.drift_s!==null){{"
+            f"         const sign=d.drift_s<0?'früher':'später';"
+            f"         m+=' (Sender '+Math.abs(Math.round(d.drift_s/60*10)/10)+' min '+sign+' als EPG)';"
+            f"       }}"
+            f"       _adShowToast(m);"
+            f"     }}else{{_adShowToast('Fehler: '+(d&&d.error||'?'));}}"
+            f"   }}).catch(()=>_adShowToast('Netzwerk-Fehler'));"
             f"}}"
             f"function bumperMarkStart(){{"
             f"  const t=Math.max(0,v.currentTime||0);"
@@ -13762,7 +15182,25 @@ def play_recording(uuid):
             # tick has populated _recPlaylistMtime (otherwise we miss
             # the freshness check and restore a stale offset). Cap at
             # 5 s so we don't sit forever if the endpoint is broken.
+            # Deep-link from /search results: ?t=<seconds> jumps the
+            # player straight to that position and overrides the saved
+            # localStorage offset. The freshness wait is skipped — the
+            # caller asked for an explicit time, not a "resume where
+            # you left off" restore.
+            f"const _deepT=(()=>{{"
+            f"  try{{const u=new URL(window.location.href);"
+            f"      const v=u.searchParams.get('t');"
+            f"      if(v===null)return null;"
+            f"      const f=parseFloat(v);return isFinite(f)&&f>=0?f:null;}}"
+            f"  catch(e){{return null;}}"
+            f"}})();"
             f"v.addEventListener('loadedmetadata',()=>{{"
+            f"  if(_deepT!==null){{"
+            f"    const D=isFinite(v.duration)?v.duration:0;"
+            f"    if(D>0)v.currentTime=Math.max(0,Math.min(D-1,_deepT));"
+            f"    else v.currentTime=_deepT;"
+            f"    v.play().catch(()=>{{}});return;"
+            f"  }}"
             f"  let waited=0;"
             f"  const tryRestore=()=>{{"
             f"    if(window._recPlaylistMtime||waited>=5000){{"
@@ -15295,6 +16733,171 @@ def health_page():
     return Response(HEALTH_HTML, mimetype="text/html")
 
 
+SEARCH_HTML = """<!doctype html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>Suche</title>
+<style>
+:root{
+  --bg:#fafafa; --fg:#222; --muted:#666;
+  --card:#ffffff; --border:#e1e1e1; --th-bg:#f0f0f0;
+  --code-bg:#0001; --link:#0366d6;
+  --hl:#fff3a0; --hl-fg:#222;
+}
+@media (prefers-color-scheme: dark){
+  :root{
+    --bg:#1a1a1a; --fg:#eee; --muted:#888;
+    --card:#252525; --border:#333; --th-bg:#2c2c2c;
+    --code-bg:#0006; --link:#5dade2;
+    --hl:#5d4d00; --hl-fg:#fff3a0;
+  }
+}
+body{margin:0;padding:16px;background:var(--bg);color:var(--fg);
+  font-family:-apple-system,sans-serif;max-width:900px;margin:0 auto}
+h1{margin:0 0 14px;font-size:1.4em}
+h1 a{color:var(--muted);text-decoration:none;font-size:.7em;margin-left:8px}
+.q-row{display:flex;gap:8px;align-items:center;margin-bottom:12px}
+#q{flex:1;padding:10px 12px;font-size:1em;border:1px solid var(--border);
+  border-radius:6px;background:var(--card);color:var(--fg)}
+#q:focus{outline:none;border-color:var(--link)}
+.opts{font-size:.85em;color:var(--muted)}
+.opts label{cursor:pointer}
+#status{color:var(--muted);font-size:.85em;margin:6px 0 12px;min-height:1.2em}
+.rec-group{background:var(--card);border:1px solid var(--border);
+  border-radius:8px;padding:10px 14px;margin-bottom:10px}
+.rec-head{font-weight:600;margin-bottom:6px}
+.rec-head .ch{color:var(--muted);font-weight:400;font-size:.85em;
+  margin-left:6px}
+.rec-head .date{color:var(--muted);font-weight:400;font-size:.8em;
+  float:right}
+.hit{padding:4px 0;border-top:1px solid var(--border);font-size:.92em;
+  display:flex;gap:10px;align-items:baseline}
+.hit:first-of-type{border-top:0}
+.hit .t{color:var(--link);text-decoration:none;font-variant-numeric:
+  tabular-nums;flex-shrink:0;min-width:64px;font-family:monospace}
+.hit .t:hover{text-decoration:underline}
+.hit .snip{color:var(--fg);line-height:1.4}
+.hit mark{background:var(--hl);color:var(--hl-fg);padding:0 2px;
+  border-radius:2px}
+.hit.is-ad .t{color:var(--muted)}
+.hit.is-ad .snip{color:var(--muted)}
+.hit .ad-tag{font-size:.7em;color:#e74c3c;font-weight:600;
+  text-transform:uppercase;margin-left:auto;flex-shrink:0}
+.empty{color:var(--muted);text-align:center;padding:30px;font-size:.9em}
+.help{color:var(--muted);font-size:.8em;margin-top:14px;line-height:1.6}
+.help code{background:var(--code-bg);padding:1px 5px;border-radius:3px}
+</style></head><body>
+<h1>Whisper-Suche <a href="/recordings">← Aufnahmen</a></h1>
+<div class="q-row">
+  <input id="q" type="search" autofocus
+    placeholder="Suche nach gesprochenem Wort…"
+    autocapitalize="off" autocorrect="off">
+  <span class="opts">
+    <label><input type="checkbox" id="incl-ads"> auch Werbung</label>
+  </span>
+</div>
+<div id="status"></div>
+<div id="results"></div>
+<div class="help">
+  Tipp: Mehrere Begriffe = AND. <code>"genaue phrase"</code> in
+  Anführungszeichen. Suffix-* für Präfix: <code>kanzler*</code>.
+</div>
+<script>
+const qInp=document.getElementById('q');
+const inclAds=document.getElementById('incl-ads');
+const statusEl=document.getElementById('status');
+const resultsEl=document.getElementById('results');
+let timer=null, lastQ='';
+
+function fmtTs(s){
+  if(!isFinite(s)||s<0)s=0;
+  const m=Math.floor(s/60), ss=Math.floor(s%60);
+  const h=Math.floor(m/60);
+  return h>0?h+':'+String(m%60).padStart(2,'0')+':'+String(ss).padStart(2,'0')
+           :m+':'+String(ss).padStart(2,'0');
+}
+function fmtDate(s){
+  if(!s)return '';
+  const d=new Date(s*1000);
+  return d.toLocaleDateString('de-DE',{day:'2-digit',month:'2-digit',
+    year:'2-digit',hour:'2-digit',minute:'2-digit'});
+}
+function escAttr(s){return String(s||'').replace(/"/g,'&quot;');}
+
+async function run(){
+  const q=qInp.value.trim();
+  if(!q){statusEl.textContent='';resultsEl.innerHTML='';lastQ='';return;}
+  if(q===lastQ)return;
+  lastQ=q;
+  statusEl.textContent='Suche…';
+  const t0=performance.now();
+  let d;
+  try{
+    const u='/api/search?q='+encodeURIComponent(q)
+      +(inclAds.checked?'&include_ads=1':'');
+    d=await fetch(u).then(r=>r.json());
+  }catch(e){
+    statusEl.textContent='Netzwerk-Fehler.';return;
+  }
+  if(q!==qInp.value.trim())return;  // user typed further, ignore
+  const ms=Math.round(performance.now()-t0);
+  if(!d.results||d.results.length===0){
+    statusEl.textContent=ms+' ms — keine Treffer.';
+    resultsEl.innerHTML='<div class="empty">Keine Treffer für '
+      +'<code>'+escAttr(q)+'</code></div>';
+    return;
+  }
+  statusEl.textContent=d.n+' Treffer in '+ms+' ms';
+  /* Group by uuid, preserve order = newest recording first. */
+  const groups=[];
+  const byUuid=new Map();
+  for(const r of d.results){
+    let g=byUuid.get(r.uuid);
+    if(!g){g={uuid:r.uuid,title:r.title,channel_slug:r.channel_slug,
+             rec_start:r.recording_start_s,hits:[]};
+      byUuid.set(r.uuid,g);groups.push(g);}
+    g.hits.push(r);
+  }
+  resultsEl.innerHTML=groups.map(g=>{
+    const recUrl='/recording/'+g.uuid;
+    const head='<div class="rec-head">'
+      +'<a href="'+recUrl+'" style="color:var(--fg);'
+      +'text-decoration:none">'+escAttr(g.title||'(unbekannt)')+'</a>'
+      +'<span class="ch">'+escAttr(g.channel_slug)+'</span>'
+      +'<span class="date">'+fmtDate(g.rec_start)+'</span></div>';
+    const hits=g.hits.map(h=>{
+      const isAd=h.prob_ad>=0.5;
+      const cls='hit'+(isAd?' is-ad':'');
+      return '<div class="'+cls+'">'
+        +'<a class="t" href="'+recUrl+'?t='+Math.floor(h.t_start)+'">'
+        +fmtTs(h.t_start)+'</a>'
+        +'<span class="snip">'+h.snippet+'</span>'
+        +(isAd?'<span class="ad-tag">Werbung</span>':'')+'</div>';
+    }).join('');
+    return '<div class="rec-group">'+head+hits+'</div>';
+  }).join('');
+}
+
+qInp.addEventListener('input',()=>{
+  clearTimeout(timer);
+  timer=setTimeout(run,300);
+});
+inclAds.addEventListener('change',()=>{lastQ='';run();});
+qInp.addEventListener('keydown',e=>{
+  if(e.key==='Enter'){e.preventDefault();clearTimeout(timer);
+    lastQ='';run();}
+});
+/* Pre-fill from ?q= for shareable links. */
+try{const p=new URL(window.location.href).searchParams.get('q');
+    if(p){qInp.value=p;run();}}catch(e){}
+</script></body></html>"""
+
+
+@app.route("/search")
+def search_page():
+    return Response(SEARCH_HTML, mimetype="text/html")
+
+
 def _self_exec(reason):
     # Replace this Python process in place. Child ffmpegs (spawned with
     # start_new_session=True and tracked via PID files) remain our
@@ -15363,6 +16966,7 @@ if __name__ == "__main__":
     load_always_warm()
     load_live_ads()
     load_mediathek_rec()
+    _adaptive_padding_load()
     adopt_surviving_ffmpegs()
     signal.signal(signal.SIGHUP, _sighup_reload)
     threading.Thread(target=_file_watcher_loop, daemon=True).start()
@@ -15383,6 +16987,9 @@ if __name__ == "__main__":
         except Exception as e:
             print(f"[auto-sched] init err: {e}", flush=True)
     threading.Thread(target=_auto_schedule_loop, daemon=True).start()
+    threading.Thread(target=_adaptive_padding_loop, daemon=True).start()
+    threading.Thread(target=_spot_fp_worker, daemon=True).start()
+    _spot_fp_resume_at_boot()
     threading.Thread(target=always_warm_loop, daemon=True).start()
     threading.Thread(target=_mediathek_rip_loop, daemon=True).start()
     threading.Thread(target=_mediathek_autorec_loop, daemon=True).start()
