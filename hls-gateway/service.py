@@ -2315,6 +2315,16 @@ def _render_per_show_iou_trend():
     # Sort each show's series chronologically.
     for s in series.values():
         s.sort(key=lambda x: x[0])
+    # Filter singletons (= movies, one-off specials) — per-show IoU
+    # for those is meaningful as ONE datapoint but doesn't trend
+    # (= broadcaster won't repeat 5×). Hiding declutters the section
+    # so series with actual movement are easier to spot.
+    show_n = _show_review_counts()
+    autorec_t = _autorec_titles()
+    series = {s: pts for s, pts in series.items()
+              if not _is_singleton_title(s, show_n, autorec_t)}
+    if not series:
+        return ""
     # Sort shows by LAST iou ascending (worst first).
     shows = sorted(series.items(), key=lambda kv: kv[1][-1][1])
 
