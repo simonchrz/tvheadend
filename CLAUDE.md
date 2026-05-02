@@ -34,7 +34,7 @@ processing. Pi CPU during full-recording processing dropped from
 | Design decisions, file/state layout, HTTP endpoints, Player UI, public-broadcaster wiring | [docs/architecture.md](docs/architecture.md) |
 | Deploying code (SIGHUP, NOT compose restart), iOS Safari quirks, SSD swap / EXT4 recovery / USB cable + power-cap diagnostics | [docs/operations.md](docs/operations.md) |
 | Mac-offload daemon (HTTP-based job pipeline, /api/internal/* endpoints, why HTTP not SMB, TCC trap) | [docs/mac-handlers.md](docs/mac-handlers.md) |
-| Mac-daemon scripts themselves (`tv-thumbs-daemon.py`, `tv-train-head.sh`, `mount-pi-tv.sh`) — symlinked from `~/bin/` so launchd paths stay valid | [mac-daemon/](mac-daemon/) |
+| Mac-daemon scripts themselves (`tv-thumbs-daemon.py`, `tv-train-head.sh`, `tv-train-snapshot-fetch.py`, `tv-live-detect.py`, `tv-whisper-classify.py`) — symlinked from `~/bin/` so launchd paths stay valid | [mac-daemon/](mac-daemon/) |
 | **UI design tokens, components, mobile patterns** — read BEFORE editing any HTML/CSS in service.py | [DESIGN.md](DESIGN.md) |
 | Things deliberately not done + open backlog | [docs/history.md](docs/history.md) |
 
@@ -102,6 +102,7 @@ strand viewers.
 | `POST/DELETE /api/internal/training-active` | tv-train-head.sh writes/clears the `.training-active` marker via HTTP (no SMB needed). Drives /learning "Training läuft seit N min" banner. |
 | `POST /api/internal/training-duration` | Append one record to `.training-durations.jsonl` (Mac-side script POSTs after each run). Feeds /learning ETA median. |
 | `GET /api/internal/live-config/<slug>` | Per-channel knobs for tv-live-detect: logo_smooth_s, start_lag_s, sponsor_duration_s, cached_logo_url, min/max_block_s. Single endpoint replaces 4 SMB reads per scan. |
+| `GET /api/internal/training-snapshot` | Bulk metadata dump for tv-train-head.py: per-recording (uuid, title, base, channel_slug, channel_name, ads_user, ads_auto, pseudo_labels, cutlist_text, has_index_m3u8) + minute_prior_by_channel. ~85 KB, ~380 ms response. Replaces SMB-mount glob of hls_root. |
 | `POST /api/recording/<uuid>/redetect` | Force a fresh tv-detect pass on this recording (truncates cutlist + writes `.detect-requested` marker) |
 | `POST /api/recording/<uuid>/bumper-capture` | Save a bumper template (start or end). Body: `{start_s, end_s, kind: "start"|"end"}`. Auto-aligns the nearest user-block boundary (±30s) to the captured frame. Channel-wide invalidation triggers re-detect across all recordings of that slug. |
 | `GET /api/internal/detect-bumpers/<slug>` | Returns `{templates: [...end...], start_templates: [...start...]}` — categorised template list for the daemon. End-bumpers from `.tvd-bumpers/<slug>/end/` AND legacy channel-root; start-bumpers from `.tvd-bumpers/<slug>/start/`. |
@@ -115,12 +116,18 @@ strand viewers.
 
 ## Training pipeline (`train-head.py`, runs 03:30 nightly)
 
-- Wrapper `tv-train-head.sh` läuft SMB-frei für Marker (POST `/api/internal/training-active` + `/training-duration`). SMB-Mount wird im Script noch geremountet falls weg — wird aber nur vom Fallback-Pfad gebraucht wenn der UUID-Cache eine .ts nicht hat (= immer seltener seit dem `~/.cache/tv-detect-daemon/source/` Prefetch-Loop)
+- Wrapper `tv-train-head.sh` läuft **vollständig SMB-frei** seit 2026-05-02:
+  1. POST `/api/internal/training-active` (= banner marker)
+  2. `tv-train-snapshot-fetch.py` zieht alle metadata via HTTP nach `/tmp/tv-train-snapshot/_rec_<uuid>/` (= mirror, 868 KB, idempotent — wiped + rebuilt jedes run)
+  3. `train-head.py --hls-root /tmp/tv-train-snapshot` liest aus dem mirror statt aus SMB
+  4. .ts files: nur daemon-cache (= `~/.cache/tv-detect-daemon/source/<uuid>.ts`); SMB-fallback entfernt da daemon-cache 100% des reviewed-Korpus deckt
+  5. POST `/api/internal/training-duration` (= ETA-history)
+  6. Snapshot-marker → daemon fired Per-Show-IoU snapshot wenn V2 queues drained
 - **Active flags**: `--with-logo --with-audio --with-minute-prior --with-self-training --write-pseudo-labels` → produces a 1282-dim head (5132 B = backbone 1280 + logo + audio). `--with-channel` available but disabled (memory: feature ceiling at N≈50 → wait until N≥150 reviewed).
 - **Audio-RMS** (added 2026-04-30): per-second normalised RMS via ffmpeg astats, fed as the 1282nd feature in NN inference. Go side: `signals/audio_rms.go` mirrors the Python extraction; head sizes 5132 (+LOGO+AUDIO) and 5156 (+LOGO+CHAN+AUDIO) supported in `signals/nn.go`. Gateway's `detect-config` endpoint reports `with_audio: true` when the deployed head matches the audio sizes; daemon then passes `--with-audio` to tv-detect.
 - **Platt-Calibration**: nach `clf.fit` wird auf hold-out Test-Set ein 1-D Sigmoid σ(A·logit + B) gefittet, Brier-Score-Diff geloggt, Sidecar `head.calibration.json` neben head.bin. Kalibrierte Probs im `--surface-uncertain` Step → Active-Learning-Targets ranken auf TATSÄCHLICHER Modell-Unsicherheit. Phase-A/B Self-Training nutzt raw Probs (Threshold-Tuning ist auf raw kalibriert).
 - **Test-set sidecar** (added 2026-05-01): train-head writes `head.test-set.json` listing UUIDs in the test split. **V2 invalidation strategy** (2026-05-01): test-set UUIDs get `.detect-requested` (high prio, ~25 min on ~20 recs); rest get `.detect-requested-low` (background — daemon picks only when high queue empty AND no detect in flight). Without sidecar falls back to V1 = all high. cutlist-uploaded clears both markers. Daemon submits at most one bg job per cycle so a freshly-arriving manual /redetect always wins within 5s. Net result: snapshot fires after the high-prio drain (~25 min); whole corpus catches up over 1-2 days of background work.
-- **Daemon source-cache prefetch** (added 2026-05-01): `tv-thumbs-daemon` runs a 30-min prefetch loop pulling missing recordings from Pi via HTTP (3 parallel, max 5 per cycle, skips if any detect in flight). Combined with `SOURCE_CACHE_MAX_GB=300` the entire Pi corpus fits locally → train-head reads from NVMe instead of SMB fallback. Single canonical local cache: `~/.cache/tv-detect-daemon/source/<uuid>.ts` (UUID-keyed). Old `~/local-tv-cache` (path-keyed) was deleted 2026-05-01 — train-head's `--daemon-cache` flag now defaults to the daemon path.
+- **Daemon source-cache prefetch** (added 2026-05-01): `tv-thumbs-daemon` runs a 30-min prefetch loop pulling missing recordings from Pi via HTTP (3 parallel, max 5 per cycle, skips if any detect in flight). Combined with `SOURCE_CACHE_MAX_GB=300` the entire Pi corpus fits locally and is the SOLE source for .ts files — SMB-fallback in train-head removed 2026-05-02. Single canonical local cache: `~/.cache/tv-detect-daemon/source/<uuid>.ts` (UUID-keyed). Old `~/local-tv-cache` (path-keyed) was deleted 2026-05-01 — train-head's `--daemon-cache` flag now defaults to the daemon path.
 - **Per-channel bumper threshold**: `.channel-config.json` per-slug `bumper_threshold` (default 0.75; RTL/SAT-1/ProSieben at 0.85 because their large generic template sets cause false-positive snaps at the lower bar). Diagnosed via the Failure-Mode-Analyse on /learning where missed_bumper deltas split 73 % threshold-bound vs 22 % window-bound.
 - **Training-active marker**: `tv-train-head.sh` POSTs to `/api/internal/training-active` on start (gateway writes file, mtime = start), DELETEs via shell trap on exit. /learning surfaces a banner with elapsed + ETA derived from `.training-durations.jsonl` (median of last 10 successful runs, also POSTed via HTTP).
 
@@ -170,7 +177,9 @@ enumerating network mounts; `os.listdir(/Users/simon/mnt/pi-tv/hls)`
 returns `Operation not permitted` even though interactive shells
 work fine. The original `mac/tv-comskip.sh` setup was silently
 broken by this since 2026-04-25 (its log file went 0-byte). HTTP
-sidesteps the TCC scope entirely.
+sidesteps the TCC scope entirely. As of 2026-05-02 NO Mac process
+touches the SMB mount during normal operation — `mount-pi-tv.sh`
+remains on disk for emergency manual access only.
 
 Eager auto-invalidation: when nightly retrain bumps `head.bin` mtime,
 prewarm notices and applies the V2 two-tier markering described in
