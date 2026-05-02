@@ -5335,23 +5335,54 @@ document.getElementById('fp-val-btn').addEventListener('click', async (ev) => {
         "m.textContent='('+titles.length+' Sendung'+(titles.length>1?'en':'')+')';"
         "const rows=titles.sort((a,b)=>d.shows[b].n-d.shows[a].n).map(t=>{"
         "const s=d.shows[t];"
-        "return '<tr><td>'+t+'</td>'"
+        "const safeT=t.replace(/\"/g,'&quot;');"
+        "return '<tr data-title=\"'+safeT+'\">'"
+        "+'<td>'+t+'</td>'"
         "+'<td style=\"text-align:center\">'+s.n+'</td>'"
         "+'<td>'+s.channelname+'</td>'"
         "+'<td>'+fmtMin(s.mean_drift_s)+'</td>'"
         "+'<td>'+fmtMin(s.min_drift_s)+'</td>'"
         "+'<td><b>'+s.suggested_start_extra_min+' min</b>'"
-        "+(s.n>=2?'':' <small style=\"color:#888\">(n=1: noch unsicher)</small>')+'</td>'"
+        "+(s.n>=2?'':' <small style=\"color:#888\">(n=1: noch unsicher)</small>')"
+        "+'</td>'"
+        "+'<td><button class=\"psd-apply\" data-extra=\"'"
+        "+s.suggested_start_extra_min+'\" '"
+        "+'style=\"padding:3px 10px;font-size:.85em;cursor:pointer;'"
+        "+'border:1px solid var(--border);border-radius:4px;'"
+        "+'background:var(--stripe);color:var(--fg)\">Anwenden</button></td>'"
         "+'</tr>';}).join('');"
         "c.innerHTML='<table style=\"width:100%;border-collapse:collapse\">"
         "<tr style=\"text-align:left;border-bottom:1px solid #ddd\">"
         "<th>Sendung</th><th style=\"text-align:center\">n</th>"
         "<th>Sender</th><th>Mean drift</th>"
         "<th>Worst (frühster)</th>"
-        "<th>Vorschlag start_extra</th></tr>'+rows+'</table>'"
+        "<th>Vorschlag start_extra</th><th></th></tr>'+rows+'</table>'"
         "+'<p style=\"color:#888;font-size:.8em;margin-top:8px\">"
-        "Anwenden: tvh autorec rule für die Sendung öffnen + start_extra "
-        "auf Vorschlag setzen. Auto-Apply via API ist Phase-4b.</p>';"
+        "Anwenden: aktualisiert die tvh autorec-Regel UND alle bereits "
+        "geplanten künftigen Aufnahmen mit diesem Titel. Erhöht nur, "
+        "reduziert nie (= sicher).</p>';"
+        "/* Apply button handler — confirms, POSTs, shows result toast. */"
+        "c.querySelectorAll('.psd-apply').forEach(btn=>{"
+        "btn.addEventListener('click',async ev=>{"
+        "const tr=ev.target.closest('tr'); const tt=tr.dataset.title;"
+        "const ex=parseInt(ev.target.dataset.extra,10);"
+        "if(!confirm('start_extra='+ex+' min für '+tt+' setzen?')) return;"
+        "ev.target.disabled=true; ev.target.textContent='…';"
+        "try{const r=await fetch('/api/internal/per-show-drift/apply',"
+        "{method:'POST',headers:{'Content-Type':'application/json'},"
+        "body:JSON.stringify({title:tt,start_extra:ex})});"
+        "const j=await r.json();"
+        "if(!j.ok){alert('Fehler: '+(j.error||'?'));ev.target.disabled=false;"
+        "ev.target.textContent='Anwenden';return;}"
+        "let m='OK · autorec: '+j.autorec_updated+'/'+j.autorec_matched;"
+        "if(j.dvr_via_cascade) m+=' · '+j.dvr_via_cascade+' DVR-Entries auto-übernommen via autorec';"
+        "else m+=' · DVR-Entries: '+j.dvr_updated+'/'+j.dvr_matched;"
+        "if(j.skipped_already_higher) m+=' · skipped (schon höher): '+j.skipped_already_higher;"
+        "if(j.no_targets) m='Keine autorec-Regel + keine geplante Aufnahme — wirkt erst beim nächsten manuellen Schedule';"
+        "if(j.errors&&j.errors.length) m+=' · Fehler: '+j.errors.join(',');"
+        "ev.target.textContent='✓ '+ex+' min'; alert(m);"
+        "}catch(e){alert('Netzwerk-Fehler: '+e);ev.target.disabled=false;"
+        "ev.target.textContent='Anwenden';}});});"
         "}).catch(e=>document.getElementById('psd-list').textContent="
         "'Fehler: '+e);"
         "</script></details>")
@@ -14157,6 +14188,135 @@ def api_recording_show_start(uuid):
         "ok": True, "show_start_s": round(t_s, 2),
         "drift_s": round(drift, 1) if drift is not None else None}),
         mimetype="application/json"))
+
+
+def _idnode_save(uuid_str, **fields):
+    """tvh idnode/save helper: POSTs {"uuid": ..., **fields} as the
+    'node' form value. Raises on HTTP failure."""
+    body = urllib.parse.urlencode({
+        "node": json.dumps({"uuid": uuid_str, **fields})
+    }).encode()
+    req = urllib.request.Request(
+        f"{TVH_BASE}/api/idnode/save",
+        data=body, method="POST",
+        headers={"Content-Type": "application/x-www-form-urlencoded"})
+    return urllib.request.urlopen(req, timeout=10).read()
+
+
+def _autorec_rules_matching_title(title):
+    """Find autorec rules whose anchored regex title would match the
+    given disp_title. The rules use ^EscapedTitle$ patterns so we
+    just compare the plain title to the unescaped version."""
+    matches = []
+    try:
+        d = json.loads(urllib.request.urlopen(
+            f"{TVH_BASE}/api/dvr/autorec/grid?limit=500", timeout=8).read())
+    except Exception as e:
+        print(f"[show-drift] autorec fetch err: {e}", flush=True)
+        return matches
+    for r in d.get("entries", []):
+        pat = (r.get("title") or "").strip()
+        if not pat.startswith("^") or not pat.endswith("$"):
+            continue
+        # Strip leading ^ and trailing $, then unescape backslashes
+        # before regex meta-chars (= the form tvh writes them in:
+        # \\space, \\-, \\!, \\&, etc.).
+        body = pat[1:-1]
+        try:
+            unesc = re.sub(r"\\(.)", r"\1", body)
+        except Exception:
+            continue
+        if unesc == title:
+            matches.append(r)
+    return matches
+
+
+def _scheduled_dvr_for_title(title):
+    """Find DVR entries (= future scheduled or currently recording)
+    whose disp_title equals the given title."""
+    out = []
+    try:
+        d = json.loads(urllib.request.urlopen(
+            f"{TVH_BASE}/api/dvr/entry/grid?limit=2000", timeout=8).read())
+    except Exception as e:
+        print(f"[show-drift] dvr fetch err: {e}", flush=True)
+        return out
+    for e in d.get("entries", []):
+        if (e.get("sched_status") in ("scheduled", "recording")
+                and (e.get("disp_title") or "").strip() == title):
+            out.append(e)
+    return out
+
+
+@app.route("/api/internal/per-show-drift/apply", methods=["POST"])
+def api_internal_per_show_drift_apply():
+    """Apply a suggested start_extra to every relevant tvh entity for
+    the given show. Body: {"title": "...", "start_extra": <minutes>}.
+
+    Updates:
+      - all autorec rules whose ^title$ pattern matches
+      - all currently-scheduled or recording DVR entries with that
+        disp_title (= future bookings inherit the new padding so the
+        next instance starts earlier)
+
+    Skips entries where the new start_extra is ≤ existing (= we never
+    REDUCE padding, only increase, since reducing risks losing the
+    show start). Returns per-target counts."""
+    try:
+        body = request.get_json(silent=True) or {}
+        title = (body.get("title") or "").strip()
+        new_extra = int(body.get("start_extra"))
+        if not title or not (0 < new_extra <= 60):
+            raise ValueError("title required, start_extra in 1..60")
+    except Exception as e:
+        return Response(json.dumps({"ok": False, "error": str(e)}),
+                        status=400, mimetype="application/json")
+    autorec_hits = _autorec_rules_matching_title(title)
+    dvr_hits = _scheduled_dvr_for_title(title)
+    n_autorec_updated = n_dvr_updated = 0
+    n_skipped_already = 0
+    errors = []
+    for r in autorec_hits:
+        cur = int(r.get("start_extra") or 0)
+        if cur >= new_extra:
+            n_skipped_already += 1
+            continue
+        try:
+            _idnode_save(r["uuid"], start_extra=new_extra)
+            n_autorec_updated += 1
+        except Exception as e:
+            errors.append(f"autorec {r['uuid'][:8]}: {e}")
+    # When an autorec rule matched + got updated, tvh cascades the new
+    # start_extra to all child DVR entries automatically. Manually
+    # POSTing during the cascade returns HTTP 400 (= entry locked).
+    # So skip DVR updates whenever an autorec match exists.
+    if not autorec_hits:
+        for e in dvr_hits:
+            cur = int(e.get("start_extra") or 0)
+            if cur >= new_extra:
+                n_skipped_already += 1
+                continue
+            try:
+                _idnode_save(e["uuid"], start_extra=new_extra)
+                n_dvr_updated += 1
+            except Exception as ex:
+                errors.append(f"dvr {e['uuid'][:8]}: {ex}")
+    cascade_msg = (f"{len(dvr_hits)} DVR entries inherit via autorec cascade"
+                   if autorec_hits and dvr_hits else "")
+    return _cors(Response(json.dumps({
+        "ok": True,
+        "title": title,
+        "new_start_extra": new_extra,
+        "autorec_matched": len(autorec_hits),
+        "autorec_updated": n_autorec_updated,
+        "dvr_matched": len(dvr_hits),
+        "dvr_updated": n_dvr_updated,
+        "dvr_via_cascade": len(dvr_hits) if autorec_hits else 0,
+        "skipped_already_higher": n_skipped_already,
+        "cascade_msg": cascade_msg,
+        "errors": errors,
+        "no_targets": (len(autorec_hits) == 0 and len(dvr_hits) == 0),
+    }), mimetype="application/json"))
 
 
 @app.route("/api/internal/per-show-drift")
