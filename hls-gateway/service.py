@@ -8549,10 +8549,18 @@ def recordings_page():
                          f'title="nächste Folge: {sd}">'
                          f'· nächste {sd} ({rel})</small>')
         # Sort attrs on the series-head row — same semantics as solo
-        # rows. data-sort-start = newest episode in the group; channel
-        # from the first episode (= all eps share a channel by
-        # construction); title from the group label.
-        max_start = max((e.get("start", 0) for e in eps), default=0)
+        # rows. data-sort-start = newest COMPLETED-or-recording episode
+        # (= "we have actual content for this group"). Excludes future-
+        # scheduled because otherwise a series with one episode planned
+        # next week would outrank a series with a recording from today
+        # — confusing for the user who reads "Neueste zuerst" as
+        # "newest content I can watch". Fall back to any episode's
+        # start time if the group is purely future-scheduled.
+        with_content = [e.get("start", 0) for e in eps
+                        if (e.get("sched_status") in ("completed", "recording")
+                            or now_ts >= e.get("stop", 0))]
+        max_start = (max(with_content) if with_content
+                     else max((e.get("start", 0) for e in eps), default=0))
         first_ch = (eps[0].get("channelname") or "").lower()
         head_sort = (f' data-sort-start="{max_start}"'
                      f' data-sort-title="{group_title.lower().replace(chr(34),"&quot;")}"'
