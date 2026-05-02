@@ -3596,7 +3596,13 @@ def _auto_schedule_run(max_n: int = AUTO_SCHED_MAX_PER_DAY,
             try:
                 body = urllib.parse.urlencode({
                     "event_id": ev["eventId"],
-                    "config_uuid": ""}).encode()
+                    "config_uuid": "",
+                    # 5/10 min pre/post padding so broadcasters running
+                    # over EPG-listed end don't truncate the recording.
+                    # Same value as record_series autorec defaults.
+                    "start_extra": 5,
+                    "stop_extra": 10,
+                }).encode()
                 req = urllib.request.Request(
                     f"{TVH_BASE}/api/dvr/entry/create_by_event",
                     data=body, method="POST")
@@ -7305,9 +7311,18 @@ def api_internal_scheduled_events():
 
 @app.route("/record-event/<event_id>")
 def record_event(event_id):
-    """Schedule a DVR entry for a specific EPG event (whole programme)."""
-    body = urllib.parse.urlencode({"event_id": event_id,
-                                    "config_uuid": ""}).encode()
+    """Schedule a DVR entry for a specific EPG event (whole programme).
+    Adds 5 min pre / 10 min post padding so we don't lose the start
+    if the broadcaster runs early or the end if they run long.
+    Witnessed: 'Davina & Shania - We Love Monaco' on RTLZWEI scheduled
+    via this endpoint without padding, broadcast ran ~13 min past EPG
+    end, recording cut off at end. tvh's global default pre/post is
+    0/0 — autorec rules carry their own padding but manual schedules
+    from this endpoint don't inherit anything."""
+    body = urllib.parse.urlencode({
+        "event_id": event_id, "config_uuid": "",
+        "start_extra": 5, "stop_extra": 10,
+    }).encode()
     req = urllib.request.Request(f"{TVH_BASE}/api/dvr/entry/create_by_event",
                                   data=body, method="POST")
     try:
@@ -11055,7 +11070,11 @@ def api_learning_plan():
             continue
         # Schedule via create_by_event (config_uuid required by tvheadend)
         try:
-            payload = {"event_id": ev.get("eventId", 0)}
+            payload = {"event_id": ev.get("eventId", 0),
+                       # 5/10 min pre/post padding — tvh's global default
+                       # is 0/0; missing padding = recordings get cut off
+                       # when broadcasters run over EPG-listed end.
+                       "start_extra": 5, "stop_extra": 10}
             if dvr_config_uuid:
                 payload["config_uuid"] = dvr_config_uuid
             req = urllib.request.Request(
