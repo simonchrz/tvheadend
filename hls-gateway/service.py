@@ -4525,14 +4525,18 @@ async function toggleAutoSchedule() {
     out.append("<div id='del-cand-mount'><p class='muted'>Lade …</p></div>")
     out.append("""<script>
 (function(){
-  const sec=document.getElementById('sec-sichere-loeschkandidaten-disk-freigeben')
-    ||document.querySelector("details[id^='sec-sichere-loeschkandidaten']");
+  // Look up the parent <details> via the mount node — robust against
+  // section-ID slugification quirks (Umlauts in "Löschkandidaten"
+  // get replaced by dashes, not "oe", so the title-derived ID
+  // doesn't match obvious guesses).
+  const mount=document.getElementById('del-cand-mount');
+  if(!mount)return;
+  const sec=mount.closest('details');
   if(!sec)return;
   let loaded=false;
   sec.addEventListener('toggle',async()=>{
     if(!sec.open||loaded)return;
     loaded=true;
-    const mount=document.getElementById('del-cand-mount');
     try{
       const r=await fetch('/api/learning/deletion-candidates').then(r=>r.json());
       const fmt=(mb)=>mb>=1024?(mb/1024).toFixed(1)+' GB':mb+' MB';
