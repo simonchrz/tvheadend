@@ -8928,11 +8928,14 @@ def recordings_page():
             f"  catch(e){{}}"
             f"  sel.value=saved;"
             f"  function apply(){{"
-            # Target the OUTER table directly. Without `>` the selector
-            # walks into the nested .series-sub <tbody>s and re-sorts
-            # the wrong children — bug seen 2026-05-02 where Neueste-
-            # zuerst order was scrambled.
-            f"    const tbody=document.querySelector('.rec-body > table');"
+            # Browsers auto-insert a <tbody> wrapper around <tr>s when
+            # the markup omits it. So .rec-body > table > tbody
+            # targets the OUTER table's auto-tbody (= our top-level
+            # rows) without descending into the nested .series-sub
+            # tables. Going `> table` alone gave .children=[tbody]
+            # not [tr,tr,…] — filter found 0 rows, no sort applied.
+            f"    const tbody=document.querySelector("
+            f"      '.rec-body > table > tbody');"
             f"    if(!tbody)return;"
             f"    const rows=Array.from(tbody.children).filter("
             f"      r=>r.tagName==='TR'&&r.dataset.sortStart!==undefined);"
