@@ -8438,7 +8438,14 @@ def recordings_page():
         sel_box = (f'<input type="checkbox" class="rec-select" '
                    f'data-uuid="{uuid}" data-title="{title}" '
                    f'aria-label="Auswählen">')
-        return (f'<tr{anchor_attr} data-status="{row_status}"{edited_attr}>'
+        # Sort attrs on top-level rows — JS reorders by these on
+        # dropdown change. Lowercased title/channel for stable
+        # locale-insensitive compare.
+        sort_attrs = (f' data-sort-start="{start}"'
+                      f' data-sort-title="{title.lower().replace(chr(34),"&quot;")}"'
+                      f' data-sort-channel="{ch_name.lower()}"')
+        return (f'<tr{anchor_attr} data-status="{row_status}"{edited_attr}'
+                f'{sort_attrs}>'
                 f'<td>{sel_box}{status_cell}</td>'
                 f'<td>{title_cell}</td>'
                 f'<td>{when}</td>'
@@ -8541,7 +8548,16 @@ def recordings_page():
             next_html = (f' <small class="series-next" '
                          f'title="nächste Folge: {sd}">'
                          f'· nächste {sd} ({rel})</small>')
-        summary = (f'<tr class="series-head"><td colspan="5">'
+        # Sort attrs on the series-head row — same semantics as solo
+        # rows. data-sort-start = newest episode in the group; channel
+        # from the first episode (= all eps share a channel by
+        # construction); title from the group label.
+        max_start = max((e.get("start", 0) for e in eps), default=0)
+        first_ch = (eps[0].get("channelname") or "").lower()
+        head_sort = (f' data-sort-start="{max_start}"'
+                     f' data-sort-title="{group_title.lower().replace(chr(34),"&quot;")}"'
+                     f' data-sort-channel="{first_ch}"')
+        summary = (f'<tr class="series-head"{head_sort}><td colspan="5">'
                    f'<details data-ar="{ar_uuid}"{open_attr}>'
                    f'<summary>{ch_logo_html}{poster_html}{badge}'
                    f'<span class="series-title">{group_title}'
@@ -8761,6 +8777,18 @@ def recordings_page():
             f"style='margin-left:14px' "
             f"title='Mehrere Aufnahmen für eine manuelle Gruppe auswählen'>"
             f"✏️ Bearbeiten</button>"
+            # Sort dropdown — reorders top-level rows (= solo + series
+            # heads) by the selected key. Choice persists per browser
+            # via localStorage. Sort happens client-side: cheap with
+            # ~600 rows, no server round-trip.
+            f"<select id='sort-select' class='series-toggle' "
+            f"style='margin-left:14px;padding:3px 6px' "
+            f"title='Sortierung'>"
+            f"<option value='start_desc'>Neueste zuerst</option>"
+            f"<option value='start_asc'>Älteste zuerst</option>"
+            f"<option value='channel'>Sender (A-Z)</option>"
+            f"<option value='title'>Sendung (A-Z)</option>"
+            f"</select>"
             f"</div>"
             # Edit-mode toolbar — hidden by default, JS toggles
             # display + manages selection state.
@@ -8875,6 +8903,50 @@ def recordings_page():
             f"  const cb=document.getElementById('series-collapse');"
             f"  if(eb)eb.addEventListener('click',()=>setAll(true));"
             f"  if(cb)cb.addEventListener('click',()=>setAll(false));"
+            f"}})();"
+            # Sort dropdown — reorders top-level rows (= solo + series-
+            # head) by data-sort-{start,channel,title}. Series-children
+            # stay inside their <details> and ride along with the
+            # series-head. Choice persists per browser via localStorage.
+            f"(function(){{"
+            f"  const KEY='rec-sort';"
+            f"  const sel=document.getElementById('sort-select');"
+            f"  if(!sel)return;"
+            f"  let saved='start_desc';"
+            f"  try{{saved=localStorage.getItem(KEY)||'start_desc';}}"
+            f"  catch(e){{}}"
+            f"  sel.value=saved;"
+            f"  function apply(){{"
+            f"    const tbody=document.querySelector('.rec-body table tbody')"
+            f"      ||document.querySelector('.rec-body table');"
+            f"    if(!tbody)return;"
+            f"    const rows=Array.from(tbody.children).filter("
+            f"      r=>r.tagName==='TR'&&r.dataset.sortStart!==undefined);"
+            f"    const mode=sel.value;"
+            f"    rows.sort((a,b)=>{{"
+            f"      if(mode==='channel'){{"
+            f"        return (a.dataset.sortChannel||'').localeCompare("
+            f"               b.dataset.sortChannel||'')"
+            f"          ||(parseInt(b.dataset.sortStart||0)"
+            f"            -parseInt(a.dataset.sortStart||0));"
+            f"      }}"
+            f"      if(mode==='title'){{"
+            f"        return (a.dataset.sortTitle||'').localeCompare("
+            f"               b.dataset.sortTitle||'')"
+            f"          ||(parseInt(b.dataset.sortStart||0)"
+            f"            -parseInt(a.dataset.sortStart||0));"
+            f"      }}"
+            f"      const da=parseInt(a.dataset.sortStart||0);"
+            f"      const db=parseInt(b.dataset.sortStart||0);"
+            f"      return mode==='start_asc'?(da-db):(db-da);"
+            f"    }});"
+            f"    rows.forEach(r=>tbody.appendChild(r));"
+            f"  }}"
+            f"  sel.addEventListener('change',()=>{{"
+            f"    try{{localStorage.setItem(KEY,sel.value);}}catch(e){{}}"
+            f"    apply();"
+            f"  }});"
+            f"  apply();"
             f"}})();"
             # Edit-mode for manual user-groups (= Rocky/Asterix
             # franchise grouping). Toggle adds body.edit-mode →
