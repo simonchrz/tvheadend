@@ -2321,8 +2321,9 @@ def _render_per_show_iou_trend():
     # so series with actual movement are easier to spot.
     show_n = _show_review_counts()
     autorec_t = _autorec_titles()
+    ug_t = _user_grouped_titles()
     series = {s: pts for s, pts in series.items()
-              if not _is_singleton_title(s, show_n, autorec_t)}
+              if not _is_singleton_title(s, show_n, autorec_t, ug_t)}
     if not series:
         return ""
     # Sort shows by LAST iou ascending (worst first).
@@ -3399,20 +3400,36 @@ def _autorec_titles() -> set:
     return out
 
 
+def _user_grouped_titles() -> set:
+    """All show titles that the user has manually placed into a
+    franchise group via /recordings → Bearbeiten → Neue Gruppe.
+    Strong "this is a film series" signal — user wouldn't manually
+    bundle Tatort episodes that way."""
+    out = set()
+    for uuids in _load_user_groups().values():
+        for u in uuids:
+            d = HLS_DIR / f"_rec_{u}"
+            t = _show_title_for_rec(d) or ""
+            if t:
+                out.add(t)
+    return out
+
+
 def _is_singleton_title(title: str, show_counts: dict,
-                        autorec_titles: set) -> bool:
+                        autorec_titles: set,
+                        user_group_titles: set = None) -> bool:
     """Is this title a one-off (= movie/special) we shouldn't chase
     for N≥5 stat-floor or auto-schedule N more episodes for?
 
-    Authoritative: TMDB-fetched `kind` field on _epg_meta. Filled
-    by _fetch_tmdb when /search/tv misses + /search/movie hits.
-    Caches refresh per EPG_META_TTL_S=30d so existing cache entries
-    pre-dating the kind field auto-upgrade.
+    Three signals (any True = singleton):
+      1. TMDB-fetched `kind` field == "movie" (authoritative)
+      2. Title is part of a user-defined franchise group
+         (= explicit "this is a movie franchise" act)
+      3. Fallback: ≤1 corpus sample AND no autorec rule
+         (catches pre-cache movies; false-positive on un-autorec'd
+         pilots — accepted cost)
 
-    Fallback (= no meta yet, or unknown kind): count + autorec
-    heuristic — title with ≤1 corpus sample AND no autorec rule
-    is treated as singleton. False-positive on series pilots that
-    haven't been autorec'd yet; accepted cost."""
+    Counter-signal: TMDB kind == "tv" overrides #2/#3."""
     with _epg_meta_lock:
         meta = _epg_meta.get(_normalize_title(title)) or {}
     kind = meta.get("kind")
@@ -3420,7 +3437,8 @@ def _is_singleton_title(title: str, show_counts: dict,
         return True
     if kind == "tv":
         return False
-    # Fallback: pre-meta or kind-less entry
+    if user_group_titles and title in user_group_titles:
+        return True
     return (show_counts.get(title, 0) <= 1
             and title not in autorec_titles)
 
@@ -3509,6 +3527,7 @@ def _auto_schedule_run(max_n: int = AUTO_SCHED_MAX_PER_DAY,
                 "skipped_reason": "auto-scheduler is paused"}
     show_n = _show_review_counts()
     autorec_t = _autorec_titles()  # for the singleton/movie skip below
+    ug_t = _user_grouped_titles()
     # Channel filter — only schedule from channels the user has ≥1
     # reviewed recording on. Otherwise the scheduler picks "Frühshoppen
     # on sonnenklar.TV" because nobody's ever recorded a shopping
@@ -3600,7 +3619,7 @@ def _auto_schedule_run(max_n: int = AUTO_SCHED_MAX_PER_DAY,
         # impossible (broadcaster won't repeat 5×) and just burns
         # disk budget on titles we'll never have a training cluster
         # for. Heuristic: ≤1 corpus sample AND no autorec rule.
-        if _is_singleton_title(title, show_n, autorec_t):
+        if _is_singleton_title(title, show_n, autorec_t, ug_t):
             continue
         # Base priority by sample count gap
         priority = max(0, 5 - n_rev)
@@ -3776,6 +3795,7 @@ def _aggregate_show_gaps():
     # unreviewed), so feed n_total in via the dict.
     show_total_n = {s: e["n_total"] for s, e in by_show.items()}
     autorec_t = _autorec_titles()
+    ug_t = _user_grouped_titles()
     out = []
     for show, e in by_show.items():
         if e["n_unreviewed_playable"] == 0:
@@ -3799,7 +3819,7 @@ def _aggregate_show_gaps():
         # is futile (= broadcaster won't repeat 5×). drift_unlock
         # already requires n_rev≥2 so singletons can't reach it.
         if sugg == "stat_floor" and _is_singleton_title(
-                show, show_total_n, autorec_t):
+                show, show_total_n, autorec_t, ug_t):
             continue
         out.append((show, e["slug"], e["n_total"], n_rev,
                     e["n_unreviewed_playable"], sugg, priority,
@@ -4665,10 +4685,12 @@ async function toggleAutoSchedule() {
     # uses). autorec_t fetched once per page render below.
     _show_recs_for_check = {s: n for s, n in show_user_recs.items()}
     _ar_titles_for_check = _autorec_titles()
+    _ug_titles_for_check = _user_grouped_titles()
     for show, n_blk in sorted(show_user_blocks.items(), key=lambda x: x[1]):
         if 0 < n_blk < 5:
             if _is_singleton_title(show, _show_recs_for_check,
-                                    _ar_titles_for_check):
+                                    _ar_titles_for_check,
+                                    _ug_titles_for_check):
                 continue
             need = 5 - n_blk
             recommendations.append({
@@ -4687,7 +4709,8 @@ async function toggleAutoSchedule() {
         # Same singleton-skip — recommending the user "record more
         # Rocky for IoU correction" is just as futile here.
         if _is_singleton_title(title, _show_recs_for_check,
-                                _ar_titles_for_check):
+                                _ar_titles_for_check,
+                                _ug_titles_for_check):
             continue
         recommendations.append({
             "kind": "test-iou", "key": title, "n": max(1, min(3, missed + extra)),
@@ -4927,8 +4950,9 @@ if (planAllBtn) {
     if fingerprints:
         show_n = _show_review_counts()
         autorec_t = _autorec_titles()
+        ug_t = _user_grouped_titles()
         fingerprints = {s: fp for s, fp in fingerprints.items()
-                        if not _is_singleton_title(s, show_n, autorec_t)}
+                        if not _is_singleton_title(s, show_n, autorec_t, ug_t)}
     if fingerprints:
         _section(f"Show-Fingerprints ({len(fingerprints)})")
         out.append("<p class='muted'>Shows mit ≥3 user-bestätigten Episoden + "
