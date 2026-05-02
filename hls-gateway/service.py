@@ -13546,10 +13546,24 @@ def _compute_feedback_stats():
             suggestions.append(
                 f"SPONSOR_DURATION_BY_CHANNEL[{slug!r}] += {mean_de:.0f}")
         if s["n"] >= 3:
+            # Wording reflects the current tv-detect pipeline (we
+            # haven't used comskip since 2026-04-25). Knobs that
+            # actually exist: bumper_threshold per channel in
+            # .channel-config.json, logo template quality, more
+            # user reviews driving the next nightly head training.
             if s["added"] > s["deleted"] * 2:
-                suggestions.append("comskip too strict — lower logo_threshold")
+                suggestions.append(
+                    f"auto under-detects ({s['added']} added vs "
+                    f"{s['deleted']} deleted) — try lowering "
+                    f"bumper_threshold for {slug} in .channel-config.json, "
+                    f"or surface more {slug} recordings for review so "
+                    f"the next head-training learns better")
             elif s["deleted"] > s["added"] * 2:
-                suggestions.append("comskip too lax — raise logo_threshold")
+                suggestions.append(
+                    f"auto over-detects ({s['deleted']} deleted vs "
+                    f"{s['added']} added) — likely logo template issue "
+                    f"(washout, wrong bbox), or raise bumper_threshold "
+                    f"for {slug} to reject ambiguous matches")
         out[slug] = {
             "n": s["n"],
             "matched": s["matched"],
