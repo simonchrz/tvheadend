@@ -3460,6 +3460,20 @@ def _auto_schedule_run(max_n: int = AUTO_SCHED_MAX_PER_DAY,
             slug = _rec_channel_slug(d.name[5:]) or ""
             if slug:
                 interested_channels.add(slug)
+    # Failure-mode rate per show + channel — feeds the score boost so
+    # we preferentially fill gaps where the model currently struggles.
+    # _aggregate_failure_modes_cached returns (per_show, per_channel)
+    # both as {key: {"total": N, "modes": {mode: count}}}.
+    try:
+        per_show_fm, per_channel_fm = _aggregate_failure_modes_cached()
+    except Exception:
+        per_show_fm, per_channel_fm = {}, {}
+    def _fail_rate(entry):
+        if not entry or entry.get("total", 0) == 0:
+            return 0.0
+        non_good = sum(v for k, v in entry.get("modes", {}).items()
+                       if k != "good")
+        return non_good / entry["total"]
     active = _count_active_auto_scheduled()
     slots = min(max_n, max(0, AUTO_SCHED_MAX_ACTIVE - active))
     if slots <= 0:
@@ -3497,12 +3511,21 @@ def _auto_schedule_run(max_n: int = AUTO_SCHED_MAX_PER_DAY,
     candidates = []
     seen_titles = set()  # dedup within this run — avoid scheduling
                          # 5 episodes of the same show in one go
+    # Length cap: skip events longer than 2h. Long films take huge
+    # disk (~3-4 GB at 25 Mbit/s DVB-C) for diminishing training value
+    # — the model has already seen the same logo/show patterns thousands
+    # of times by frame 30k. 7200s catches all sitcoms (25-50min),
+    # reality (45-90min), most movies (90-120min); excludes 3h+ epics.
+    MAX_LEN_S = 7200
     for ev in data.get("entries", []):
         title = (ev.get("title") or "").strip()
         if not title:
             continue
         start = ev.get("start", 0)
+        stop = ev.get("stop", 0)
         if start <= now_ts or start > horizon:
+            continue
+        if stop > start and (stop - start) > MAX_LEN_S:
             continue
         if ev.get("eventId") in existing_eids:
             continue
@@ -3513,32 +3536,56 @@ def _auto_schedule_run(max_n: int = AUTO_SCHED_MAX_PER_DAY,
         n_rev = show_n.get(title, 0)
         if n_rev >= 5:
             continue  # already enough labelled examples
+        # Base priority by sample count gap
         priority = max(0, 5 - n_rev)
         if priority == 0:
             continue
+        # Boost: high failure-rate on this show OR on this channel = the
+        # current model struggles here. More data of those = bigger
+        # marginal IoU lift per labelled recording. Cap at +2 so the
+        # base sample-gap signal still dominates ordering.
+        if _fail_rate(per_show_fm.get(title)) > 0.4:
+            priority += 1
+        if _fail_rate(per_channel_fm.get(ch_slug)) > 0.4:
+            priority += 1
         candidates.append((priority, start, ev, n_rev))
-    # Sort: higher priority first, then earlier start (= sooner data)
+    # Sort: higher priority first, then earlier start (= sooner data).
+    # The picking loop below adds a time-spread constraint on top.
     candidates.sort(key=lambda c: (-c[0], c[1]))
-    # Pick top per dedup-by-title, schedule
+    # Pick top per dedup-by-title PLUS time-of-day spread.
+    # SPREAD_S=3600 means subsequent picks must start ≥1 h apart from
+    # any earlier pick this run. Avoids 3 events at 12:55 burning all
+    # tuners on the same minute (= what v1 did).
+    SPREAD_S = 3600
+    picked_starts = []
     picked = []
     for prio, start, ev, n_rev in candidates:
         title = ev["title"]
         if title in seen_titles:
             continue
+        if any(abs(start - ps) < SPREAD_S for ps in picked_starts):
+            continue
         if len(picked) >= slots:
             break
         seen_titles.add(title)
+        picked_starts.append(start)
         picked.append((prio, start, ev, n_rev))
     results = []
     for prio, start, ev, n_rev in picked:
+        ch_slug = slugify(ev.get("channelName") or "")
         log_entry = {
             "ts": int(time.time()),
             "title": ev.get("title"),
             "channel": ev.get("channelName"),
             "start": start,
+            "stop": ev.get("stop", 0),
             "event_id": ev.get("eventId"),
             "score": prio,
             "n_reviewed_before": n_rev,
+            "show_fail_rate": round(
+                _fail_rate(per_show_fm.get(ev.get("title"))), 2),
+            "channel_fail_rate": round(
+                _fail_rate(per_channel_fm.get(ch_slug)), 2),
             "ok": False, "dvr_uuid": None, "error": None,
             "dry_run": dry_run,
         }
