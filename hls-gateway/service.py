@@ -8548,21 +8548,24 @@ def recordings_page():
             next_html = (f' <small class="series-next" '
                          f'title="nächste Folge: {sd}">'
                          f'· nächste {sd} ({rel})</small>')
-        # Sort attrs on the series-head row — same semantics as solo
-        # rows. data-sort-start = newest COMPLETED-or-recording episode
-        # (= "we have actual content for this group"). Excludes future-
-        # scheduled because otherwise a series with one episode planned
-        # next week would outrank a series with a recording from today
-        # — confusing for the user who reads "Neueste zuerst" as
-        # "newest content I can watch". Fall back to any episode's
-        # start time if the group is purely future-scheduled.
+        # Sort attrs on the series-head row. Two values:
+        #   data-sort-start      = newest completed-or-recording episode
+        #   data-sort-start-all  = newest of ANY episode (incl. future-
+        #                          scheduled)
+        # JS picks data-sort-start-all when the status filter currently
+        # shows "scheduled" rows, else sort-start. Without this split,
+        # a series with one episode planned next week would always
+        # outrank a series with a recording from today — confusing
+        # when the user has scheduled rows hidden via the filter.
         with_content = [e.get("start", 0) for e in eps
                         if (e.get("sched_status") in ("completed", "recording")
                             or now_ts >= e.get("stop", 0))]
         max_start = (max(with_content) if with_content
                      else max((e.get("start", 0) for e in eps), default=0))
+        max_start_all = max((e.get("start", 0) for e in eps), default=0)
         first_ch = (eps[0].get("channelname") or "").lower()
         head_sort = (f' data-sort-start="{max_start}"'
+                     f' data-sort-start-all="{max_start_all}"'
                      f' data-sort-title="{group_title.lower().replace(chr(34),"&quot;")}"'
                      f' data-sort-channel="{first_ch}"')
         summary = (f'<tr class="series-head"{head_sort}><td colspan="5">'
@@ -8934,21 +8937,34 @@ def recordings_page():
             f"    const rows=Array.from(tbody.children).filter("
             f"      r=>r.tagName==='TR'&&r.dataset.sortStart!==undefined);"
             f"    const mode=sel.value;"
+            # When the status filter currently shows "scheduled", series
+            # heads should sort by data-sort-start-all (= max-of-all-
+            # episodes including future). Otherwise use data-sort-start
+            # (= max-of-completed-only). Solo rows have no -all variant
+            # so we fall back to sort-start there.
+            f"    const fb=document.getElementById('rec-filter');"
+            f"    const schedCb=fb&&fb.querySelector("
+            f"      'input[type=checkbox][value=\"scheduled\"]');"
+            f"    const includeScheduled=schedCb?schedCb.checked:false;"
+            f"    function startOf(r){{"
+            f"      if(includeScheduled&&r.dataset.sortStartAll){{"
+            f"        return parseInt(r.dataset.sortStartAll);"
+            f"      }}"
+            f"      return parseInt(r.dataset.sortStart||0);"
+            f"    }}"
             f"    rows.sort((a,b)=>{{"
             f"      if(mode==='channel'){{"
             f"        return (a.dataset.sortChannel||'').localeCompare("
             f"               b.dataset.sortChannel||'')"
-            f"          ||(parseInt(b.dataset.sortStart||0)"
-            f"            -parseInt(a.dataset.sortStart||0));"
+            f"          ||(startOf(b)-startOf(a));"
             f"      }}"
             f"      if(mode==='title'){{"
             f"        return (a.dataset.sortTitle||'').localeCompare("
             f"               b.dataset.sortTitle||'')"
-            f"          ||(parseInt(b.dataset.sortStart||0)"
-            f"            -parseInt(a.dataset.sortStart||0));"
+            f"          ||(startOf(b)-startOf(a));"
             f"      }}"
-            f"      const da=parseInt(a.dataset.sortStart||0);"
-            f"      const db=parseInt(b.dataset.sortStart||0);"
+            f"      const da=startOf(a);"
+            f"      const db=startOf(b);"
             f"      return mode==='start_asc'?(da-db):(db-da);"
             f"    }});"
             f"    rows.forEach(r=>tbody.appendChild(r));"
@@ -8956,6 +8972,13 @@ def recordings_page():
             f"  sel.addEventListener('change',()=>{{"
             f"    try{{localStorage.setItem(KEY,sel.value);}}catch(e){{}}"
             f"    apply();"
+            f"  }});"
+            # Re-sort when the status filter changes (= scheduled checkbox
+            # toggled → which sort attr to use).
+            f"  document.addEventListener('change',ev=>{{"
+            f"    if(ev.target.matches('#rec-filter input[type=checkbox]')){{"
+            f"      apply();"
+            f"    }}"
             f"  }});"
             f"  apply();"
             f"}})();"
