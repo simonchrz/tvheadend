@@ -9053,6 +9053,12 @@ def _rec_thumbs_spawn(uuid):
         return
     def run():
         try:
+            # stderr → DEVNULL: -loglevel error suppresses ffmpeg's
+            # regular log output but DVB sequence-header issues emit
+            # [mpeg2video] codec warnings that bypass that filter →
+            # docker logs noise. Thumb job already has no error-
+            # reporting path (no .done file = visible missing thumbs
+            # on /recordings) so swallowing stderr loses nothing.
             subprocess.run(
                 ["nice", "-n", "18", "ionice", "-c", "3",
                  "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
@@ -9060,7 +9066,7 @@ def _rec_thumbs_spawn(uuid):
                  "-vf", f"fps=1/{THUMB_INTERVAL},scale=160:-2",
                  "-q:v", "6",
                  str(out_dir / "t%05d.jpg")],
-                timeout=900, check=False)
+                timeout=900, check=False, stderr=subprocess.DEVNULL)
             (out_dir / ".done").write_text("")
             print(f"[rec-thumbs {uuid[:8]}] done", flush=True)
         except Exception as e:
