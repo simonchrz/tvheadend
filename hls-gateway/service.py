@@ -127,6 +127,10 @@ EPG_ARCHIVE_FILE = HLS_DIR / ".epg_archive.jsonl"
 ALWAYS_WARM_FILE = HLS_DIR / ".always_warm.json"
 EPG_META_FILE    = HLS_DIR / ".epg_meta.json"  # tvmaze poster + rating cache
 USER_GROUPS_FILE = HLS_DIR / ".user-groups.json"  # manual recording groups (= cross-title franchise grouping like Rocky/Asterix)
+AUTO_SCHED_LOG   = HLS_DIR / ".tvd-models" / "auto-schedule-log.jsonl"  # one JSON-line per auto-schedule decision (success or skip)
+AUTO_SCHED_PAUSE = HLS_DIR / ".tvd-models" / ".auto-schedule-paused"   # presence = paused; default-paused on first install
+AUTO_SCHED_MAX_PER_DAY = 3   # hard cap: auto-creates max N scheduled entries per daily run
+AUTO_SCHED_MAX_ACTIVE  = 8   # hard cap: paused once this many auto-scheduled entries sit in the queue
 EPG_META_TTL_S   = 30 * 86400                  # re-fetch each title monthly
 CH_LOGO_DIR      = Path(__file__).parent / "static" / "ch-logos"
 TMDB_API_KEY     = os.environ.get("TMDB_API_KEY", "").strip()  # optional: better DE show coverage
@@ -3362,6 +3366,239 @@ def _label_yield_score(uuid):
     return score
 
 
+def _show_review_counts() -> dict:
+    """show_title → number of recordings on disk that user has reviewed
+    (= ads_user.json with reviewed_at). Source of truth for the
+    auto-scheduler's "how much do we have for this show?" decision."""
+    out = {}
+    for d in HLS_DIR.glob("_rec_*"):
+        if not d.is_dir():
+            continue
+        show = _show_title_for_rec(d) or ""
+        if not show:
+            continue
+        user_p = d / "ads_user.json"
+        if not user_p.is_file():
+            continue
+        try:
+            raw = json.loads(user_p.read_text())
+            if isinstance(raw, dict) and raw.get("reviewed_at"):
+                out[show] = out.get(show, 0) + 1
+        except Exception:
+            pass
+    return out
+
+
+def _read_auto_schedule_log(max_age_s: int = 7 * 86400) -> list:
+    """Return recent auto-schedule entries, newest first. Each entry is
+    one JSON object as written by _auto_schedule_run."""
+    if not AUTO_SCHED_LOG.is_file():
+        return []
+    cutoff = time.time() - max_age_s
+    out = []
+    try:
+        for ln in AUTO_SCHED_LOG.read_text().splitlines():
+            if not ln.strip():
+                continue
+            try:
+                e = json.loads(ln)
+                if e.get("ts", 0) >= cutoff:
+                    out.append(e)
+            except Exception:
+                pass
+    except Exception:
+        return []
+    out.sort(key=lambda e: -e.get("ts", 0))
+    return out
+
+
+def _count_active_auto_scheduled() -> int:
+    """How many auto-scheduled DVR entries are still in the queue
+    (= scheduled or recording, not yet completed/cancelled). Cross-
+    references the log against tvh's current grid via dvr_uuid."""
+    log_entries = _read_auto_schedule_log(max_age_s=14 * 86400)
+    log_uuids = {e.get("dvr_uuid") for e in log_entries
+                 if e.get("ok") and e.get("dvr_uuid")}
+    if not log_uuids:
+        return 0
+    try:
+        data = json.loads(urllib.request.urlopen(
+            f"{TVH_BASE}/api/dvr/entry/grid?limit=2000",
+            timeout=10).read())
+    except Exception:
+        return 0
+    active = 0
+    for e in data.get("entries", []):
+        if (e.get("uuid") in log_uuids
+                and e.get("sched_status") in ("scheduled", "recording")):
+            active += 1
+    return active
+
+
+def _auto_schedule_run(max_n: int = AUTO_SCHED_MAX_PER_DAY,
+                        dry_run: bool = False) -> dict:
+    """Pick the most-needed shows from EPG over the next 7 days and
+    auto-schedule them via tvh's create_by_event. Returns a structured
+    result for both the daily loop and the manual trigger endpoint.
+
+    Scoring is intentionally simple for v1: priority = (5 - N_reviewed)
+    capped at 0; ties broken by earlier start time. Skip shows already
+    well-covered (N≥5), already in the active queue, or duplicates of
+    something we just scheduled this run."""
+    if AUTO_SCHED_PAUSE.exists() and not dry_run:
+        return {"ok": True, "paused": True, "scheduled": [],
+                "skipped_reason": "auto-scheduler is paused"}
+    show_n = _show_review_counts()
+    # Channel filter — only schedule from channels the user has ≥1
+    # reviewed recording on. Otherwise the scheduler picks "Frühshoppen
+    # on sonnenklar.TV" because nobody's ever recorded a shopping
+    # channel, score=5. Implicit interest signal: a channel without
+    # any training data → user doesn't care about that channel.
+    interested_channels = set()
+    for d in HLS_DIR.glob("_rec_*"):
+        if (d / "ads_user.json").is_file():
+            slug = _rec_channel_slug(d.name[5:]) or ""
+            if slug:
+                interested_channels.add(slug)
+    active = _count_active_auto_scheduled()
+    slots = min(max_n, max(0, AUTO_SCHED_MAX_ACTIVE - active))
+    if slots <= 0:
+        return {"ok": True, "scheduled": [], "skipped_reason":
+                f"hit AUTO_SCHED_MAX_ACTIVE={AUTO_SCHED_MAX_ACTIVE} "
+                f"(active={active})"}
+    # Walk EPG for the next 7 days. tvh's grid is paginated; one big
+    # call covers all channels we receive.
+    now_ts = int(time.time())
+    horizon = now_ts + 7 * 86400
+    try:
+        # tvh occasionally returns event titles with stray non-UTF-8
+        # bytes (= broadcaster encoded with latin-1 in a UTF-8 EPG
+        # field). Decode with errors=replace so one bad title doesn't
+        # tank the whole scheduler run.
+        raw = urllib.request.urlopen(
+            f"{TVH_BASE}/api/epg/events/grid?limit=1500",
+            timeout=15).read()
+        data = json.loads(raw.decode("utf-8", errors="replace"))
+    except Exception as e:
+        return {"ok": False, "error": f"epg fetch: {e}"}
+    # Existing scheduled events to dedup against (= avoid scheduling
+    # an EPG event that's already on the calendar manually).
+    try:
+        sched = json.loads(urllib.request.urlopen(
+            f"{TVH_BASE}/api/dvr/entry/grid?limit=2000",
+            timeout=10).read())
+        existing_eids = {e.get("broadcast")
+                         for e in sched.get("entries", [])
+                         if e.get("sched_status") in ("scheduled", "recording")
+                         and e.get("broadcast")}
+    except Exception:
+        existing_eids = set()
+    # Score each upcoming event
+    candidates = []
+    seen_titles = set()  # dedup within this run — avoid scheduling
+                         # 5 episodes of the same show in one go
+    for ev in data.get("entries", []):
+        title = (ev.get("title") or "").strip()
+        if not title:
+            continue
+        start = ev.get("start", 0)
+        if start <= now_ts or start > horizon:
+            continue
+        if ev.get("eventId") in existing_eids:
+            continue
+        # Channel-of-interest gate
+        ch_slug = slugify(ev.get("channelName") or "")
+        if interested_channels and ch_slug not in interested_channels:
+            continue
+        n_rev = show_n.get(title, 0)
+        if n_rev >= 5:
+            continue  # already enough labelled examples
+        priority = max(0, 5 - n_rev)
+        if priority == 0:
+            continue
+        candidates.append((priority, start, ev, n_rev))
+    # Sort: higher priority first, then earlier start (= sooner data)
+    candidates.sort(key=lambda c: (-c[0], c[1]))
+    # Pick top per dedup-by-title, schedule
+    picked = []
+    for prio, start, ev, n_rev in candidates:
+        title = ev["title"]
+        if title in seen_titles:
+            continue
+        if len(picked) >= slots:
+            break
+        seen_titles.add(title)
+        picked.append((prio, start, ev, n_rev))
+    results = []
+    for prio, start, ev, n_rev in picked:
+        log_entry = {
+            "ts": int(time.time()),
+            "title": ev.get("title"),
+            "channel": ev.get("channelName"),
+            "start": start,
+            "event_id": ev.get("eventId"),
+            "score": prio,
+            "n_reviewed_before": n_rev,
+            "ok": False, "dvr_uuid": None, "error": None,
+            "dry_run": dry_run,
+        }
+        if dry_run:
+            log_entry["ok"] = True
+            log_entry["error"] = "dry_run"
+        else:
+            try:
+                body = urllib.parse.urlencode({
+                    "event_id": ev["eventId"],
+                    "config_uuid": ""}).encode()
+                req = urllib.request.Request(
+                    f"{TVH_BASE}/api/dvr/entry/create_by_event",
+                    data=body, method="POST")
+                res = urllib.request.urlopen(req, timeout=10).read().decode()
+                rd = json.loads(res) if res else {}
+                u = rd.get("uuid")
+                if isinstance(u, list):
+                    u = u[0] if u else None
+                log_entry["ok"] = bool(u)
+                log_entry["dvr_uuid"] = u
+            except Exception as e:
+                log_entry["error"] = str(e)
+        results.append(log_entry)
+    # Append non-dry-run entries to the log
+    if not dry_run and results:
+        try:
+            AUTO_SCHED_LOG.parent.mkdir(parents=True, exist_ok=True)
+            with open(AUTO_SCHED_LOG, "a") as f:
+                for r in results:
+                    f.write(json.dumps(r) + "\n")
+        except Exception as e:
+            print(f"[auto-sched] log write err: {e}", flush=True)
+    return {"ok": True, "scheduled": [r for r in results if r["ok"]],
+            "errors": [r for r in results if not r["ok"]],
+            "candidates_seen": len(candidates),
+            "active_before": active}
+
+
+def _auto_schedule_loop():
+    """Daily 04:30 local — fires _auto_schedule_run() once. Sleeps to
+    next-04:30 in between. Default-paused (= AUTO_SCHED_PAUSE marker
+    exists on first install); user un-pauses when ready."""
+    while True:
+        now = time.localtime()
+        secs = now.tm_hour * 3600 + now.tm_min * 60 + now.tm_sec
+        target = 4 * 3600 + 30 * 60
+        delay = (target - secs) % 86400
+        if delay < 60:
+            delay += 86400  # already past today's slot, wait for tomorrow
+        time.sleep(delay)
+        try:
+            r = _auto_schedule_run()
+            print(f"[auto-sched] daily fire: {len(r.get('scheduled', []))} "
+                  f"scheduled, {len(r.get('errors', []))} errors, "
+                  f"paused={r.get('paused', False)}", flush=True)
+        except Exception as e:
+            print(f"[auto-sched] error: {e}", flush=True)
+
+
 def _aggregate_show_gaps():
     """Returns a sorted list of (show, slug, n_total, n_reviewed,
     n_unreviewed_playable, suggestion) tuples for shows that would
@@ -3865,6 +4102,66 @@ def learning_page():
                 f"{note}</div>")
         except Exception:
             pass
+
+    # Auto-scheduler banner: shows what got auto-planned recently +
+    # quick toggle to pause/resume. Sits ABOVE all sections so it's
+    # the first thing the user sees after the training-active line.
+    auto_log = _read_auto_schedule_log(max_age_s=3 * 86400)
+    auto_paused = AUTO_SCHED_PAUSE.exists()
+    if auto_log or auto_paused:
+        ok_recent = [e for e in auto_log if e.get("ok")]
+        err_recent = [e for e in auto_log if not e.get("ok")]
+        if auto_paused:
+            badge_color = "#7f8c8d"
+            head = "🛑 Auto-Scheduler pausiert"
+        elif ok_recent:
+            badge_color = "#27ae60"
+            head = (f"📅 Auto-Scheduler aktiv — letzte 3 Tage: "
+                    f"{len(ok_recent)} geplant"
+                    + (f", {len(err_recent)} fehlgeschlagen"
+                       if err_recent else ""))
+        else:
+            badge_color = "#3498db"
+            head = "📅 Auto-Scheduler aktiv — noch nichts geplant"
+        out.append(
+            f"<div class='status' style='background:{badge_color}22;"
+            f"border-left:4px solid {badge_color};margin:8px 0 16px'>"
+            f"<b>{head}</b> "
+            f"<button onclick='toggleAutoSchedule()' "
+            f"style='float:right;padding:4px 12px;border-radius:4px;"
+            f"border:1px solid {badge_color};background:transparent;"
+            f"color:var(--fg);cursor:pointer;font-family:inherit;"
+            f"font-size:.85em'>"
+            f"{'▶ Aktivieren' if auto_paused else '⏸ Pausieren'}</button>")
+        if ok_recent[:5]:
+            out.append("<details style='margin-top:8px'>"
+                       "<summary style='cursor:pointer;font-size:.9em'>"
+                       f"Letzte {min(5, len(ok_recent))} geplante Aufnahmen "
+                       "anzeigen</summary>")
+            out.append("<ul style='margin:6px 0 0 0;padding-left:20px;"
+                       "font-size:.88em'>")
+            for e in ok_recent[:5]:
+                ts = time.strftime("%d.%m %H:%M",
+                                   time.localtime(e.get("ts", 0)))
+                start = time.strftime("%d.%m %H:%M",
+                                      time.localtime(e.get("start", 0)))
+                title = (e.get("title") or "?")[:40]
+                ch = e.get("channel") or "?"
+                n_rev = e.get("n_reviewed_before", 0)
+                out.append(f"<li>{ts}: <b>{title}</b> auf {ch} "
+                           f"(geplant {start}) — Show hatte {n_rev} reviewed</li>")
+            out.append("</ul></details>")
+        out.append("</div>")
+        out.append("""<script>
+async function toggleAutoSchedule() {
+  const r = await fetch('/api/learning/auto-schedule-log').then(r=>r.json());
+  const now_paused = r.paused;
+  const newState = !now_paused;
+  await fetch('/api/learning/auto-schedule-pause', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({paused: newState})});
+  location.reload();
+}</script>""")
 
     # History chart (visual trend before the table)
     if history:
@@ -10566,6 +10863,46 @@ def api_learning_summary():
                             mimetype="application/json"))
 
 
+@app.route("/api/learning/auto-schedule-trigger", methods=["POST"])
+def api_learning_auto_schedule_trigger():
+    """Manually fire the auto-scheduler. Optional ?dry_run=1 for
+    testing without actually creating DVR entries."""
+    dry = request.args.get("dry_run") in ("1", "true", "yes")
+    return _cors(Response(json.dumps(_auto_schedule_run(dry_run=dry)),
+                          mimetype="application/json"))
+
+
+@app.route("/api/learning/auto-schedule-log")
+def api_learning_auto_schedule_log():
+    """Recent auto-scheduler decisions (= last 7 days)."""
+    return _cors(Response(json.dumps({
+        "entries": _read_auto_schedule_log(),
+        "paused": AUTO_SCHED_PAUSE.exists(),
+        "max_per_day": AUTO_SCHED_MAX_PER_DAY,
+        "max_active": AUTO_SCHED_MAX_ACTIVE,
+        "active_now": _count_active_auto_scheduled(),
+    }), mimetype="application/json"))
+
+
+@app.route("/api/learning/auto-schedule-pause", methods=["POST"])
+def api_learning_auto_schedule_pause():
+    """Toggle the pause marker. Body {"paused": true|false}."""
+    try:
+        body = json.loads(request.get_data().decode("utf-8") or "{}")
+        paused = bool(body.get("paused"))
+    except Exception:
+        return Response(json.dumps({"ok": False, "error": "bad json"}),
+                        status=400, mimetype="application/json")
+    AUTO_SCHED_PAUSE.parent.mkdir(parents=True, exist_ok=True)
+    if paused:
+        AUTO_SCHED_PAUSE.write_text(str(int(time.time())))
+    else:
+        try: AUTO_SCHED_PAUSE.unlink()
+        except FileNotFoundError: pass
+    return _cors(Response(json.dumps({"ok": True, "paused": paused}),
+                          mimetype="application/json"))
+
+
 @app.route("/api/learning/plan", methods=["POST"])
 def api_learning_plan():
     """Schedule N upcoming EPG events that match a learning recommendation.
@@ -14546,6 +14883,19 @@ if __name__ == "__main__":
     threading.Thread(target=prewarm_codecs, daemon=True).start()
     threading.Thread(target=epg_snapshot_loop, daemon=True).start()
     threading.Thread(target=_rec_prewarm_loop, daemon=True).start()
+    # Default-pause the auto-scheduler on first install (= log file
+    # absent → never ran here before). User opts-in via the toggle on
+    # /learning to avoid surprise auto-scheduled recordings on a
+    # freshly-deployed instance.
+    if not AUTO_SCHED_LOG.is_file() and not AUTO_SCHED_PAUSE.exists():
+        try:
+            AUTO_SCHED_PAUSE.parent.mkdir(parents=True, exist_ok=True)
+            AUTO_SCHED_PAUSE.write_text(str(int(time.time())))
+            print("[auto-sched] default-paused on first install — "
+                  "user opt-in via /learning toggle", flush=True)
+        except Exception as e:
+            print(f"[auto-sched] init err: {e}", flush=True)
+    threading.Thread(target=_auto_schedule_loop, daemon=True).start()
     threading.Thread(target=always_warm_loop, daemon=True).start()
     threading.Thread(target=_mediathek_rip_loop, daemon=True).start()
     threading.Thread(target=_mediathek_autorec_loop, daemon=True).start()
