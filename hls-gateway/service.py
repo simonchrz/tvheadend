@@ -13953,10 +13953,18 @@ def api_bumper_delete(slug, fname):
 
 @app.route("/api/internal/detect-models/<fname>")
 def api_internal_detect_models(fname):
-    """Serves head.bin + backbone.onnx so the Mac daemon doesn't need
-    SMB. Daemon caches locally and only re-fetches on size/mtime
-    change — head.bin updates nightly (~5 KB), backbone is static."""
-    if fname not in ("head.bin", "backbone.onnx"):
+    """Serves model files + train-state sidecars so the Mac side
+    doesn't need SMB. Daemon caches head.bin + backbone.onnx;
+    train-head wrapper prefetches head.history.json so the new
+    history entry appends to the existing list rather than starts
+    a fresh one. Whitelist of allowed names — never let a path
+    component or wildcard through."""
+    allowed = {
+        "head.bin", "backbone.onnx",
+        "head.history.json", "head.test-set.json",
+        "head.calibration.json",
+    }
+    if fname not in allowed:
         abort(404)
     p = HLS_DIR / ".tvd-models" / fname
     if not p.is_file():
