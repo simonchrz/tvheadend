@@ -5283,34 +5283,10 @@ document.getElementById('fp-val-btn').addEventListener('click', async (ev) => {
                        f"<td><a href='{link}'>öffnen</a></td></tr>")
         out.append("</table>")
 
-    if _section_open[0]:
-        out.append("</details>")
-    # Persist <details> open/closed across page reloads via
-    # localStorage. Read state on DOMContentLoaded; intercept each
-    # toggle event to save. Defaults from data-default-open survive
-    # only if no entry exists for that id yet (= first visit).
-    out.append("""<script>
-      (function() {
-        const KEY = 'learning-section-state';
-        let saved = {};
-        try { saved = JSON.parse(localStorage.getItem(KEY) || '{}'); } catch(_) {}
-        document.querySelectorAll('details.section').forEach(d => {
-          const id = d.id;
-          if (id in saved) d.open = !!saved[id];
-          d.addEventListener('toggle', () => {
-            saved[id] = d.open;
-            try { localStorage.setItem(KEY, JSON.stringify(saved)); } catch(_) {}
-          });
-        });
-      })();
-    </script>""")
     # ── Per-Show EPG-Drift (Phase-4 manual show-start marks) ────
+    _section("Per-Show EPG-Drift")
     out.append(
-        "<details id='per-show-drift' style='margin-top:32px'>"
-        "<summary style='cursor:pointer;font-weight:600;font-size:1.05em'>"
-        "Per-Show EPG-Drift "
         "<small style='color:#888;font-weight:400' id='psd-meta'></small>"
-        "</summary>"
         "<p style='color:#666;font-size:.85em;margin:8px 0;line-height:1.45'>"
         "Sender starten Sendungen oft 3-10 min vor dem EPG-Termin "
         "(„Pre-Roll"
@@ -5385,8 +5361,29 @@ document.getElementById('fp-val-btn').addEventListener('click', async (ev) => {
         "ev.target.textContent='Anwenden';}});});"
         "}).catch(e=>document.getElementById('psd-list').textContent="
         "'Fehler: '+e);"
-        "</script></details>")
+        "</script>")
 
+    if _section_open[0]:
+        out.append("</details>")
+    # Persist <details> open/closed across page reloads via
+    # localStorage. Read state on DOMContentLoaded; intercept each
+    # toggle event to save. Defaults from data-default-open survive
+    # only if no entry exists for that id yet (= first visit).
+    out.append("""<script>
+      (function() {
+        const KEY = 'learning-section-state';
+        let saved = {};
+        try { saved = JSON.parse(localStorage.getItem(KEY) || '{}'); } catch(_) {}
+        document.querySelectorAll('details.section').forEach(d => {
+          const id = d.id;
+          if (id in saved) d.open = !!saved[id];
+          d.addEventListener('toggle', () => {
+            saved[id] = d.open;
+            try { localStorage.setItem(KEY, JSON.stringify(saved)); } catch(_) {}
+          });
+        });
+      })();
+    </script>""")
     out.append("</body></html>")
     return Response("\n".join(out), mimetype="text/html")
 
