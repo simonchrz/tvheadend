@@ -14066,7 +14066,7 @@ def api_recording_bumper_capture(uuid):
                     raw["ads"] = blocks
                     user_cache.write_text(json.dumps(raw))
 
-    n_invalidated = _invalidate_detect_for_channel(slug)
+    n_invalidated = _invalidate_detect_for_channel(slug, exclude_uuid=uuid)
     align_log = (f" — aligned block {aligned['block']} "
                  f"{aligned['boundary']} {aligned['old']:.1f}→"
                  f"{aligned['new']:.1f}s") if aligned else ""
@@ -14081,18 +14081,27 @@ def api_recording_bumper_capture(uuid):
         mimetype="application/json"))
 
 
-def _invalidate_detect_for_channel(slug):
+def _invalidate_detect_for_channel(slug, exclude_uuid=None):
     """Mark every recording of the given channel as detect-pending so
     the daemon re-runs detection with the new bumper template set.
     Called after a bumper-template add/delete — old auto-cutlists
     stale relative to the new templates would persist forever
     otherwise. Returns count of invalidated recordings.
+
+    `exclude_uuid` skips one specific recording — used when the
+    invalidation source IS a user-action on that recording (= they're
+    actively reviewing it, manual ads_user.json is the ground truth,
+    re-detecting WHILE they're in the player would wipe their just-
+    finished cutlist and trigger the prewarm/cskip loop that strips
+    the .txt mid-edit).
     """
     if not slug or not HLS_DIR.exists():
         return 0
     n = 0
     for d in HLS_DIR.glob("_rec_*"):
         uuid = d.name[5:]
+        if exclude_uuid and uuid == exclude_uuid:
+            continue
         try:
             if _rec_channel_slug(uuid) != slug:
                 continue
@@ -14185,7 +14194,7 @@ def api_bumper_delete(slug, fname):
     except Exception as e:
         return Response(json.dumps({"ok": False, "error": str(e)}),
                         status=500, mimetype="application/json")
-    n_invalidated = _invalidate_detect_for_channel(slug)
+    n_invalidated = _invalidate_detect_for_channel(slug, exclude_uuid=uuid)
     print(f"[bumper-delete] {slug}/{fname} — invalidated "
           f"{n_invalidated} recording(s) for re-detect", flush=True)
     return _cors(Response(json.dumps({"ok": True,
