@@ -4588,6 +4588,62 @@ async function toggleAutoSchedule() {
   location.reload();
 }</script>""")
 
+    # Auto-confirm banner — analogous to auto-scheduler. Default-paused
+    # on first install; user opts-in once a few /recordings badges
+    # have been seen and the verdicts look trustworthy.
+    ac_paused = AUTO_CONFIRM_PAUSE.exists()
+    ac_today_count = 0
+    if AUTO_CONFIRM_LOG.is_file():
+        try:
+            cutoff = time.time() - 86400
+            for ln in AUTO_CONFIRM_LOG.read_text().splitlines():
+                ln = ln.strip()
+                if not ln:
+                    continue
+                try:
+                    r = json.loads(ln)
+                    if r.get("ts", 0) >= cutoff:
+                        ac_today_count += 1
+                except Exception:
+                    continue
+        except Exception:
+            pass
+    if ac_paused:
+        ac_color = "#7f8c8d"
+        ac_head = ("✓ Auto-Confirm pausiert — keine Aufnahmen werden "
+                   "automatisch reviewed")
+    elif ac_today_count:
+        ac_color = "#27ae60"
+        ac_head = (f"✓ Auto-Confirm aktiv — letzte 24h: {ac_today_count} "
+                   f"Aufnahme{'n' if ac_today_count != 1 else ''} "
+                   f"automatisch bestätigt")
+    else:
+        ac_color = "#3498db"
+        ac_head = ("✓ Auto-Confirm aktiv — wartet auf Aufnahmen mit "
+                   "Confidence ≥85% (Whisper + Cluster-Anchors nötig)")
+    out.append(
+        f"<div class='status' style='background:{ac_color}22;"
+        f"border-left:4px solid {ac_color};margin:8px 0 16px'>"
+        f"<b>{ac_head}</b> "
+        f"<button onclick='toggleAutoConfirm()' "
+        f"style='float:right;padding:4px 12px;border-radius:4px;"
+        f"border:1px solid {ac_color};background:transparent;"
+        f"color:var(--fg);cursor:pointer;font-family:inherit;"
+        f"font-size:.85em'>"
+        f"{'▶ Aktivieren' if ac_paused else '⏸ Pausieren'}</button>"
+        f"</div>"
+        f"<script>"
+        f"async function toggleAutoConfirm() {{"
+        f"  const r = await fetch('/api/internal/auto-confirm/status')"
+        f"    .then(r => r.json()).catch(() => ({{paused: {str(ac_paused).lower()}}}));"
+        f"  const newState = !r.paused;"
+        f"  await fetch('/api/internal/auto-confirm/pause', {{"
+        f"    method: 'POST', headers: {{'Content-Type': 'application/json'}},"
+        f"    body: JSON.stringify({{paused: newState}})}});"
+        f"  location.reload();"
+        f"}}"
+        f"</script>")
+
     # History chart (visual trend before the table)
     if history:
         _section("Verlauf", default_open=True)
@@ -9290,6 +9346,7 @@ def recordings_page():
             f".badge.auto-confirm-ok{{background:#16a34a;color:#fff}}"
             f".badge.auto-confirm-review{{background:#ca8a04;color:#fff}}"
             f".badge.auto-confirmed-applied{{background:#16a34a;color:#fff}}"
+            f".badge.dupe{{background:#7c3aed;color:#fff;text-decoration:none}}"
             f"@keyframes scanpulse{{0%,100%{{opacity:.5}}50%{{opacity:1}}}}"
             f".badge.live{{animation:livepulse 1.5s ease-in-out infinite}}"
             f"@keyframes livepulse{{0%,100%{{opacity:1}}50%{{opacity:.6}}}}"
@@ -9503,6 +9560,40 @@ def recordings_page():
             f"      td.appendChild(b);"
             f"    }});"
             f"  }}catch(e){{console.warn('auto-confirm fetch failed',e);}}"
+            f"}})();"
+            # Duplicate-recording badge — fetches the multi-signal dupe
+            # detection result and tags each row whose recording has a
+            # duplicate partner. Badge links to the partner so the user
+            # can compare and decide to delete one.
+            f"(async function(){{"
+            f"  try{{"
+            f"    const r=await fetch("
+            f"      '{HOST_URL}/api/internal/duplicate-recordings');"
+            f"    if(!r.ok)return;"
+            f"    const d=await r.json();"
+            f"    const partners={{}};"
+            f"    for(const p of (d.pairs||[])){{"
+            f"      const sc=p.score||0;"
+            f"      if(!partners[p.uuid_a]||partners[p.uuid_a].score<sc)"
+            f"        partners[p.uuid_a]={{uuid:p.uuid_b,score:sc,basis:p.basis}};"
+            f"      if(!partners[p.uuid_b]||partners[p.uuid_b].score<sc)"
+            f"        partners[p.uuid_b]={{uuid:p.uuid_a,score:sc,basis:p.basis}};"
+            f"    }}"
+            f"    document.querySelectorAll('tr[data-uuid]').forEach(tr=>{{"
+            f"      const uuid=tr.dataset.uuid;if(!uuid)return;"
+            f"      const p=partners[uuid];if(!p)return;"
+            f"      const td=tr.querySelector('td:nth-child(3)');"
+            f"      if(!td)return;"
+            f"      const a=document.createElement('a');"
+            f"      a.className='badge dupe';"
+            f"      a.href='{HOST_URL}/recording/'+p.uuid;"
+            f"      a.textContent='📋 dup';"
+            f"      a.title='Duplikat-Verdacht ('+p.basis+', score='"
+            f"        +Math.round(p.score*100)+'%) — Klick öffnet Partner';"
+            f"      td.appendChild(document.createTextNode(' '));"
+            f"      td.appendChild(a);"
+            f"    }});"
+            f"  }}catch(e){{console.warn('dupe fetch failed',e);}}"
             f"}})();"
             # Status filter — multi-select checkboxes hide rows whose
             # data-status isn't in the selected set. State persists per
@@ -13663,6 +13754,33 @@ def _auto_confirm_loop():
         time.sleep(300)
 
 
+@app.route("/api/internal/auto-confirm/status")
+def api_internal_auto_confirm_status():
+    """Current pause state + recent counts. Used by /learning toggle."""
+    n_today = 0
+    if AUTO_CONFIRM_LOG.is_file():
+        try:
+            cutoff = time.time() - 86400
+            for ln in AUTO_CONFIRM_LOG.read_text().splitlines():
+                ln = ln.strip()
+                if not ln:
+                    continue
+                try:
+                    r = json.loads(ln)
+                    if r.get("ts", 0) >= cutoff:
+                        n_today += 1
+                except Exception:
+                    continue
+        except Exception:
+            pass
+    return _cors(Response(json.dumps({
+        "paused": AUTO_CONFIRM_PAUSE.exists(),
+        "n_auto_confirmed_24h": n_today,
+        "min_confidence": AUTO_CONFIRM_MIN_CONFIDENCE,
+        "max_per_loop": AUTO_CONFIRM_MAX_PER_LOOP,
+    }), mimetype="application/json"))
+
+
 @app.route("/api/internal/auto-confirm/pause", methods=["POST"])
 def api_internal_auto_confirm_pause():
     """Toggle auto-confirm pause via marker file. Mirrors the auto-
@@ -15808,6 +15926,40 @@ def play_recording(uuid):
         pass
     title_safe = title.replace("<", "&lt;")
     src = f"{HOST_URL}/recording/{uuid}/index.m3u8"
+    # Auto-confirm metadata — surface a banner if this recording was
+    # auto-reviewed by the Phase-6A loop so the user can undo if the
+    # verdict is wrong.
+    auto_confirm_banner = ""
+    user_p = HLS_DIR / f"_rec_{uuid}" / "ads_user.json"
+    if user_p.is_file():
+        try:
+            cur = json.loads(user_p.read_text())
+            if isinstance(cur, dict) and cur.get("auto_confirmed_at"):
+                score = cur.get("auto_confirm_score")
+                pct = (f" ({int(score*100)}%)" if score else "")
+                ts = cur["auto_confirmed_at"]
+                age_h = max(0, int((time.time() - ts) / 3600))
+                auto_confirm_banner = (
+                    f"<div id='ac-banner' style='position:fixed;top:0;"
+                    f"left:0;right:0;background:#16a34a;color:#fff;"
+                    f"padding:8px 14px;font-size:.9em;z-index:25;"
+                    f"display:flex;align-items:center;gap:12px'>"
+                    f"<span>✓ Auto-Confirmed{pct} vor {age_h} h — "
+                    f"prüfe und tippe Undo wenn die Werbeblöcke falsch "
+                    f"sind</span>"
+                    f"<button onclick='undoAutoConfirm()' "
+                    f"style='margin-left:auto;padding:4px 12px;"
+                    f"border-radius:4px;border:1px solid #fff;"
+                    f"background:transparent;color:#fff;cursor:pointer'>"
+                    f"Undo</button>"
+                    f"<button onclick=\"document.getElementById('ac-banner')"
+                    f".style.display='none'\" "
+                    f"style='padding:4px 8px;border-radius:4px;"
+                    f"border:1px solid #fff6;background:transparent;"
+                    f"color:#fff;cursor:pointer'>×</button>"
+                    f"</div>")
+        except Exception:
+            pass
     html = (f"<!doctype html><html><head>"
             f"{PLAYER_HEAD_META}"
             f"<title>{title_safe}</title>"
@@ -15836,6 +15988,7 @@ def play_recording(uuid):
             f"animation:spin 1s linear infinite}}"
             f"@keyframes spin{{to{{transform:rotate(360deg)}}}}"
             f"</style></head><body>"
+            f"{auto_confirm_banner}"
             f"<video id='v' autoplay muted playsinline "
             f"webkit-playsinline disablepictureinpicture></video>"
             f"<div id='loader'>"
@@ -16097,6 +16250,21 @@ def play_recording(uuid):
             f"        uncertainPts=[];"
             f"      }} else {{"
             f"        _adShowToast('Fehler beim Speichern');"
+            f"      }}"
+            f"  }}).catch(()=>_adShowToast('Netzwerk-Fehler'));"
+            f"}}"
+            f"/* Undo auto-confirm: deletes ads_user.json IFF auto-"
+            f"   confirmed (server enforces — manual reviews are safe). */"
+            f"function undoAutoConfirm(){{"
+            f"  if(!confirm('Auto-Confirm rückgängig? Werbeblöcke werden "
+            f"beim nächsten Detect frisch berechnet.')) return;"
+            f"  fetch('{HOST_URL}/api/recording/{uuid}/auto-confirm-undo',"
+            f"    {{method:'POST'}}).then(r=>r.json()).then(d=>{{"
+            f"      if(d && d.ok){{"
+            f"        _adShowToast('Auto-Confirm rückgängig — Seite lädt neu');"
+            f"        setTimeout(()=>location.reload(), 800);"
+            f"      }} else {{"
+            f"        _adShowToast('Fehler: '+(d && d.error || 'unbekannt'));"
             f"      }}"
             f"  }}).catch(()=>_adShowToast('Netzwerk-Fehler'));"
             f"}}"
