@@ -11140,6 +11140,22 @@ def _rec_prewarm_once():
             print(f"[rec-prewarm] gc orphan {uuid[:8]}", flush=True)
             shutil.rmtree(d, ignore_errors=True)
 
+    # Per-uuid cooldown so a uuid that fails to produce a cutlist
+    # doesn't permanently steal the cskip slot every cycle (= the
+    # bug where ef6ad633 got cskip-spawned 6× in a row while
+    # bd6f080b never got reached because each cycle returned at
+    # the first empty-cutlist match). 10 min cooldown gives the
+    # Mac daemon enough time to actually write a cutlist back.
+    PREWARM_PER_UUID_COOLDOWN_S = 600
+    if not hasattr(_rec_prewarm_once, "_last_spawn"):
+        _rec_prewarm_once._last_spawn = {}
+    last_spawn = _rec_prewarm_once._last_spawn
+    now = time.time()
+    # Cap on concurrent spawn-issuances per cycle so we don't burst
+    # 100+ markers at once after a head-deploy invalidation.
+    MAX_HLS_PER_CYCLE = 3
+    MAX_CSKIP_PER_CYCLE = 3
+    n_hls_spawned = n_cskip_spawned = 0
     for e in data.get("entries", []):
         uuid = e.get("uuid")
         if not uuid or not e.get("filename"):
@@ -11147,31 +11163,33 @@ def _rec_prewarm_once():
         out_dir = HLS_DIR / f"_rec_{uuid}"
         playlist = out_dir / "index.m3u8"
         if not playlist.exists():
-            # Pi-side eager remux. Earlier this branch deferred to a
-            # Mac handler when alive, but the Mac launchd job has been
-            # silently broken by macOS TCC restrictions (network mounts
-            # not enumerable from launchd Aqua agents). Net result was:
-            # recordings sat unremuxed until the user clicked, then Pi
-            # spawned a CPU-intensive transcode synchronously. Just do
-            # it eagerly here; load + concurrency gates above prevent
-            # this from interfering with live streams.
+            if n_hls_spawned >= MAX_HLS_PER_CYCLE:
+                continue
+            if (now - last_spawn.get(("hls", uuid), 0)
+                    < PREWARM_PER_UUID_COOLDOWN_S):
+                continue
+            # Pi-side eager remux — Mac daemon polls the marker
+            # via /api/internal/hls-pending and POSTs back the
+            # tarball. Each spawn is just a marker-write; the work
+            # itself is async on the Mac.
             print(f"[rec-prewarm] remuxing {uuid[:8]} "
                   f"({e.get('disp_title', '?')[:40]})", flush=True)
             _rec_hls_spawn(uuid)
-            # Also kick off thumbs (writes .requested marker; Mac
-            # daemon over HTTP picks it up — no SMB dependency)
             _rec_thumbs_spawn(uuid)
-            return  # one per cycle
+            last_spawn[("hls", uuid)] = now
+            n_hls_spawned += 1
+            continue
         # Playlist exists — ensure thumbs got triggered too
         if not (out_dir / "thumbs" / ".done").exists() and \
            not (out_dir / "thumbs" / ".requested").exists():
             _rec_thumbs_spawn(uuid)
         # HLS already present — fill in the ad markers if missing.
-        # Hand off to the Mac entirely if its launchd agent is alive
-        # (heartbeat < 5 min); only run our own comskip if the Mac is
-        # offline. Cooperative '.scanning' lock-file is the secondary
-        # guard against double-runs in any remaining race window.
         if not list(out_dir.glob("*.txt")):
+            if n_cskip_spawned >= MAX_CSKIP_PER_CYCLE:
+                continue
+            if (now - last_spawn.get(("cskip", uuid), 0)
+                    < PREWARM_PER_UUID_COOLDOWN_S):
+                continue
             if _mac_comskip_alive():
                 continue
             scanning = out_dir / ".scanning"
@@ -11186,7 +11204,8 @@ def _rec_prewarm_once():
             if not (cskip_info and cskip_info["proc"].poll() is None):
                 print(f"[rec-prewarm] comskip {uuid[:8]}", flush=True)
                 _rec_cskip_spawn(uuid)
-                return
+                last_spawn[("cskip", uuid)] = now
+                n_cskip_spawned += 1
 
 
 def _rec_playlist_as_vod(text, is_running=False):
