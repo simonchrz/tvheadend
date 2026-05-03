@@ -13655,6 +13655,168 @@ def api_recording_auto_confirm_undo(uuid):
                           mimetype="application/json"))
 
 
+def _find_duplicate_recordings(min_cluster_overlap=0.75,
+                               min_anchors=5):
+    """Find pairs of recordings that are SAME CONTENT (not just same
+    show — the SAME broadcast).
+
+    Two strong signals:
+      1. Same disp_title AND broadcast within ±12 h (= autorec hit
+         the same EPG event twice, e.g. cross-mux duplicate or a
+         catch-up record). Different episodes of the same series
+         excluded by the time-window.
+      2. ≥min_cluster_overlap fraction of cluster-anchored spots
+         shared (= content-based dedup; works cross-channel for
+         syndicated reruns even with different titles/timestamps)."""
+    by_title = {}
+    rec_meta = {}
+    # Pull broadcast start times from tvh — needed to filter
+    # "different episodes of same series" out of signal 1.
+    tvh_start = {}
+    try:
+        td = json.loads(urllib.request.urlopen(
+            f"{TVH_BASE}/api/dvr/entry/grid?limit=2000",
+            timeout=8).read())
+        for e in td.get("entries", []):
+            if e.get("uuid"):
+                tvh_start[e["uuid"]] = e.get("start") or 0
+    except Exception:
+        pass
+    for d in HLS_DIR.glob("_rec_*"):
+        if not d.is_dir():
+            continue
+        uuid = d.name[5:]
+        title = _show_title_for_rec(d) or _rec_dvr_title(uuid) or ""
+        if not title:
+            continue
+        dur = _rec_duration_s(d)
+        if dur < 60:
+            continue
+        rec_meta[uuid] = {
+            "title": title,
+            "duration_s": dur,
+            "channel_slug": _rec_channel_slug(uuid) or "",
+            "rec_dir": d,
+            "start_ts": tvh_start.get(uuid, 0),
+        }
+        by_title.setdefault(title, []).append(uuid)
+
+    pairs = []
+
+    # --- Signal 1: same title + same broadcast (start within ±5min) ---
+    # Tight window because SpongeBob etc. air the same show multiple
+    # times per day = different episodes. ±5 min only catches the
+    # "autorec hit the same EPG event twice on different muxes" case.
+    SAME_BROADCAST_WIN = 5 * 60
+    for title, uuids in by_title.items():
+        if len(uuids) < 2:
+            continue
+        for i in range(len(uuids)):
+            for j in range(i + 1, len(uuids)):
+                a, b = uuids[i], uuids[j]
+                ta = rec_meta[a]["start_ts"]
+                tb = rec_meta[b]["start_ts"]
+                if not (ta and tb):
+                    continue  # missing start — can't tell
+                if abs(ta - tb) > SAME_BROADCAST_WIN:
+                    continue  # different broadcast → different episode
+                da = rec_meta[a]["duration_s"]
+                db = rec_meta[b]["duration_s"]
+                ratio = min(da, db) / max(da, db) if max(da, db) > 0 else 0
+                if ratio < 0.95:
+                    continue
+                pairs.append({
+                    "uuid_a": a, "uuid_b": b,
+                    "title": title,
+                    "channel_a": rec_meta[a]["channel_slug"],
+                    "channel_b": rec_meta[b]["channel_slug"],
+                    "duration_a": round(da, 1),
+                    "duration_b": round(db, 1),
+                    "start_diff_s": int(abs(ta - tb)),
+                    "basis": "same_broadcast",
+                    "score": round(ratio, 3),
+                })
+
+    # --- Signal 2: cluster-anchored overlap (cross-title path) ---
+    # Skip when we already have a signal-1 hit for the pair to avoid
+    # duplicate entries.
+    sig1_pairs = {(p["uuid_a"], p["uuid_b"]) for p in pairs}
+    try:
+        with _spot_fp_lock:
+            conn = _spot_fp_open()
+            try:
+                rows = conn.execute(
+                    "SELECT fp.uuid, fm.family_id, fp.window_start_s "
+                    "FROM family_members fm "
+                    "JOIN fingerprints fp ON fp.id = fm.fp_id "
+                    "WHERE fm.family_id IN ("
+                    "  SELECT family_id FROM family_members "
+                    "  GROUP BY family_id HAVING COUNT(*) >= 3"
+                    ")").fetchall()
+            finally:
+                conn.close()
+    except Exception:
+        rows = []
+    by_uuid_anchors = {}
+    for uuid, fam_id, ws in rows:
+        by_uuid_anchors.setdefault(uuid, set()).add(fam_id)
+    uuids_with_anchors = sorted(by_uuid_anchors.keys())
+    for i in range(len(uuids_with_anchors)):
+        for j in range(i + 1, len(uuids_with_anchors)):
+            a, b = uuids_with_anchors[i], uuids_with_anchors[j]
+            if (a, b) in sig1_pairs or (b, a) in sig1_pairs:
+                continue
+            if a not in rec_meta or b not in rec_meta:
+                continue
+            sa = by_uuid_anchors[a]
+            sb = by_uuid_anchors[b]
+            if min(len(sa), len(sb)) < min_anchors:
+                continue
+            shared = len(sa & sb)
+            overlap = shared / min(len(sa), len(sb))
+            if overlap < min_cluster_overlap:
+                continue
+            # Different titles likely → either re-air with renamed
+            # episode, or same advertiser-network mid-show ad break
+            # (= weaker signal). Demand higher overlap when titles
+            # differ.
+            same_title = rec_meta[a]["title"] == rec_meta[b]["title"]
+            if not same_title and overlap < 0.75:
+                continue
+            pairs.append({
+                "uuid_a": a, "uuid_b": b,
+                "title_a": rec_meta[a]["title"],
+                "title_b": rec_meta[b]["title"],
+                "channel_a": rec_meta[a]["channel_slug"],
+                "channel_b": rec_meta[b]["channel_slug"],
+                "shared_anchors": shared,
+                "n_anchors_a": len(sa),
+                "n_anchors_b": len(sb),
+                "basis": "cluster_overlap",
+                "score": round(overlap, 3),
+            })
+
+    pairs.sort(key=lambda p: -p["score"])
+    return pairs
+
+
+@app.route("/api/internal/duplicate-recordings")
+def api_internal_duplicate_recordings():
+    """List of suspected duplicate recording pairs across the corpus.
+    Used by /recordings to flag redundancies + by user to manually
+    decide which copy to keep."""
+    try:
+        min_overlap = max(0.3,
+                          min(1.0, float(request.args.get("min_overlap")
+                                         or 0.75)))
+    except Exception:
+        min_overlap = 0.75
+    pairs = _find_duplicate_recordings(min_cluster_overlap=min_overlap)
+    return _cors(Response(json.dumps({
+        "pairs": pairs, "n": len(pairs)}),
+        mimetype="application/json"))
+
+
 @app.route("/api/internal/auto-confirm/<uuid>")
 def api_internal_auto_confirm(uuid):
     """Multi-signal auto-confirmation score. Combines Whisper-
