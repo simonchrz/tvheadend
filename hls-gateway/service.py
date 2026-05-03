@@ -9087,7 +9087,8 @@ def recordings_page():
             # the user can tell Rocky 1 from Rocky 2.
             title_html = (f'<td>{title_cell}</td>'
                           if show_title_in_series else '')
-            return (f'<tr{anchor_attr} data-status="{row_status}"{edited_attr}>'
+            return (f'<tr{anchor_attr} data-status="{row_status}"'
+                    f' data-uuid="{uuid}"{edited_attr}>'
                     f'<td>{status_cell}</td>'
                     f'{title_html}'
                     f'<td>{when}</td>'
@@ -9107,7 +9108,8 @@ def recordings_page():
         sort_attrs = (f' data-sort-start="{start}"'
                       f' data-sort-title="{title.lower().replace(chr(34),"&quot;")}"'
                       f' data-sort-channel="{ch_name.lower()}"')
-        return (f'<tr{anchor_attr} data-status="{row_status}"{edited_attr}'
+        return (f'<tr{anchor_attr} data-status="{row_status}"'
+                f' data-uuid="{uuid}"{edited_attr}'
                 f'{sort_attrs}>'
                 f'<td>{sel_box}{status_cell}</td>'
                 f'<td>{title_cell}</td>'
