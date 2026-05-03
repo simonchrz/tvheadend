@@ -11977,6 +11977,19 @@ def api_internal_training_snapshot():
             pseudo = json.loads((d / "pseudo_labels.json").read_text())
         except Exception:
             pass
+        # Cluster-anchored ad spots (= silence-aligned spots in this
+        # recording whose audio+visual fingerprint matches a known
+        # cluster with ≥3 members). High-confidence ad anchors,
+        # usable by train-head as additional confirmed-ad regions —
+        # especially valuable for unreviewed recordings (= no manual
+        # ads_user.json). Each entry: {window_start_s, end_s,
+        # family_id, family_size}.
+        cluster_anchored = []
+        try:
+            cluster_anchored = _cluster_anchored_for_recording(
+                uuid, min_family_size=3)
+        except Exception:
+            pass
         out["recordings"].append({
             "uuid": uuid,
             "base": base,
@@ -11989,6 +12002,7 @@ def api_internal_training_snapshot():
             "pseudo_labels": pseudo,
             "cutlist_text": cutlist_text,
             "has_index_m3u8": (d / "index.m3u8").exists(),
+            "cluster_anchored": cluster_anchored,
         })
     try:
         out["minute_prior_by_channel"] = json.loads(
@@ -13104,16 +13118,215 @@ def api_internal_spot_fp_upload():
         mimetype="application/json"))
 
 
+def _cluster_anchored_for_recording(uuid_str, min_family_size=3,
+                                    spot_dur_default=20.0):
+    """Return list of {window_start_s, end_s, family_id, family_size}
+    for spots in this recording whose family has ≥ min_family_size
+    members across the corpus (= confidently a recurring ad).
+
+    Used as a high-confidence ad-anchor signal:
+      - reviewed recording: cross-check user labels (= QA)
+      - unreviewed recording: pseudo-label as confirmed-ad without
+        manual review (= path to fully-automated review)"""
+    with _spot_fp_lock:
+        conn = _spot_fp_open()
+        try:
+            # Family size lookup
+            sizes = {fid: n for fid, n in conn.execute(
+                "SELECT family_id, COUNT(*) FROM family_members "
+                "GROUP BY family_id").fetchall()}
+            rows = conn.execute(
+                "SELECT fp.id, fp.window_start_s, fp.block_end_s, "
+                "fm.family_id "
+                "FROM fingerprints fp "
+                "JOIN family_members fm ON fm.fp_id = fp.id "
+                "WHERE fp.uuid = ?", (uuid_str,)).fetchall()
+        finally:
+            conn.close()
+    out = []
+    for fp_id, ws, be, fam in rows:
+        n = sizes.get(fam, 1)
+        if n < min_family_size:
+            continue
+        # Spot duration not stored; use the silence-aligned windowing
+        # default (= ~20s per spot, conservative). Real boundaries are
+        # in the source ads.json's block, this is just the detected
+        # spot's local extent within it.
+        out.append({
+            "window_start_s": float(ws),
+            "end_s": min(float(be), float(ws) + spot_dur_default),
+            "family_id": int(fam),
+            "family_size": int(n),
+        })
+    return out
+
+
+def _cluster_coverage_pct(uuid_str, blocks):
+    """% of total ad-block time covered by cluster-anchored spots
+    with family_size ≥ 3. Returns (coverage_pct, n_anchored,
+    total_block_s) — coverage_pct ∈ [0, 100] or None if no blocks."""
+    if not blocks:
+        return (None, 0, 0)
+    total_block_s = sum(max(0, e - s) for s, e in blocks)
+    if total_block_s <= 0:
+        return (None, 0, 0)
+    anchors = _cluster_anchored_for_recording(uuid_str)
+    if not anchors:
+        return (0.0, 0, total_block_s)
+    # Build interval-set of anchored spans, intersect with blocks
+    anchored = sorted([(a["window_start_s"], a["end_s"]) for a in anchors])
+    # Merge overlapping anchors first
+    merged = []
+    for s, e in anchored:
+        if merged and s <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], e))
+        else:
+            merged.append((s, e))
+    # Intersection length with blocks
+    cov_s = 0.0
+    for bs, be in blocks:
+        for ms, me in merged:
+            ov_s = max(bs, ms)
+            ov_e = min(be, me)
+            if ov_e > ov_s:
+                cov_s += ov_e - ov_s
+    pct = min(100.0, 100.0 * cov_s / total_block_s)
+    return (round(pct, 1), len(anchors), total_block_s)
+
+
+@app.route("/api/internal/head-bundle", methods=["POST"])
+def api_internal_head_bundle():
+    """Receive a tar.gz bundle of train-head outputs from the Mac
+    trainer (= head.bin + sidecars + archive/). Extracted into
+    /mnt/tv/hls/.tvd-models/ atomically. Replaces the SMB-write
+    pattern from the pre-migration era.
+
+    Body: raw tar.gz bytes. Pi extracts into a tempdir, then moves
+    files into place — head.bin LAST so daemons polling for new
+    head don't see a partial deploy."""
+    import tarfile, io, tempfile, os as _os
+    body = request.get_data() or b""
+    if not body:
+        return Response(json.dumps({"ok": False, "error": "empty body"}),
+                        status=400, mimetype="application/json")
+    target_dir = HLS_DIR / ".tvd-models"
+    target_dir.mkdir(parents=True, exist_ok=True)
+    n_files = 0
+    archive_files = 0
+    head_bin_payload = None
+    try:
+        with tarfile.open(fileobj=io.BytesIO(body), mode="r:gz") as tf:
+            for member in tf.getmembers():
+                if not member.isfile():
+                    continue
+                name = member.name.lstrip("./")
+                # Only allow expected file shapes — never let an
+                # absolute or parent-traversing path in.
+                if name.startswith("/") or ".." in Path(name).parts:
+                    continue
+                # Whitelist: head.bin, head.*.json/.txt at root,
+                # and archive/head.*.bin
+                parts = Path(name).parts
+                if len(parts) == 1 and (
+                        name == "head.bin"
+                        or name.startswith("head.")):
+                    pass
+                elif (len(parts) == 2 and parts[0] == "archive"
+                      and parts[1].startswith("head.")
+                      and parts[1].endswith(".bin")):
+                    archive_files += 1
+                else:
+                    continue
+                data = tf.extractfile(member)
+                if data is None:
+                    continue
+                payload = data.read()
+                if name == "head.bin":
+                    head_bin_payload = payload
+                    continue
+                # Atomic write via tmp + rename
+                target = target_dir / name
+                target.parent.mkdir(parents=True, exist_ok=True)
+                tmp = target.with_suffix(target.suffix + ".tmp")
+                tmp.write_bytes(payload)
+                tmp.replace(target)
+                n_files += 1
+    except Exception as e:
+        return Response(json.dumps({"ok": False,
+                                     "error": f"unpack: {e}"}),
+                        status=400, mimetype="application/json")
+    # Write head.bin LAST so daemons polling .tvd-models/ never see
+    # a sidecar referencing a head that doesn't exist yet.
+    if head_bin_payload is not None:
+        head_target = target_dir / "head.bin"
+        tmp = head_target.with_suffix(".bin.tmp")
+        tmp.write_bytes(head_bin_payload)
+        tmp.replace(head_target)
+        n_files += 1
+    return _cors(Response(json.dumps({
+        "ok": True, "n_files": n_files,
+        "archive_kept": archive_files,
+        "head_deployed": head_bin_payload is not None,
+        "size_bytes": len(body)}),
+        mimetype="application/json"))
+
+
+@app.route("/api/internal/spot-fp/cluster-anchored/<uuid>")
+def api_internal_spot_fp_cluster_anchored(uuid):
+    """For one recording: list spots that match a known cluster
+    (family_size ≥ 3 by default). Plus coverage stats.
+
+    Used by the UI badge + future train-head pseudo-label consumer."""
+    try:
+        min_size = max(2, int(request.args.get("min_family_size") or 3))
+    except Exception:
+        min_size = 3
+    rec_dir = HLS_DIR / f"_rec_{uuid}"
+    if not rec_dir.is_dir():
+        return Response(json.dumps({"ok": False, "error": "unknown uuid"}),
+                        status=404, mimetype="application/json")
+    # Pull blocks (user-edits if present, else auto)
+    blocks = []
+    user_p = rec_dir / "ads_user.json"
+    auto_p = rec_dir / "ads.json"
+    is_reviewed = user_p.is_file()
+    src = user_p if is_reviewed else auto_p
+    try:
+        d = json.loads(src.read_text()) if src.is_file() else None
+        raw = d.get("ads") if isinstance(d, dict) else d
+        for blk in raw or []:
+            try:
+                blocks.append((float(blk[0]), float(blk[1])))
+            except Exception:
+                pass
+    except Exception:
+        pass
+    anchored = _cluster_anchored_for_recording(uuid, min_size)
+    cov_pct, n_anchors, total_s = _cluster_coverage_pct(uuid, blocks)
+    return _cors(Response(json.dumps({
+        "uuid": uuid,
+        "is_reviewed": is_reviewed,
+        "n_blocks": len(blocks),
+        "total_block_s": round(total_s, 1),
+        "n_anchored_spots": n_anchors,
+        "coverage_pct": cov_pct,
+        "anchored": anchored,
+    }), mimetype="application/json"))
+
+
 @app.route("/api/internal/spot-fp/queue")
 def api_internal_spot_fp_queue():
-    """Return list of uuids needing Mac-side spot extraction.
+    """Return uuids needing Mac-side spot extraction. Includes BOTH
+    reviewed (ads_user.json) AND unreviewed-but-detected (ads.json
+    only) recordings. Mac script's /recording/<uuid>/ads endpoint
+    transparently returns merged-or-auto blocks either way.
 
-      ?include_no_dhash=1 (default): also include uuids whose existing
-        fingerprints don't yet have dhashes (= partial-Pi-side extract,
-        Mac re-extract will give us full audio+visual)
-      ?missing_only=1: only uuids with NO fingerprints at all"""
+      ?include_no_dhash=1 (default): also uuids missing dhashes
+      ?missing_only=1: only uuids with NO fingerprints at all
+      ?reviewed_only=1: skip the auto-detected-only recordings"""
     include_no_dh = request.args.get("include_no_dhash", "1") in ("1","true")
     missing_only  = request.args.get("missing_only") in ("1","true")
+    reviewed_only = request.args.get("reviewed_only") in ("1","true")
     with _spot_fp_lock:
         conn = _spot_fp_open()
         try:
@@ -13126,21 +13339,32 @@ def api_internal_spot_fp_queue():
                     "WHERE dhashes IS NULL").fetchall()}
         finally:
             conn.close()
-    out_missing = []
+    out_missing_reviewed = []
+    out_missing_unreviewed = []
     out_partial = []
     for d in HLS_DIR.glob("_rec_*"):
-        if not (d / "ads_user.json").is_file():
-            continue
         u = d.name[5:]
+        is_reviewed = (d / "ads_user.json").is_file()
+        is_detected = (d / "ads.json").is_file()
+        if not (is_reviewed or is_detected):
+            continue
+        if reviewed_only and not is_reviewed:
+            continue
         if u not in indexed:
-            out_missing.append(u)
+            (out_missing_reviewed if is_reviewed
+             else out_missing_unreviewed).append(u)
         elif u in no_dh:
             out_partial.append(u)
-    items = out_missing if missing_only else (out_missing + out_partial)
+    # Reviewed first (= higher confidence labels boost training more
+    # than unreviewed cluster matches).
+    items = out_missing_reviewed if missing_only else (
+        out_missing_reviewed + out_missing_unreviewed + out_partial)
     return _cors(Response(json.dumps({
         "uuids": items,
-        "n_missing": len(out_missing),
-        "n_partial_no_dhash": len(out_partial)}),
+        "n_missing_reviewed": len(out_missing_reviewed),
+        "n_missing_unreviewed": len(out_missing_unreviewed),
+        "n_partial_no_dhash": len(out_partial),
+        "n_missing": len(out_missing_reviewed) + len(out_missing_unreviewed)}),
         mimetype="application/json"))
 
 
