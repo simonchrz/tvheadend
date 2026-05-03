@@ -13708,19 +13708,92 @@ def api_recording_auto_confirm_undo(uuid):
                           mimetype="application/json"))
 
 
+def _whisper_text_for(uuid_str):
+    """Concatenate all whisper window texts for one recording into
+    one document. None if no whisper.json."""
+    p = HLS_DIR / f"_rec_{uuid_str}" / ".whisper.json"
+    if not p.is_file():
+        return None
+    try:
+        d = json.loads(p.read_text())
+        return " ".join((w.get("text") or "") for w in d.get("windows", []))
+    except Exception:
+        return None
+
+
+def _whisper_jaccard(text_a, text_b, n=4):
+    """Char-n-gram Jaccard similarity (0..1). 0 if either empty."""
+    if not text_a or not text_b:
+        return 0.0
+    sa = {text_a[i:i+n] for i in range(len(text_a) - n + 1)}
+    sb = {text_b[i:i+n] for i in range(len(text_b) - n + 1)}
+    if not sa or not sb:
+        return 0.0
+    inter = len(sa & sb)
+    union = len(sa | sb)
+    return inter / union if union else 0.0
+
+
+def _dhashes_for(uuid_str):
+    """All dHash hashes from all spots of this recording. Returns
+    list of int64 hashes (possibly empty)."""
+    out = []
+    try:
+        with _spot_fp_lock:
+            conn = _spot_fp_open()
+            try:
+                rows = conn.execute(
+                    "SELECT dhashes FROM fingerprints "
+                    "WHERE uuid = ? AND dhashes IS NOT NULL",
+                    (uuid_str,)).fetchall()
+            finally:
+                conn.close()
+    except Exception:
+        return []
+    for (blob,) in rows:
+        b = bytes(blob)
+        for i in range(0, len(b), 8):
+            chunk = b[i:i+8]
+            if len(chunk) == 8:
+                out.append(int.from_bytes(chunk, "big"))
+    return out
+
+
+def _dhash_overlap(hashes_a, hashes_b, max_bit_diff=12):
+    """Fraction of dHashes in the SHORTER list that have any match
+    within `max_bit_diff` bits in the OTHER list. 0..1."""
+    if not hashes_a or not hashes_b:
+        return 0.0
+    shorter, longer = (hashes_a, hashes_b) if len(hashes_a) <= len(hashes_b) \
+                      else (hashes_b, hashes_a)
+    bit_count = int.bit_count
+    matches = 0
+    for h in shorter:
+        for k in longer:
+            if bit_count(h ^ k) <= max_bit_diff:
+                matches += 1
+                break
+    return matches / len(shorter)
+
+
 def _find_duplicate_recordings(min_cluster_overlap=0.75,
                                min_anchors=5):
     """Find pairs of recordings that are SAME CONTENT (not just same
     show — the SAME broadcast).
 
-    Two strong signals:
-      1. Same disp_title AND broadcast within ±12 h (= autorec hit
-         the same EPG event twice, e.g. cross-mux duplicate or a
-         catch-up record). Different episodes of the same series
-         excluded by the time-window.
-      2. ≥min_cluster_overlap fraction of cluster-anchored spots
-         shared (= content-based dedup; works cross-channel for
-         syndicated reruns even with different titles/timestamps)."""
+    Three signals, weighted:
+      1. Same disp_title AND broadcast within ±5 min (= autorec hit
+         the same EPG event twice). Different episodes of the same
+         series excluded by the tight time-window.
+      2. Cluster-anchored spot overlap ≥min_cluster_overlap
+         (= shared known commercial spots).
+      3. Whisper-text Jaccard similarity ≥0.5 (= same dialogue =
+         same broadcast even with different titles).
+      4. dHash visual overlap ≥0.4 (= same keyframes appear).
+
+    Pair survives if signal 1 fires OR (signal 2 + signal 3 + signal 4
+    weighted score ≥ 1.5; e.g. cluster 0.7 + whisper 0.5 + dhash 0.4).
+    All 3 sub-scores reported for UI decision-making."""
     by_title = {}
     rec_meta = {}
     # Pull broadcast start times from tvh — needed to filter
@@ -13790,16 +13863,14 @@ def _find_duplicate_recordings(min_cluster_overlap=0.75,
                     "score": round(ratio, 3),
                 })
 
-    # --- Signal 2: cluster-anchored overlap (cross-title path) ---
-    # Skip when we already have a signal-1 hit for the pair to avoid
-    # duplicate entries.
+    # --- Pre-build per-uuid signals ONCE (= O(n) per signal) ---
     sig1_pairs = {(p["uuid_a"], p["uuid_b"]) for p in pairs}
     try:
         with _spot_fp_lock:
             conn = _spot_fp_open()
             try:
                 rows = conn.execute(
-                    "SELECT fp.uuid, fm.family_id, fp.window_start_s "
+                    "SELECT fp.uuid, fm.family_id "
                     "FROM family_members fm "
                     "JOIN fingerprints fp ON fp.id = fm.fp_id "
                     "WHERE fm.family_id IN ("
@@ -13811,8 +13882,22 @@ def _find_duplicate_recordings(min_cluster_overlap=0.75,
     except Exception:
         rows = []
     by_uuid_anchors = {}
-    for uuid, fam_id, ws in rows:
+    for uuid, fam_id in rows:
         by_uuid_anchors.setdefault(uuid, set()).add(fam_id)
+    # Cache whisper text + dhash list per uuid (lazy — only when first
+    # asked, since not every uuid will be paired)
+    _wcache = {}
+    _dcache = {}
+    def _get_whisper(u):
+        if u not in _wcache:
+            _wcache[u] = _whisper_text_for(u)
+        return _wcache[u]
+    def _get_dhashes(u):
+        if u not in _dcache:
+            _dcache[u] = _dhashes_for(u)
+        return _dcache[u]
+
+    # --- Signal 2/3/4 combined: candidate pairs from anchors ---
     uuids_with_anchors = sorted(by_uuid_anchors.keys())
     for i in range(len(uuids_with_anchors)):
         for j in range(i + 1, len(uuids_with_anchors)):
@@ -13823,18 +13908,47 @@ def _find_duplicate_recordings(min_cluster_overlap=0.75,
                 continue
             sa = by_uuid_anchors[a]
             sb = by_uuid_anchors[b]
+            # Cheap pre-filter: need at least min_anchors on each side
+            # and SOME shared. Anything below that = not a candidate
+            # for further signals.
             if min(len(sa), len(sb)) < min_anchors:
                 continue
             shared = len(sa & sb)
-            overlap = shared / min(len(sa), len(sb))
-            if overlap < min_cluster_overlap:
+            cluster_ovl = shared / min(len(sa), len(sb))
+            # Skip non-candidates early — anything below 0.4 cluster
+            # overlap won't survive even with strong whisper+dhash.
+            if cluster_ovl < 0.4:
                 continue
-            # Different titles likely → either re-air with renamed
-            # episode, or same advertiser-network mid-show ad break
-            # (= weaker signal). Demand higher overlap when titles
-            # differ.
-            same_title = rec_meta[a]["title"] == rec_meta[b]["title"]
-            if not same_title and overlap < 0.75:
+            # Whisper Jaccard
+            wa = _get_whisper(a)
+            wb = _get_whisper(b)
+            whisper_ovl = _whisper_jaccard(wa, wb) if (wa and wb) else 0.0
+            # dHash overlap
+            dha = _get_dhashes(a)
+            dhb = _get_dhashes(b)
+            dhash_ovl = _dhash_overlap(dha, dhb) if (dha and dhb) else 0.0
+            # Combined score: weighted sum, max 1.0.
+            #   cluster:  weight 0.4 — broad audio-pattern match
+            #   whisper:  weight 0.4 — strong dialogue match (= same broadcast)
+            #   dhash:    weight 0.2 — visual confirmation
+            combined = (0.4 * cluster_ovl
+                        + 0.4 * whisper_ovl
+                        + 0.2 * dhash_ovl)
+            # Accept rules — REQUIRE whisper ≥ 0.3 (= same dialogue is
+            # the strongest "same broadcast" signal; cluster + dHash
+            # alone match channels-with-shared-ad-slates without
+            # distinguishing different episodes). Whisper transcripts
+            # are noisy so 0.3 is the practical lower bound for "same
+            # dialogue, just different ASR runs".
+            # German ASR has a natural ~0.3 n-gram floor from common
+            # function words (und, ich, sie, das); 0.4 is the actual
+            # "same dialogue" threshold. Same-set shows (Lenßen hilft
+            # courtroom, GZSZ apartment) trip cluster + dhash but the
+            # different DIALOGUE keeps whisper below 0.4 → correctly
+            # excluded.
+            if whisper_ovl < 0.4:
+                continue
+            if combined < 0.5:
                 continue
             pairs.append({
                 "uuid_a": a, "uuid_b": b,
@@ -13845,8 +13959,11 @@ def _find_duplicate_recordings(min_cluster_overlap=0.75,
                 "shared_anchors": shared,
                 "n_anchors_a": len(sa),
                 "n_anchors_b": len(sb),
-                "basis": "cluster_overlap",
-                "score": round(overlap, 3),
+                "cluster_overlap": round(cluster_ovl, 3),
+                "whisper_jaccard": round(whisper_ovl, 3),
+                "dhash_overlap": round(dhash_ovl, 3),
+                "basis": "multi_signal",
+                "score": round(combined, 3),
             })
 
     pairs.sort(key=lambda p: -p["score"])
