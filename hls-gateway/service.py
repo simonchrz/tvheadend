@@ -3625,6 +3625,42 @@ def _auto_schedule_run(max_n: int = AUTO_SCHED_MAX_PER_DAY,
         non_good = sum(v for k, v in entry.get("modes", {}).items()
                        if k != "good")
         return non_good / entry["total"]
+    # Per-show LATEST IoU from the post-deploy snapshots — shows with
+    # weak production-IoU benefit most from another labelled sample.
+    # File is JSONL: one entry per (show, ts).
+    show_iou = {}
+    iou_path = HLS_DIR / ".tvd-models" / "head.per-show-iou.jsonl"
+    if iou_path.is_file():
+        try:
+            for ln in iou_path.read_text().splitlines():
+                ln = ln.strip()
+                if not ln:
+                    continue
+                try:
+                    r = json.loads(ln)
+                    s = r.get("show")
+                    iou = r.get("iou_mean")
+                    ts = r.get("ts", "")
+                    if not s or iou is None:
+                        continue
+                    cur = show_iou.get(s)
+                    if not cur or ts > cur[0]:
+                        show_iou[s] = (ts, float(iou))
+                except Exception:
+                    continue
+        except Exception:
+            pass
+    # Per-show drift presence — shows with NO drift mark yet benefit
+    # from a fresh recording where the user might mark it (= teaches
+    # us the EPG-Drift, then auto-padding for next time).
+    drift_known = set()
+    drift_path = HLS_DIR / ".tvd-models" / "per-show-drift.json"
+    if drift_path.is_file():
+        try:
+            for s in json.loads(drift_path.read_text()).keys():
+                drift_known.add(s)
+        except Exception:
+            pass
     active = _count_active_auto_scheduled()
     slots = min(max_n, max(0, AUTO_SCHED_MAX_ACTIVE - active))
     if slots <= 0:
@@ -3704,6 +3740,23 @@ def _auto_schedule_run(max_n: int = AUTO_SCHED_MAX_PER_DAY,
         if _fail_rate(per_show_fm.get(title)) > 0.4:
             priority += 1
         if _fail_rate(per_channel_fm.get(ch_slug)) > 0.4:
+            priority += 1
+        # Phase-6F refinements:
+        # - Low per-show production IoU = model already failing here in
+        #   prod = next labelled sample is high-leverage. +2 if < 0.5,
+        #   +1 if < 0.7. Doesn't fire when no IoU snapshot exists yet.
+        # - Unknown EPG-drift = recording it gives the user a chance to
+        #   mark show-start, which then permanently improves padding for
+        #   that show. +1 only if we have ≥1 reviewed sample (= we know
+        #   the show actually exists in our corpus).
+        latest = show_iou.get(title)
+        if latest:
+            iou = latest[1]
+            if iou < 0.5:
+                priority += 2
+            elif iou < 0.7:
+                priority += 1
+        if n_rev >= 1 and title not in drift_known:
             priority += 1
         candidates.append((priority, start, ev, n_rev))
     # Sort: higher priority first, then earlier start (= sooner data).
