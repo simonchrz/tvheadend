@@ -9222,6 +9222,8 @@ def recordings_page():
             f".badge.ads-uncertain{{background:#d35400;color:#fff;"
             f"text-decoration:none}}"
             f".badge.auto-extended{{background:#0f766e;color:#ccfbf1}}"
+            f".badge.auto-confirm-ok{{background:#16a34a;color:#fff}}"
+            f".badge.auto-confirm-review{{background:#ca8a04;color:#fff}}"
             f"@keyframes scanpulse{{0%,100%{{opacity:.5}}50%{{opacity:1}}}}"
             f".badge.live{{animation:livepulse 1.5s ease-in-out infinite}}"
             f"@keyframes livepulse{{0%,100%{{opacity:1}}50%{{opacity:.6}}}}"
@@ -9393,6 +9395,48 @@ def recordings_page():
             f"    }});"
             f"  }}"
             f"  setInterval(refresh,60000);refresh();"
+            f"}})();"
+            # Auto-confirm badge — fetches multi-signal verdict per
+            # recording (whisper + cluster-anchored + block structure)
+            # and adds a colored badge: green = auto_confirm (no
+            # review needed), amber = needs_review (manual check), red
+            # = anomaly (possible missed ad). Async + bulk, runs once
+            # per page load.
+            f"(async function(){{"
+            f"  try{{"
+            f"    const r=await fetch("
+            f"      '{HOST_URL}/api/internal/auto-confirm-bulk');"
+            f"    if(!r.ok)return;"
+            f"    const d=await r.json();"
+            f"    const verdicts=d.verdicts||{{}};"
+            f"    document.querySelectorAll('tr[data-uuid]').forEach(tr=>{{"
+            f"      const uuid=tr.dataset.uuid;if(!uuid)return;"
+            f"      const v=verdicts[uuid];if(!v||!v.verdict)return;"
+            f"      const td=tr.querySelector('td:nth-child(3)');"
+            f"      if(!td)return;"
+            f"      let cls,txt,title;"
+            f"      if(v.verdict==='auto_confirm'){{"
+            f"        cls='auto-confirm-ok';"
+            f"        txt='✓ auto';"
+            f"        title='Multi-Signal Auto-Confirm: '+("
+            f"          v.confidence!=null?(Math.round(v.confidence*100)+'%'):'')+"
+            f"          ' confidence — '+v.n_high_conf+'/'+v.n_blocks+' Blocks high-conf, '+"
+            f"          v.n_anomalies+' Anomalien';"
+            f"      }}else if(v.verdict==='needs_review'){{"
+            f"        cls='auto-confirm-review';"
+            f"        const c=v.confidence!=null?Math.round(v.confidence*100):0;"
+            f"        txt='? '+c+'%';"
+            f"        title='Auto-Confirm zu schwach ('+c+'%) — '+"
+            f"          v.n_high_conf+'/'+v.n_blocks+' Blocks high-conf, '+"
+            f"          v.n_anomalies+' Anomalien — Review empfohlen';"
+            f"      }}else return;"
+            f"      const b=document.createElement('span');"
+            f"      b.className='badge '+cls;"
+            f"      b.textContent=txt;b.title=title;"
+            f"      td.appendChild(document.createTextNode(' '));"
+            f"      td.appendChild(b);"
+            f"    }});"
+            f"  }}catch(e){{console.warn('auto-confirm fetch failed',e);}}"
             f"}})();"
             # Status filter — multi-select checkboxes hide rows whose
             # data-status isn't in the selected set. State persists per
@@ -13269,6 +13313,185 @@ def api_internal_head_bundle():
         "head_deployed": head_bin_payload is not None,
         "size_bytes": len(body)}),
         mimetype="application/json"))
+
+
+def _read_whisper_windows(uuid_str):
+    """Return list of {t, prob, text} from .whisper.json or empty."""
+    p = HLS_DIR / f"_rec_{uuid_str}" / ".whisper.json"
+    if not p.is_file():
+        return []
+    try:
+        d = json.loads(p.read_text())
+        return d.get("windows") or []
+    except Exception:
+        return []
+
+
+def _compute_auto_confirm(uuid_str,
+                          whisper_block_pct=0.70,
+                          whisper_show_anomaly_p=0.70,
+                          whisper_show_anomaly_n=3):
+    """Decide whether a recording can be auto-confirmed without
+    manual review. Combines Whisper-classifier per-window probs +
+    cluster-anchored spot coverage + ad-block structure.
+
+    Returns dict with per-block verdicts, show-region anomalies,
+    overall verdict ('auto_confirm' | 'needs_review' | 'no_data'),
+    and a confidence score in [0, 1]."""
+    rec_dir = HLS_DIR / f"_rec_{uuid_str}"
+    if not rec_dir.is_dir():
+        return {"verdict": "no_data", "error": "unknown uuid"}
+    # Auto-detected blocks come from the cutlist .txt via comskip
+    # parser (= same path /recording/<uuid>/ads uses). ads.json is
+    # only a transient cache that's regenerated on demand and
+    # frequently absent after a head-deploy V2 invalidation.
+    blocks = _rec_parse_comskip(rec_dir) or []
+    if not blocks:
+        ads_p = rec_dir / "ads.json"
+        if ads_p.is_file():
+            try:
+                raw = json.loads(ads_p.read_text())
+                blocks = [(float(b[0]), float(b[1]))
+                          for b in (raw if isinstance(raw, list)
+                                    else raw.get("ads") or [])]
+            except Exception:
+                blocks = []
+    if not blocks:
+        # No detected ads → trivially nothing to confirm; treat as
+        # auto-confirmable (= empty cutlist is its own ground truth).
+        return {"verdict": "auto_confirm", "confidence": 1.0,
+                "blocks": [], "show_anomalies": [],
+                "reason": "no detected ad blocks"}
+    # Whisper windows + cluster anchors
+    windows = _read_whisper_windows(uuid_str)
+    anchors = _cluster_anchored_for_recording(uuid_str,
+                                              min_family_size=3)
+    has_whisper = bool(windows)
+    has_anchors = bool(anchors)
+    if not has_whisper:
+        return {"verdict": "needs_review", "confidence": 0.0,
+                "reason": "no whisper.json — can't auto-confirm",
+                "blocks": [], "show_anomalies": []}
+    # Whisper window centre (60 s windows: t=start, centre = t+30)
+    win_center = lambda w: float(w.get("t", 0)) + 30.0
+    win_prob   = lambda w: float(w.get("prob", 0))
+    # Per-block analysis
+    block_results = []
+    n_high_conf = 0
+    for s, e in blocks:
+        in_block = [w for w in windows
+                    if s <= win_center(w) <= e]
+        n_in = len(in_block)
+        n_ad = sum(1 for w in in_block if win_prob(w) > 0.5)
+        whisper_pct = (n_ad / n_in) if n_in else 0.0
+        anchored = [a for a in anchors
+                    if a["window_start_s"] >= s - 5
+                    and a["end_s"] <= e + 5]
+        anchor_count = len(anchored)
+        # Verdict: high_conf when BOTH conditions hold
+        is_high = (whisper_pct >= whisper_block_pct
+                   and anchor_count >= 1)
+        if is_high:
+            n_high_conf += 1
+        block_results.append({
+            "start": round(s, 2), "end": round(e, 2),
+            "whisper_n_windows": n_in,
+            "whisper_pct_ad": round(whisper_pct, 3),
+            "anchor_count": anchor_count,
+            "verdict": "high_conf" if is_high else "uncertain",
+        })
+    # Show-region anomalies: streaks of high-prob whisper windows
+    # OUTSIDE any ad-block (= candidate for "missed ad" the auto
+    # detector failed to flag).
+    in_block_set = set()
+    for s, e in blocks:
+        for i, w in enumerate(windows):
+            if s <= win_center(w) <= e:
+                in_block_set.add(i)
+    show_anomalies = []
+    streak_start = None
+    streak_n = 0
+    for i, w in enumerate(windows):
+        if i in in_block_set:
+            streak_start = None
+            streak_n = 0
+            continue
+        if win_prob(w) >= whisper_show_anomaly_p:
+            if streak_start is None:
+                streak_start = w
+                streak_n = 1
+            else:
+                streak_n += 1
+        else:
+            if streak_n >= whisper_show_anomaly_n and streak_start:
+                show_anomalies.append({
+                    "t_start": round(float(streak_start.get("t", 0)), 1),
+                    "n_windows": streak_n,
+                    "verdict": "possible missed ad",
+                })
+            streak_start = None
+            streak_n = 0
+    if streak_n >= whisper_show_anomaly_n and streak_start:
+        show_anomalies.append({
+            "t_start": round(float(streak_start.get("t", 0)), 1),
+            "n_windows": streak_n,
+            "verdict": "possible missed ad",
+        })
+    # Overall verdict + confidence
+    n_blocks = len(blocks)
+    block_pct = n_high_conf / n_blocks
+    anomaly_penalty = min(0.5, 0.1 * len(show_anomalies))
+    confidence = max(0.0, block_pct * 1.0 - anomaly_penalty)
+    verdict = ("auto_confirm" if confidence >= 0.85
+               and not show_anomalies
+               else "needs_review")
+    return {
+        "verdict": verdict,
+        "confidence": round(confidence, 3),
+        "n_blocks": n_blocks,
+        "n_blocks_high_conf": n_high_conf,
+        "n_show_anomalies": len(show_anomalies),
+        "blocks": block_results,
+        "show_anomalies": show_anomalies,
+        "has_whisper": has_whisper,
+        "has_anchors": has_anchors,
+    }
+
+
+@app.route("/api/internal/auto-confirm/<uuid>")
+def api_internal_auto_confirm(uuid):
+    """Multi-signal auto-confirmation score. Combines Whisper-
+    classifier per-window probs + cluster-anchored spot coverage +
+    ad-block structure to decide whether a recording can be
+    confirmed without manual review."""
+    return _cors(Response(json.dumps(_compute_auto_confirm(uuid)),
+                          mimetype="application/json"))
+
+
+@app.route("/api/internal/auto-confirm-bulk")
+def api_internal_auto_confirm_bulk():
+    """Compact verdicts for every recording with an ads_user.json or
+    ads.json. Skips deep block detail — just {uuid: {verdict,
+    confidence, n_blocks, n_high_conf, n_anomalies}}. UI on
+    /recordings paints a badge per row from this single call."""
+    out = {}
+    for d in HLS_DIR.glob("_rec_*"):
+        if not (d / "ads_user.json").is_file() and not (d / "ads.json").is_file():
+            continue
+        uuid = d.name[5:]
+        try:
+            v = _compute_auto_confirm(uuid)
+        except Exception as e:
+            v = {"verdict": "error", "error": str(e)}
+        out[uuid] = {
+            "verdict": v.get("verdict"),
+            "confidence": v.get("confidence"),
+            "n_blocks": v.get("n_blocks", 0),
+            "n_high_conf": v.get("n_blocks_high_conf", 0),
+            "n_anomalies": v.get("n_show_anomalies", 0),
+        }
+    return _cors(Response(json.dumps({"verdicts": out, "n": len(out)}),
+                          mimetype="application/json"))
 
 
 @app.route("/api/internal/spot-fp/cluster-anchored/<uuid>")
