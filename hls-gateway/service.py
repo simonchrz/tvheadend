@@ -8807,14 +8807,29 @@ def recordings_page():
                                 'title="Mac comskip analysiert Werbeblöcke">🔍</span>')
             user_p_path = out_dir / "ads_user.json"
             user_reviewed = False
+            user_auto_confirmed = False
+            user_auto_score = None
             if user_p_path.exists():
-                status_cell += (' <span class="badge ads-edited" '
-                                'title="Werbeblöcke manuell angepasst">✏️</span>')
                 try:
-                    user_reviewed = bool(json.loads(
-                        user_p_path.read_text()).get("reviewed_at"))
+                    cur_user = json.loads(user_p_path.read_text())
+                    user_reviewed = bool(cur_user.get("reviewed_at"))
+                    user_auto_confirmed = bool(cur_user.get("auto_confirmed_at"))
+                    user_auto_score = cur_user.get("auto_confirm_score")
                 except Exception:
                     pass
+                if user_auto_confirmed:
+                    score_pct = (f" ({int(user_auto_score*100)}%)"
+                                 if user_auto_score else "")
+                    status_cell += (
+                        f' <span class="badge auto-confirmed-applied" '
+                        f'title="Automatisch bestätigt durch Multi-Signal '
+                        f'Auto-Confirm{score_pct} — kein manueller Review '
+                        f'nötig. Player → Undo wenn nicht passt.">'
+                        f'✓ auto{score_pct}</span>')
+                else:
+                    status_cell += (' <span class="badge ads-edited" '
+                                    'title="Werbeblöcke manuell angepasst">'
+                                    '✏️</span>')
             # Detect-done indicator: cutlist .txt with the comskip
             # FILE PROCESSING COMPLETE marker means the daemon has
             # actually run and written its result. Combined with
@@ -9221,6 +9236,7 @@ def recordings_page():
             f".badge.auto-extended{{background:#0f766e;color:#ccfbf1}}"
             f".badge.auto-confirm-ok{{background:#16a34a;color:#fff}}"
             f".badge.auto-confirm-review{{background:#ca8a04;color:#fff}}"
+            f".badge.auto-confirmed-applied{{background:#16a34a;color:#fff}}"
             f"@keyframes scanpulse{{0%,100%{{opacity:.5}}50%{{opacity:1}}}}"
             f".badge.live{{animation:livepulse 1.5s ease-in-out infinite}}"
             f"@keyframes livepulse{{0%,100%{{opacity:1}}50%{{opacity:.6}}}}"
@@ -13472,6 +13488,171 @@ def _compute_auto_confirm(uuid_str,
         "has_whisper": has_whisper,
         "has_anchors": has_anchors,
     }
+
+
+# Path to the JSONL audit log of every auto-confirm action — one
+# line per auto-confirmed recording for transparency + manual undo.
+AUTO_CONFIRM_LOG = HLS_DIR / ".tvd-models" / "auto-confirmed.jsonl"
+# Path to the on/off marker — when present, auto-confirm loop is
+# PAUSED. Same pattern as AUTO_SCHED_PAUSE on /learning.
+AUTO_CONFIRM_PAUSE = HLS_DIR / ".tvd-models" / "auto-confirm-paused"
+# Per-loop cap so a classifier regression can't auto-confirm 100+
+# recordings before user notices.
+AUTO_CONFIRM_MAX_PER_LOOP = 5
+# Min confidence + extra hard requirements (Whisper + cluster anchors)
+# already enforced inside _compute_auto_confirm — this gate adds one
+# more sanity check at the apply side.
+AUTO_CONFIRM_MIN_CONFIDENCE = 0.85
+
+
+def _auto_confirm_apply(uuid_str, verdict_dict):
+    """Persist an auto-confirm decision: write ads_user.json with the
+    auto-detected blocks + reviewed_at + auto_confirmed_at +
+    auto_confirm_score. Skips if ads_user.json already exists (= user
+    already touched it manually). Returns True on write."""
+    rec_dir = HLS_DIR / f"_rec_{uuid_str}"
+    user_p = rec_dir / "ads_user.json"
+    if user_p.is_file():
+        return False
+    blocks = _rec_parse_comskip(rec_dir) or []
+    if not blocks:
+        ads_p = rec_dir / "ads.json"
+        if ads_p.is_file():
+            try:
+                raw = json.loads(ads_p.read_text())
+                blocks = [[float(b[0]), float(b[1])]
+                          for b in (raw if isinstance(raw, list)
+                                    else raw.get("ads") or [])]
+            except Exception:
+                blocks = []
+    payload = {
+        "ads": [[round(s, 2), round(e, 2)] for s, e in blocks],
+        "deleted": [],
+        "reviewed_at": int(time.time()),
+        "auto_confirmed_at": int(time.time()),
+        "auto_confirm_score": verdict_dict.get("confidence"),
+        "auto_confirm_n_blocks": verdict_dict.get("n_blocks"),
+    }
+    try:
+        tmp = user_p.with_suffix(".tmp")
+        tmp.write_text(json.dumps(payload))
+        tmp.replace(user_p)
+    except Exception as e:
+        print(f"[auto-confirm] write err {uuid_str[:8]}: {e}", flush=True)
+        return False
+    # Audit log
+    try:
+        AUTO_CONFIRM_LOG.parent.mkdir(parents=True, exist_ok=True)
+        with AUTO_CONFIRM_LOG.open("a") as f:
+            f.write(json.dumps({
+                "ts": int(time.time()),
+                "uuid": uuid_str,
+                "confidence": verdict_dict.get("confidence"),
+                "n_blocks": verdict_dict.get("n_blocks"),
+                "n_high_conf": verdict_dict.get("n_blocks_high_conf"),
+            }) + "\n")
+    except Exception:
+        pass
+    print(f"[auto-confirm] {uuid_str[:8]}: confidence "
+          f"{verdict_dict.get('confidence')} → wrote ads_user.json "
+          f"({len(blocks)} blocks)", flush=True)
+    return True
+
+
+def _auto_confirm_loop():
+    """Every 5 min: scan recordings without ads_user.json, compute
+    multi-signal auto-confirm verdict, apply if SAFE.
+
+    Pause via AUTO_CONFIRM_PAUSE marker file (= toggleable from
+    /learning). Cap AUTO_CONFIRM_MAX_PER_LOOP per cycle so a
+    classifier regression can't burn through the corpus."""
+    time.sleep(60)  # let the gateway settle on startup
+    while True:
+        try:
+            if AUTO_CONFIRM_PAUSE.exists():
+                time.sleep(300)
+                continue
+            n_applied = 0
+            for d in HLS_DIR.glob("_rec_*"):
+                if n_applied >= AUTO_CONFIRM_MAX_PER_LOOP:
+                    break
+                if not d.is_dir():
+                    continue
+                if (d / "ads_user.json").is_file():
+                    continue  # already user- or auto-confirmed
+                uuid = d.name[5:]
+                try:
+                    v = _compute_auto_confirm(uuid)
+                except Exception as e:
+                    print(f"[auto-confirm] compute err {uuid[:8]}: {e}",
+                          flush=True)
+                    continue
+                if v.get("verdict") != "auto_confirm":
+                    continue
+                conf = v.get("confidence") or 0
+                if conf < AUTO_CONFIRM_MIN_CONFIDENCE:
+                    continue
+                # Need both signals for safety
+                if not v.get("has_whisper"):
+                    continue
+                # has_anchors is FALSE if cluster anchors found 0 spots
+                # OR if no fingerprints exist at all. Reject — can't
+                # cross-check the auto blocks without anchored spots.
+                if not v.get("has_anchors"):
+                    continue
+                if _auto_confirm_apply(uuid, v):
+                    n_applied += 1
+            if n_applied:
+                print(f"[auto-confirm] loop applied {n_applied} "
+                      f"recordings", flush=True)
+        except Exception as e:
+            print(f"[auto-confirm] loop err: {e}", flush=True)
+        time.sleep(300)
+
+
+@app.route("/api/internal/auto-confirm/pause", methods=["POST"])
+def api_internal_auto_confirm_pause():
+    """Toggle auto-confirm pause via marker file. Mirrors the auto-
+    schedule pause on /learning. Body: {"paused": true|false}."""
+    try:
+        data = request.get_json(silent=True) or {}
+        pause = bool(data.get("paused"))
+    except Exception:
+        pause = True
+    AUTO_CONFIRM_PAUSE.parent.mkdir(parents=True, exist_ok=True)
+    if pause:
+        AUTO_CONFIRM_PAUSE.write_text(str(int(time.time())))
+    else:
+        try: AUTO_CONFIRM_PAUSE.unlink()
+        except FileNotFoundError: pass
+    return _cors(Response(json.dumps({
+        "ok": True, "paused": AUTO_CONFIRM_PAUSE.exists()}),
+        mimetype="application/json"))
+
+
+@app.route("/api/recording/<uuid>/auto-confirm-undo", methods=["POST"])
+def api_recording_auto_confirm_undo(uuid):
+    """Revert an auto-confirm decision. Deletes ads_user.json IF it
+    was auto-confirmed (= has auto_confirmed_at field) — won't touch
+    a manually-edited file. Re-detects from cutlist on next scan."""
+    rec_dir = HLS_DIR / f"_rec_{uuid}"
+    user_p = rec_dir / "ads_user.json"
+    if not user_p.is_file():
+        return Response(json.dumps({"ok": False, "error": "no ads_user.json"}),
+                        status=404, mimetype="application/json")
+    try:
+        cur = json.loads(user_p.read_text())
+        if not isinstance(cur, dict) or not cur.get("auto_confirmed_at"):
+            return Response(json.dumps({
+                "ok": False,
+                "error": "not an auto-confirmed entry — manual review present"}),
+                status=409, mimetype="application/json")
+    except Exception as e:
+        return Response(json.dumps({"ok": False, "error": str(e)}),
+                        status=500, mimetype="application/json")
+    user_p.unlink()
+    return _cors(Response(json.dumps({"ok": True, "uuid": uuid}),
+                          mimetype="application/json"))
 
 
 @app.route("/api/internal/auto-confirm/<uuid>")
@@ -17755,6 +17936,18 @@ if __name__ == "__main__":
             print(f"[auto-sched] init err: {e}", flush=True)
     threading.Thread(target=_auto_schedule_loop, daemon=True).start()
     threading.Thread(target=_adaptive_padding_loop, daemon=True).start()
+    # Default-pause auto-confirm on first install — user opts-in
+    # explicitly via /learning toggle once they've seen a few sample
+    # verdicts on the /recordings badge to gain confidence.
+    if not AUTO_CONFIRM_LOG.is_file() and not AUTO_CONFIRM_PAUSE.exists():
+        try:
+            AUTO_CONFIRM_PAUSE.parent.mkdir(parents=True, exist_ok=True)
+            AUTO_CONFIRM_PAUSE.write_text(str(int(time.time())))
+            print("[auto-confirm] default-paused on first install — "
+                  "user opt-in via /learning toggle", flush=True)
+        except Exception as e:
+            print(f"[auto-confirm] init err: {e}", flush=True)
+    threading.Thread(target=_auto_confirm_loop, daemon=True).start()
     # spot-fp extraction moved to Mac (tv-spot-extract.py) — Pi only
     # stores + indexes via /api/internal/spot-fp/upload. Worker thread
     # + resume-at-boot are no-ops now (kept callable for one-off
